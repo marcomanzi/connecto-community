@@ -250,28 +250,39 @@ mod tests {
 
     #[test]
     fn every_listed_token_shape_is_removed() {
+        // Made-up tokens, each in pieces so secret scanners do not take this
+        // test for a leak.
         for secret in [
-            "sk-abcdefgh12345678",
-            "sk-ant-api03-abc_DEF-123456",
-            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-            "AKIAIOSFODNN7EXAMPLE",
-            "glpat-abcDEF123_ghiJKL-4567",
-            "xoxb-123456789012-abcdefABCDEF",
-            "xoxp-1234-5678-abcdef",
-            "github_pat_11ABCDEFG0abcdefghijkl_mnopqrstuvwxyzABCDEFGHIJ",
-            "AIzaSyA1234567890abcdefghijklmnopqrstuv",
-            "npm_abcdefghijklmnopqrstuvwxyz0123456789",
-            // A made-up Discord token, in pieces so secret scanners do not
-            // take this test for a leak.
+            concat!("sk-", "abcdefgh12345678"),
+            concat!("sk-ant-", "api03-abc_DEF-123456"),
+            concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            concat!("AKIA", "IOSFODNN7EXAMPLE"),
+            concat!("glpat-", "abcDEF123_ghiJKL-4567"),
+            concat!("xoxb-", "123456789012-abcdefABCDEF"),
+            concat!("xoxp-", "1234-5678-abcdef"),
+            concat!(
+                "github_pat_",
+                "11ABCDEFG0abcdefghijkl_mnopqrstuvwxyzABCDEFGHIJ"
+            ),
+            concat!("AIza", "SyA1234567890abcdefghijklmnopqrstuv"),
+            concat!("npm_", "abcdefghijklmnopqrstuvwxyz0123456789"),
             concat!(
                 "MTIzNDU2Nzg5MDEyMzQ1Njc4",
                 ".GabcDE.",
                 "abcdefghijklmnopqrstuvwxyz_0123456789-AB"
             ),
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF123_-x",
+            concat!(
+                "eyJhbGciOiJIUzI1NiJ9",
+                ".eyJzdWIiOiIxMjM0In0",
+                ".abcDEF123_-x"
+            ),
             "Bearer abc.def-ghi_jkl",
             "bearer abcdefghijkl",
-            "-----BEGIN RSA PRIVATE KEY-----\nabc\ndef\n-----END RSA PRIVATE KEY-----",
+            concat!(
+                "-----BEGIN RSA PRIVATE",
+                " KEY-----\nabc\ndef\n-----END RSA PRIVATE",
+                " KEY-----"
+            ),
         ] {
             let text = format!("before {secret} after");
             let out = clean(&text);
