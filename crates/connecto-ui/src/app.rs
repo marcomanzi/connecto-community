@@ -35,6 +35,7 @@ use crate::history::{self, History, HistoryAction, HistoryInput, HistoryOut, Sco
 use crate::hosts::{self, HostAction, HostSheet};
 use crate::menu::{InWindowBar, NativeMenu};
 use crate::metrics::{FrameMetrics, MetricsSink, PaneCounters};
+use crate::notice::{self, Notice, NoticeAction};
 use crate::pairing::{self, PairingAction, PairingSheet};
 use crate::pane::{Pane, drop_activation};
 use crate::picker;
@@ -318,6 +319,8 @@ pub struct App {
     pairing: Option<PairingSheet>,
     /// The confirmation before a machine is removed or a host forgotten.
     confirm: Option<Confirm>,
+    /// A notice that says why an action is not done yet, with an OK button.
+    notice: Option<Notice>,
     /// Project Settings, for one project (the gear in the sidebar).
     project_settings: Option<ProjectSettingsSheet>,
     /// Connecto Home, packages and the per-project settings.
@@ -521,6 +524,7 @@ impl App {
             host_sheet: None,
             pairing: None,
             confirm: None,
+            notice: None,
             project_settings: None,
             packages: diagnostics.packages,
             agents: diagnostics.agents,
@@ -561,7 +565,7 @@ impl App {
 
     /// Whether a dialog drawn over everything is open: pairing or a confirm.
     fn overlay_open(&self) -> bool {
-        self.pairing.is_some() || self.confirm.is_some()
+        self.pairing.is_some() || self.confirm.is_some() || self.notice.is_some()
     }
 
     /// A command the open field refused: say so where the field is.
@@ -978,6 +982,13 @@ impl App {
     }
 
     fn open_project(&mut self) {
+        // Every way of creating a project comes here. Creating one on a remote
+        // machine is not built yet, so say so instead of opening this
+        // machine's folder picker.
+        if self.host.is_some() {
+            self.notice = Some(Notice::remote_project());
+            return;
+        }
         if let Some(path) = (self.picker)() {
             self.open_path(&path);
         }
@@ -2644,6 +2655,17 @@ impl App {
                 }
             }
         }
+        if let Some(notice) = &self.notice {
+            let mut out = Out::default();
+            notice::dialog(ctx, notice, esc, &mut out);
+            #[cfg(test)]
+            {
+                self.hits.notice = std::mem::take(&mut out.marks);
+            }
+            if out.actions.contains(&NoticeAction::Ok) {
+                self.notice = None;
+            }
+        }
     }
 
     fn pairing_action(&mut self, action: PairingAction) {
@@ -3412,6 +3434,10 @@ impl App {
 
     pub(crate) fn confirm_open(&self) -> bool {
         self.confirm.is_some()
+    }
+
+    pub(crate) fn notice_open(&self) -> bool {
+        self.notice.is_some()
     }
 
     pub(crate) fn settings_tab_for_tests(&self) -> SettingsTab {

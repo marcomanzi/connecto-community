@@ -202,6 +202,13 @@
   var odo = $("#odo");
   if (odo) {
     var digits = $("#odo-digits"), text = $("#odo-text"), week = $("#odo-week"), ghost = $("#odo-ghost");
+    var pill = $("#dl-float");
+    // The pill shows the same count once the odometer is out of view.
+    if (pill && "IntersectionObserver" in window) {
+      new IntersectionObserver(function (es) {
+        es.forEach(function (e) { pill.classList.toggle("away", e.isIntersecting); });
+      }, { threshold: 0.15 }).observe(odo);
+    }
     var MIN_CELLS = 6, shown = null, everLoaded = false;
     var whole = function (n) { return typeof n === "number" && isFinite(n) && n >= 0 && Math.floor(n) === n && n < 1e12; };
     var fmt = function (n) { return n.toLocaleString("en-US"); };
@@ -245,7 +252,7 @@
         // A frame at the old value, then roll to the new one.
         void digits.offsetWidth;
       }
-      requestAnimationFrame(function () { setDigits(total); });
+      setTimeout(function () { setDigits(total); }, 40);
       shown = total;
       if (ghost) {
         // The odometer's digits, giant and faint, behind the whole hero.
@@ -264,6 +271,18 @@
         week.hidden = false;
       } else {
         week.hidden = true;
+      }
+      if (pill) {
+        $("#dl-float-n").textContent = fmt(total);
+        $("#dl-float-word").textContent = total === 1 ? "download" : "downloads";
+        var pw = $("#dl-float-week");
+        pw.hidden = week.hidden;
+        pw.textContent = week.textContent;
+        if (pill.hidden) {
+          pill.hidden = false;
+          // A moment after it is displayed, so the fade-in runs.
+          setTimeout(function () { pill.classList.add("in"); }, 40);
+        }
       }
       if (grew && !reduce) {
         odo.classList.remove("bump");

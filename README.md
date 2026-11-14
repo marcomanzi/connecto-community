@@ -2,9 +2,9 @@
 
 https://connecto.studio
 
-A macOS desktop app that runs Claude Code and Codex in real terminals, up to eight per project, with a manual relay between them. Nothing moves between the sessions unless you click Send, or an agent in one terminal uses the `connecto` command (see Agents using other terminals).
+A desktop app for macOS and Windows that runs Claude Code and Codex in real terminals, up to 16 per project, and lets them work together. Nothing moves between the sessions unless you send it, or an agent in one terminal uses the `connecto` command (see Agents using other terminals).
 
-This is a proof of concept. There is no licence decision yet, so it is not ready for public release.
+Connecto is released and open source under the [GNU AGPL-3.0](LICENSE). Downloads for macOS and Windows are at [connecto.studio](https://connecto.studio); the source is at <https://github.com/marcomanzi/connecto-community>.
 
 ## What you need
 

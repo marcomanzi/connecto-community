@@ -6729,6 +6729,69 @@ mod remote_ui {
         assert!(!w.has(&Hit::Project("remote:build box".into())));
     }
 
+    /// A window over the two local projects and a remote, and the fake
+    /// workspace, so a test can see whether a folder was opened.
+    fn remote_window() -> (Arc<FakeWorkspace>, Arc<FakeRemote>, W) {
+        let (_orbit, _connecto, ws) = two_projects();
+        let remote = FakeRemote::new();
+        let w = W::with_remote(
+            &ws,
+            None,
+            Arc::new(connecto_core::NoPackages),
+            Arc::clone(&remote) as Arc<dyn RemoteControl>,
+        );
+        (ws, remote, w)
+    }
+
+    #[test]
+    fn creating_a_project_on_a_remote_machine_says_it_is_not_built_yet() {
+        let (ws, _remote, mut w) = remote_window();
+        click_row(&mut w, "build box");
+        // The header plus, and the command the menu and the shortcuts send.
+        w.click_hit(&Hit::HeaderPlus);
+        w.frame(vec![]);
+        assert!(w.app.notice_open(), "the notice is shown");
+        let texts = w.app.hits.notice.texts.clone();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "Project creation on remote machines is still in development"),
+            "{texts:?}"
+        );
+        assert!(ws.opened.lock().unwrap().is_empty(), "no folder picker");
+        // Escape and OK both dismiss it, and neither opens a folder.
+        w.frame(esc());
+        w.frame(vec![]);
+        assert!(!w.app.notice_open());
+        w.app.queue_for_tests(Command::OpenProject);
+        w.frame(vec![]);
+        w.frame(vec![]);
+        assert!(
+            w.app.notice_open(),
+            "the menu and shortcut path asks the same"
+        );
+        let ok = w.app.hits.notice.rects["notice-ok"].center();
+        w.click(ok);
+        w.frame(vec![]);
+        w.frame(vec![]);
+        assert!(!w.app.notice_open());
+        assert!(ws.opened.lock().unwrap().is_empty(), "still no folder");
+    }
+
+    #[test]
+    fn creating_a_project_on_this_machine_still_opens_the_folder_picker() {
+        let (ws, _remote, mut w) = remote_window();
+        click_row(&mut w, "build box");
+        click_row(&mut w, "localhost");
+        w.click_hit(&Hit::HeaderPlus);
+        w.frame(vec![]);
+        assert!(!w.app.notice_open(), "no notice on this machine");
+        assert_eq!(
+            *ws.opened.lock().unwrap(),
+            [PathBuf::from("/picked/folder")]
+        );
+    }
+
     #[test]
     fn a_disconnected_host_says_so_instead_of_listing_nothing() {
         let (_orbit, remote, mut w) = window();

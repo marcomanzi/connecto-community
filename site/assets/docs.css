@@ -92,9 +92,13 @@ body.docs { font-size: 16px; }
 @media (max-width: 800px) {
   .book { grid-template-columns: 1fr; }
   .menu-btn { display: block; }
-  .dtop .links a:not(.btn) { display: none; }
+  .dtop .links a:not(.btn):not(.keep) { display: none; }
+  .dtop .links .gh-link span { display: none; }
   .dside { position: fixed; inset: 60px 0 0 0; z-index: 30; background: var(--bg); width: 100%; height: auto; display: none; border-right: 0; }
   body.nav-open .dside { display: block; }
   .pager { grid-template-columns: 1fr; } .pager a.next { grid-column: 1; }
 }
 @media (max-width: 520px) { .dtop { gap: 10px; padding: 0 14px; } .dtop .brand span { display: none; } .search { flex: 1 1 0; min-width: 0; } }
+
+.dtop .gh-link { display: inline-flex; align-items: center; gap: 6px; }
+.dtop .gh-link .gh { flex: none; }

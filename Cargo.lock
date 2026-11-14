@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-adapter"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "connecto-core",
  "serde_json",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-app"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "connecto-audit",
  "connecto-automation",
@@ -1168,7 +1168,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-audit"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "connecto-core",
  "crossbeam-channel",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-automation"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "arc-swap",
  "connecto-core",
@@ -1196,14 +1196,14 @@ dependencies = [
 
 [[package]]
 name = "connecto-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "connecto-gate"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "connecto-audit",
  "connecto-core",
@@ -1212,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-hook"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-net"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-packages"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "arc-swap",
  "connecto-core",
@@ -1263,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-pty"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "arc-swap",
  "connecto-core",
@@ -1275,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-redact"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "connecto-core",
  "regex",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-secrets"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "keyring-core",
  "security-framework",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-session"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "arc-swap",
  "connecto-adapter",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-store"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "nix",
  "serde_json",
@@ -1331,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-term"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "alacritty_terminal",
  "connecto-core",
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-ui"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "chrono",
  "connecto-core",
@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-update"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "connecto-workspace"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "arc-swap",
  "connecto-audit",

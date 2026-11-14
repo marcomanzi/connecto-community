@@ -23,6 +23,7 @@ mod keymap;
 mod links;
 mod menu;
 mod metrics;
+mod notice;
 mod pairing;
 mod pane;
 mod picker;
