@@ -1,5 +1,5 @@
-// The downloads shown on the landing page and in the docs. Version 0.1.8 is the
-// current build (0.1.0 to 0.1.7 are left out of this list; their files may stay on the server). The files are not in this repository: put each one in
+// The downloads shown on the landing page and in the docs. Version 0.1.9 is the
+// current build (0.1.0 to 0.1.8 are left out of this list; their files may stay on the server). The files are not in this repository: put each one in
 // site/downloads/ on the server, under the name below.
 //
 // To publish another build, build it with scripts/release/ (see its README for
@@ -24,34 +24,34 @@
 window.CONNECTO_RELEASES = [
   {
     title: "Windows · x86_64",
-    version: "0.1.8",
-    file: "downloads/connecto-0.1.8-windows-x86_64.zip",
+    version: "0.1.9",
+    file: "downloads/connecto-0.1.9-windows-x86_64.zip",
     size: "16.1 MB",
-    sha256: "3a393dc6a655a2fde1b01eecd6d42f5d8c65722105ab3c498061ed932af2a95c",
+    sha256: "56b7d7d1edb9d7b76460a66ed07a27b9b0127128f0fa67c0262d69f8b938f4bf",
     note: "Windows 10 (1809) or later"
   },
   {
     title: "macOS · Apple silicon",
-    version: "0.1.8",
-    file: "downloads/connecto-0.1.8-macos-aarch64.dmg",
+    version: "0.1.9",
+    file: "downloads/connecto-0.1.9-macos-aarch64.dmg",
     size: "16.9 MB",
-    sha256: "6746ff561adfbb4ccf2b0a0a84ea0685c9ab3ddbf45d72211667f13e1f7b1bb0",
+    sha256: "3761fc824c2015db7d1ff8ee5591801fa26f90416429c4718c422d3a119fdeca",
     note: "macOS 11 or later"
   },
   {
     title: "macOS · Intel",
-    version: "0.1.8",
-    file: "downloads/connecto-0.1.8-macos-x86_64.dmg",
+    version: "0.1.9",
+    file: "downloads/connecto-0.1.9-macos-x86_64.dmg",
     size: "18.6 MB",
-    sha256: "b1f26513206b0e50db7d35d6b106d066f8f2750b8d2d1737745e7f60c1c68ba0",
+    sha256: "f9c75a229180059afb5007912eb705ddd25f8b242d16b1284685c772be441103",
     note: "macOS 10.15 or later"
   },
   {
     title: "macOS · Universal (both)",
-    version: "0.1.8",
-    file: "downloads/connecto-0.1.8-macos-universal.dmg",
+    version: "0.1.9",
+    file: "downloads/connecto-0.1.9-macos-universal.dmg",
     size: "36.7 MB",
-    sha256: "3021f75c8baf41308e163c7e00556587a335dbd0aebb93155a43258d1d543daa",
+    sha256: "b1e77c2128ea3f6eb9a1fb0a6cdd13fa9717d694eefa2c68899c9ce40f576ba0",
     note: "macOS 10.15 or later"
   }
 ];
