@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skills &amp; Plugins packages · Connecto docs</title>
+<meta name="description" content="Bundles of skills, subagents, commands and plugin settings that Connecto installs into your projects.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="packages">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Skills &amp; Plugins packages</h1>
+<p class="lead">A package is a bundle of skills, subagents, commands, hooks and plugin settings. Connecto installs it into every project that uses it, and keeps it up to date.</p>
+
+<p>Without packages, a skill you wrote lives in one project's <code>.claude</code> folder and you copy it by hand to the next. With packages, you keep it in one place and each project receives it.</p>
+
+<h2 id="connecto-home">Connecto Home</h2>
+<p>Packages and automations live in a folder you choose, called <strong>Connecto Home</strong>. Set it in <strong>Settings → CONNECTO HOME</strong>.</p>
+<pre>Connecto Home/
+├─ automations/     your automations
+└─ packages/        your packages</pre>
+<p>It is an ordinary folder, so you can keep it in git and share it with your team. It cannot be your home folder, or inside <code>~/.claude</code>, <code>~/.codex</code>, <code>~/.local</code> or <code>~/Library</code>.</p>
+
+<h2>What is in a package</h2>
+<pre>packages/team-tools/
+├─ package.json
+├─ .claude/
+│  ├─ skills/&lt;name&gt;/SKILL.md
+│  ├─ agents/&lt;name&gt;.md
+│  ├─ commands/&lt;name&gt;.md
+│  ├─ hooks/…
+│  └─ settings.json
+├─ .codex/
+│  └─ agents/&lt;name&gt;.toml
+└─ .agents/
+   └─ skills/&lt;name&gt;/SKILL.md      Codex skills</pre>
+<p><code>package.json</code> has four fields and no others:</p>
+<pre>{
+  "name": "Team tools",
+  "description": "Review and release workflows for the platform team.",
+  "version": 1,
+  "extends": "connecto"
+}</pre>
+<ul>
+  <li><code>extends</code> names a package that is installed first, so yours can build on it.</li>
+  <li><code>version</code> is Connecto's. It goes up by one whenever the content changes. Do not edit it.</li>
+  <li>The folder name is the package's id: lowercase letters, digits and <code>-</code>.</li>
+</ul>
+
+<h2>The built-in package</h2>
+<p>Connecto ships one package, and it is the default until you pick another. It contains team workflows in which each tool is reviewed by the other:</p>
+<ul>
+  <li><strong>Skills</strong>: <code>brainstorm-team</code>, <code>dev-team</code>, <code>strong-dev-team</code>, <code>daily-team</code> and <code>strong-daily-team</code>. They run only when you invoke them.</li>
+  <li><strong>Subagents</strong>: architect, backend, frontend, developer, finalizer, doc-analyst, requirements-challenger and spec-writer.</li>
+  <li><strong>Plugin settings</strong> for Claude Code, and a status line showing the model, context use and session cost.</li>
+</ul>
+<p>The built-in package cannot be edited or deleted. To change it, create your own package that extends it.</p>
+
+<h2>Create a package</h2>
+<ol>
+  <li>Open <strong>Terminal → Skills &amp; Plugins…</strong> and click <strong>New package…</strong>.</li>
+  <li>Give it a name, and optionally a package to extend.</li>
+  <li>A Claude terminal opens in Connecto Home and asks which skills and plugins to include. It can take them from your own <code>~/.claude</code> and <code>~/.codex</code>, or from a project.</li>
+</ol>
+<p>In the sheet, each package has <strong>Set as default</strong>, <strong>Edit</strong> and <strong>Delete</strong>. You can also write the files yourself and check them:</p>
+<pre>connecto package check &lt;id&gt;</pre>
+
+<h2>Which packages a project gets</h2>
+<p>Open a project's settings from the gear on its row:</p>
+<ul>
+  <li><strong>DEFAULT PACKAGE</strong>: whether this project uses the default package.</li>
+  <li><strong>ADDED PACKAGES</strong>: more packages for this project only.</li>
+  <li><strong>TOOLS</strong>: Claude, Codex or both. Only the chosen tools' files are installed.</li>
+  <li><strong>STATUS</strong>: what is installed, and a <strong>Refresh</strong> button.</li>
+</ul>
+
+<h2>How installing works</h2>
+<p>Connecto copies the package's files into the project's <code>.claude</code>, <code>.codex</code> and <code>.agents</code> folders when the project opens, when a package changes, and when you click Refresh. The default package goes in first, then the added ones.</p>
+<ul>
+  <li><strong>Files you edited are left alone.</strong> Connecto records what it installed in <code>.connecto/packages.lock</code>, so it can tell its own files from your changes. The status lists any file it skipped.</li>
+  <li><strong>Files a package dropped are removed.</strong></li>
+  <li><strong><code>settings.json</code> is merged, not replaced.</strong> A key you already set is never overwritten, and exactly what Connecto added is taken back if the package changes.</li>
+  <li><strong>Running terminals keep what they started with.</strong> Restart a terminal to pick up an update.</li>
+</ul>
+<p>A package can hold up to 2000 files and 16 MiB. Symbolic links and <code>settings.local.json</code> are never installed.</p>
+
+<div class="note"><p><b>A package can contain hooks and settings.</b> They run in your projects with your account's reach. Install packages only from people you would run a script from.</p></div>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

@@ -1,0 +1,1 @@
+{"columns":60,"tasks":[{"id":"t1","name":"doc-analyst","model":"claude-haiku-4-5","effort":"low","label":"Reading every crate of the workspace and writing down what each module does, which platform it targets, and where the macOS assumptions are","tokenCount":999999,"contextWindowSize":200000}]}

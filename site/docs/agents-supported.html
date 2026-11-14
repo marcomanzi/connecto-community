@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Supported agents · Connecto docs</title>
+<meta name="description" content="The agent CLIs Connecto runs today, and the ones that are next.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="agents-supported">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Supported agents</h1>
+<p class="lead">Connecto runs agent CLIs through adapters: one per tool. Two are available, and three are next.</p>
+
+<table>
+  <tr><th>Agent</th><th>Status</th><th>Command for a new terminal</th></tr>
+  <tr><td><strong>Claude Code</strong></td><td><span class="pill">available</span></td><td><code>connecto add claude</code> · <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>1</kbd></td></tr>
+  <tr><td><strong>Codex</strong></td><td><span class="pill">available</span></td><td><code>connecto add codex</code> · <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>2</kbd></td></tr>
+  <tr><td><strong>Plain shell</strong> (not an agent)</td><td><span class="pill">available</span></td><td><code>connecto add shell</code> · <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>3</kbd></td></tr>
+  <tr><td><strong>Gemini CLI</strong></td><td><span class="pill red">next</span></td><td></td></tr>
+  <tr><td><strong>Cursor CLI</strong></td><td><span class="pill red">next</span></td><td></td></tr>
+  <tr><td><strong>opencode</strong></td><td><span class="pill red">next</span></td><td></td></tr>
+</table>
+
+<h2>Available today</h2>
+<p>Claude Code and Codex both have everything in these docs: terminals, the <code>connecto</code> command, automations, packages, isolated and system profiles, history, and remote sessions.</p>
+<ul>
+  <li>Connecto does not pin a CLI version. It relies on the tools staying compatible, and runs its own verified copy, made from your install at the first launch. To pick up a newer version by hand, run <code>connecto-app provision</code>.</li>
+  <li>The tools' own auto-update is turned off inside Connecto, so a session never changes under you.</li>
+  <li>Writing a new <a href="packages.html">package</a> with an agent's help uses Claude. <a href="history.html#utility-sessions">Titles</a> use Claude too.</li>
+</ul>
+
+<h2>A plain shell</h2>
+<p>Besides the agents, a terminal can be your login shell: <code>$SHELL</code> started as an interactive login shell in the project folder, so it has the environment you know. It has no turns, no login and no launch mode, so its dot is a small grey square that only says it is running. Other terminals drive it with <code>connecto send &lt;id&gt; '&lt;one command line&gt;'</code> and <code>connecto read &lt;id&gt;</code>; <code>--ask</code> and <code>watch</code> are refused, because a shell has no end of turn to report. It is held to the same rules as any terminal: Pause blocks writes, and every write is in the audit log. It is also as powerful as a bypass-permissions agent, so treat access to it that way.</p>
+
+<h2>Next: Gemini CLI, Cursor CLI and opencode</h2>
+<div class="note soon"><p><b>These three are being built now.</b> This page will list what each supports as it lands.</p></div>
+<p>The aim is for a new agent to be a full member of the workspace, not a second-class terminal:</p>
+<ul>
+  <li>its own terminals, in the same project tree, with the same states;</li>
+  <li>the <code>connecto</code> command, so it can ask Claude or Codex for help, and be asked;</li>
+  <li>the same Pause, audit log and redaction;</li>
+  <li>a place in packages, automations and per-project settings, as far as each tool allows.</li>
+</ul>
+<p>How far each one goes depends on what the CLI itself offers: for example, whether it reports the end of a turn, and whether it can resume a conversation.</p>
+
+<h2>What an adapter does</h2>
+<p>For each tool, an adapter tells Connecto how to:</p>
+<ul>
+  <li>launch it, with which options and which profile folder;</li>
+  <li>sign in, and tell whether it is signed in;</li>
+  <li>know when it is ready for input, when a turn starts and when it ends;</li>
+  <li>capture its reply, so <code>send --ask</code> can deliver it;</li>
+  <li>resume a conversation from the history.</li>
+</ul>
+<p>Adapters are part of Connecto itself. A new agent arrives with a new version of the app.</p>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "agent": "claude",
+  "enabled": false,
+  "keys": [
+    "enter"
+  ],
+  "match": "welcome_screen",
+  "model": "jev-1.14.0",
+  "name": "Continue Claude welcome screen",
+  "question": {
+    "criteria": {
+      "other": "Anything else: the normal Claude Code start banner or input box without `Press Enter to continue`; a menu prompt (workspace trust, Chrome extension, Bypass Permissions warning, permission prompts); or the welcome text only in old scrollback while the session has moved on.",
+      "welcome_screen": "A line `Welcome to Claude Code` with a version number, often ASCII art, then `Security notes:` with items like `1. Claude can make mistakes.` and `2. Due to prompt injection risks, only use it with code you trust`, ending with `Press Enter to continue…`. It is still waiting for Enter."
+    },
+    "instructions": "The text is the screen of a Claude Code terminal. Decide whether it is currently showing the first-run `Welcome to Claude Code` screen with security notes, still waiting for Enter.",
+    "type": "choice"
+  },
+  "threshold": 0.8,
+  "trigger": [
+    "Welcome to Claude Code",
+    "Press Enter to continue"
+  ],
+  "version": 1
+}

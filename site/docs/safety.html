@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pause, audit and redaction · Connecto docs</title>
+<meta name="description" content="What agents can do in Connecto, and the controls you have: Pause, Stop, the audit log and redaction.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="safety">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Pause, audit and redaction</h1>
+<p class="lead">Connecto gives agents more reach, not less: they can drive each other. This page says plainly what that means and what you control.</p>
+
+<h2>What agents can do</h2>
+<div class="note warn"><p><b>There is no sandbox.</b> Agents run as your user, with your files and your network. In the default launch mode, the tools' own approval checks are off. An agent can change anything your account can change.</p><p>Text on one screen can steer an agent that reads it. With the <code>connecto</code> command, that agent can type into the other terminals.</p></div>
+<p>If you want the tools' own checks back, choose <strong>Auto</strong> or <strong>Prompt</strong> in <a href="isolation.html#how-agents-are-launched">How agents are launched</a>.</p>
+
+<h2>Pause</h2>
+<p><strong>Agents → Pause All Agents</strong>, or <kbd>⌘</kbd> <kbd>.</kbd>, or the switch at the bottom of the sidebar.</p>
+<p>Pause is a full brake on everything that is not you:</p>
+<ul>
+  <li>agents sending text or keys to other terminals;</li>
+  <li>agents adding, starting or closing terminals, and being woken;</li>
+  <li>automations checking screens and typing;</li>
+  <li>remote users typing, resizing, changing terminals, and pairing.</li>
+</ul>
+<p>A turn that is already running continues: Pause does not kill anything. You can still type into any terminal yourself. An agent cannot lift Pause.</p>
+
+<h2>Stop</h2>
+<ul>
+  <li><strong>Close Terminal</strong> (<kbd>⌘</kbd> <kbd>W</kbd>) ends one terminal and moves it to the history.</li>
+  <li><strong>Agents → Stop Everything</strong> pauses first, then ends every terminal.</li>
+</ul>
+<p>Connecto ends the processes it can find. A process that detached itself before you clicked Stop can outlive it.</p>
+
+<h2>The audit log</h2>
+<p>Every action that one terminal takes on another is recorded: who did it (you, an agent, an automation, or a remote user), what it was, and the text, with secrets redacted.</p>
+<p>The log is in Connecto's data folder under <code>audit/</code>, with a new file for each launch. Each record is chained to the one before it by a hash, so an edited record can be found:</p>
+<pre>connecto-app audit verify &lt;file&gt;</pre>
+<p>The check finds a changed record. It cannot tell that the end of a file was deleted.</p>
+
+<h2>Redaction</h2>
+<p>Before text leaves a terminal for anywhere else, Connecto removes what looks like a secret and writes <code>[REDACTED]</code> in its place:</p>
+<ul>
+  <li>known token formats and private-key blocks;</li>
+  <li>values after names such as <code>password=</code>;</li>
+  <li>long random-looking strings.</li>
+</ul>
+<p>It applies to messages between agents, the audit log, history transcripts, the text sent to the automation classifier, and the text used to title a terminal. If redaction fails, the content is withheld instead of passed on.</p>
+<p>Your own terminal is never redacted: you see exactly what the tool printed.</p>
+<div class="note"><p>Redaction is best effort. It lowers the chance that a secret travels; it is not proof that none did.</p></div>
+
+<h2>What Connecto does to limit damage</h2>
+<ul>
+  <li>It refuses your home folder, its own data folder and the tools' state folders as projects.</li>
+  <li>A terminal inherits only <code>USER</code>, <code>LOGNAME</code>, <code>PATH</code> and <code>LANG</code> from your environment.</li>
+  <li>Isolated projects (an advanced option) keep their logins and settings <a href="isolation.html">apart from yours</a>.</li>
+  <li>Sessions outside Connecto cannot message a Connecto Claude terminal.</li>
+  <li>Automations have rate limits and a per-terminal cutoff.</li>
+  <li>Remote access is off until you turn it on.</li>
+</ul>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

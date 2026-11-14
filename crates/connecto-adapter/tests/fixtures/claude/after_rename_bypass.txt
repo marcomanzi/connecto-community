@@ -1,0 +1,13 @@
+u ▐▛███▛█  Claude Code v2.1.322
+▝▜██████▀  Fable 5.2 · Claude Ultra
+ ▝▝   ▝▝   ~/.skainet-throwaway-home/workroot/remote-proj
+
+
+❯ /rename backend reviewer
+  ⎿  Session renamed to: backend reviewer
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────── backend reviewer ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=…
+  ⏵⏵ bypass permissions on (shift+tab to cycle)                                                               ◐ medium · /effort

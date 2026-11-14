@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Python bytecode from test fixtures
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Release artifacts
+/dist/
+
+# The relay access token built into release builds (never committed)
+scripts/release/relay-token.local
+
+# The private key that signs the update feed (never committed)
+scripts/release/update-signing-key.local

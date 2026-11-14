@@ -1,0 +1,25 @@
+{
+  "agent": "claude",
+  "enabled": false,
+  "keys": [
+    "enter"
+  ],
+  "match": "theme_picker",
+  "model": "jev-1.14.0",
+  "name": "Choose the Dark theme in Claude setup",
+  "question": {
+    "criteria": {
+      "other": "Anything else: a different onboarding step (login, trust folder, security notes), the picker with the marker on a different option than plain `Dark mode`, the `/theme` command opened inside a normal session, normal conversation or command output that only mentions these words, or a screen where the theme was already chosen and the next step is shown.",
+      "theme_picker": "The screen shows `Welcome to Claude Code`, `Let's get started.`, the heading `Choose the text style that looks best with your terminal`, the hint `To change this later, run /theme`, and a list of options `Auto (match terminal)`, `Dark mode`, `Light mode`, `Dark mode (colorblind-friendly)`, `Light mode (colorblind-friendly)`, `Dark mode (ANSI colors only)`, `Light mode (ANSI colors only)`, usually followed by a code diff preview and a `Syntax theme:` line. If a selection marker (`❯` or `✔`) is visible, it is on the plain `Dark mode` line. The picker is still open: nothing after it shows the onboarding moved on."
+    },
+    "instructions": "The text is the screen of a Claude Code terminal. Decide whether it is showing the first-run onboarding theme picker that is still waiting for the user to choose a text style, with Dark mode as the current selection.",
+    "type": "choice"
+  },
+  "threshold": 0.8,
+  "trigger": [
+    "Choose the text style that looks best with your terminal",
+    "To change this later, run /theme",
+    "Dark mode (colorblind-friendly)"
+  ],
+  "version": 1
+}

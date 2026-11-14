@@ -1,0 +1,22 @@
+[package]
+name = "connecto-hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "connecto-hook"
+path = "src/bin/connecto-hook.rs"
+
+[dependencies]
+serde_json.workspace = true
+
+# A named-pipe server for the Windows transport tests (the client is std only).
+[target.'cfg(windows)'.dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "io-util", "time"] }

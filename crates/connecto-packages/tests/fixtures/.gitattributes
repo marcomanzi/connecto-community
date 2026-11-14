@@ -1,0 +1,3 @@
+# Status line inputs and the exact bytes the scripts print: never converted
+# (no CRLF on a Windows checkout), compared byte for byte.
+* -text

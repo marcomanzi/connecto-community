@@ -1,0 +1,22 @@
+ ▐▛███▛█   Claude Code v2.1.322
+▝▜██████▀  Fable 5.2 · Claude Ultra
+ ▝▝   ▝▝   ~/.skainet-throwaway-home/workroot/remote-proj
+
+
+❯ Write a 120 word paragraph about lighthouses.
+
+⏺ Lighthouses have guided sailors along dangerous coastlines for more than two thousand years. The earliest known example, the
+  Pharos of Alexandria, stood over a hundred meters tall and was counted among the wonders of the ancient world. Later towers
+  burned coal, oil, or gas, until the nineteenth century brought the Fresnel lens, whose concentric prisms could throw a beam more
+  than twenty miles out to sea. Each light flashed in its own distinct pattern, allowing navigators to identify their position at
+  night. Keepers once lived on site, trimming wicks and winding clockwork through storms and solitude. Today most lighthouses are
+  automated, and satellite navigation has reduced their importance, yet they endure as landmarks and symbols of safety,
+  vigilance, and hope.
+
+✻ Crunched for 10s · done 6:11 PM
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────── backend reviewer ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=…
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Updates · Connecto docs</title>
+<meta name="description" content="How Connecto updates itself: checks, downloads in the background, verifies, and installs when you restart.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="updates">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Updates</h1>
+<p class="lead">Connecto keeps itself up to date. A new version is downloaded in the background and installed when you say so, with one restart. Your terminals come back afterwards, as at any start.</p>
+
+<h2>How it works</h2>
+<ol>
+  <li><strong>A check at launch, then once a day.</strong> Connecto reads a small file, <code>connecto.studio/downloads/update.json</code>, that names the newest version. It sends nothing about you or your machine: the request carries only <code>Connecto-Updater/&lt;version&gt;</code> as its user agent.</li>
+  <li><strong>A download in the background.</strong> When there is a newer version, Connecto downloads it and checks it before offering it (see below).</li>
+  <li><strong>You choose when.</strong> A strip at the top of the window says <em>Connecto 0.1.9 is ready</em>, with <strong>Update and restart</strong> and <strong>Later</strong>. Later hides it until the next version.</li>
+  <li><strong>Running agents finish first.</strong> If an agent is in the middle of a turn, Connecto waits for it, and says how many turns it is waiting for. <strong>Restart now</strong> does not wait.</li>
+  <li><strong>The restart.</strong> Connecto quits as usual, the new version is put in place, and it starts. Open projects and terminals are restored, and agent sessions resume where they were.</li>
+</ol>
+<p>To check by hand, choose <strong>Connecto → Check for Updates…</strong> (on Windows, <strong>File → Check for Updates…</strong>), or <strong>Check now</strong> in <strong>Settings → Connecto Home → Updates</strong>. There you can also turn off <strong>Check for updates automatically</strong>. There is one release channel: no betas.</p>
+
+<h2>What is checked</h2>
+<ul>
+  <li><strong>The feed is signed.</strong> <code>update.json</code> carries an ed25519 signature. Connecto has the matching public key built in, so a feed changed by anyone else is refused.</li>
+  <li><strong>The download matches.</strong> The feed names each file's size and SHA-256, and the download must match both.</li>
+  <li><strong>On a Mac, Apple's checks too.</strong> The new app must be intact, signed with the same Developer ID as the one running, and accepted by Gatekeeper (notarized by Apple). Anything else is not installed.</li>
+  <li><strong>Never older.</strong> Only a newer version than the one running is offered.</li>
+</ul>
+
+<h2>If the new version does not start</h2>
+<p>The version you had is kept until the new one has started properly. If the new one has not started within two minutes, it is moved aside, the previous version is put back and started, and a note says so. That version is not offered again; the next one is.</p>
+<p>On a Mac the previous version is kept in Connecto's data folder (<code>updates/previous</code>), and an older one goes to the Trash. On Windows it is kept beside the install folder, as <code>Connecto.previous</code>.</p>
+
+<h2>Where Connecto must be installed</h2>
+<ul>
+  <li><strong>Mac:</strong> in a folder you can write to, normally <strong>Applications</strong>. A copy run straight from the disk image cannot update itself; Connecto then offers the download page instead.</li>
+  <li><strong>Windows:</strong> in <code>%LOCALAPPDATA%\Programs\Connecto</code> (unzip the download into <code>%LOCALAPPDATA%\Programs</code>). A copy elsewhere installs its first update there.</li>
+</ul>
+<p>The download count on the home page counts new downloads only: an update of an existing install is not counted.</p>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

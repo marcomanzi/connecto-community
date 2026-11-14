@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connecto — your coding agents, connected</title>
+<meta name="description" content="Connecto is a macOS app that runs Claude Code and Codex in real terminals, side by side, and lets them work together: agents ask each other, automations answer prompts, and skills packages follow every project.">
+<meta property="og:title" content="Connecto — your coding agents, connected">
+<meta property="og:description" content="Run Claude Code and Codex in real terminals and let them work together. Automations, skills packages, isolated profiles and remote sessions.">
+<meta property="og:image" content="assets/img/logo-640.png">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+
+<header class="top" id="top">
+  <div class="wrap">
+    <a class="brand" href="./"><img class="mark" src="assets/img/icon-256.png" alt="">Connecto</a>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#automations">Automations</a>
+      <a href="#clis">Agents</a>
+      <a class="keep" href="docs/">Docs</a>
+      <a href="#donate">Support</a>
+      <a class="btn btn-primary btn-sm" href="#download">Download</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+<section class="hero">
+  <canvas id="net" aria-hidden="true"></canvas>
+  <div class="odo-ghost" id="odo-ghost" aria-hidden="true"></div>
+  <div class="wrap">
+    <span class="eyebrow"><i></i>macOS<span class="if-win" hidden> · Windows</span> · Claude Code + Codex · more agents on the way</span>
+    <h1>Your coding agents, <em>connected</em>.</h1>
+    <p class="lede">Connecto runs Claude Code and Codex in real terminals, side by side, and lets them work as a team. One agent asks another for a review, opens a helper, waits for the answer. You watch it all, and you hold the brake.</p>
+    <div class="cta">
+      <a class="btn btn-primary" id="hero-dl" href="#download">Download for macOS</a>
+      <a class="btn btn-ghost" href="docs/">Read the docs →</a>
+    </div>
+    <div class="odo" id="odo" role="status" aria-live="polite">
+      <div class="odo-head"><span class="odo-live"><i></i>LIVE</span><span class="odo-label">Downloads of Connecto</span></div>
+      <div class="odo-digits" id="odo-digits" aria-hidden="true"></div>
+      <p class="odo-foot"><span id="odo-text">Counting downloads…</span><span class="odo-week" id="odo-week" hidden></span></p>
+    </div>
+    <p class="hero-note">Up to 16 terminals per project. Every project open at once.</p>
+
+    <div class="mock" id="mock" aria-label="A Connecto window: a project tree on the left and an agent terminal on the right">
+      <div class="mock-bar"><span></span><span></span><span></span><b>Connecto</b></div>
+      <div class="mock-body">
+        <aside class="side">
+          <h6>PROJECTS</h6>
+          <div class="row proj"><span class="mono">S</span>shop-api</div>
+          <div class="row on"><i class="dot working"></i>claude-1 <small>working</small></div>
+          <div class="row child"><i class="dot working" id="dot-rev"></i>review the diff <small>codex</small></div>
+          <div class="row child"><i class="dot done"></i>write migration <small>done</small></div>
+          <div class="row"><i class="dot needs"></i>codex-2 <small>waiting for you</small></div>
+          <div class="row"><i class="dot idle"></i>claude-3 <small>idle</small></div>
+          <div class="row proj"><span class="mono">W</span>web-app</div>
+          <div class="row"><i class="dot idle"></i>claude-1 <small>idle</small></div>
+          <div class="row"><i class="dot off"></i>codex-1 <small>not started</small></div>
+          <h6 style="margin-top:18px">HOSTS</h6>
+          <div class="row"><i class="dot done"></i>studio-mac <small>connected</small></div>
+        </aside>
+        <div class="pane">
+          <div class="pane-head"><i class="dot working"></i><b>claude-1</b> shop-api <span class="tag">Claude Code</span></div>
+          <pre class="term" id="term" aria-live="off"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="clis" aria-label="Supported agents">
+  <div class="wrap">
+    <div class="label">One window for every agent CLI</div>
+    <span class="chip"><i class="dot done"></i>Claude Code</span>
+    <span class="chip"><i class="dot done"></i>Codex</span>
+    <span class="chip next">Gemini CLI <em>next</em></span>
+    <span class="chip next">Cursor CLI <em>next</em></span>
+    <span class="chip next">opencode <em>next</em></span>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <span class="kicker">What it does</span>
+      <h2>A workspace built for more than one agent.</h2>
+      <p>The CLIs you already use, unchanged, running in real terminals. Connecto adds what is missing between them: a way to talk, a way to share skills, and a way to stop everything at once.</p>
+    </div>
+
+    <div class="bento">
+      <article class="card w4 rv">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M4 6h10a3 3 0 0 1 3 3v2M20 18H10a3 3 0 0 1-3-3v-2"/><path d="m14 8 3 3 3-3M10 16l-3-3-3 3"/></svg></div>
+        <h3>Agents that use each other</h3>
+        <p>Every terminal gets a <code>connecto</code> command. An agent can list the other terminals, read them, open a new one, ask a question and get just the answer back, delivered into its context when the other agent finishes.</p>
+        <div class="snip"><span class="m">$</span> connecto add codex --name <span class="g">"review the diff"</span>
+<span class="m">$</span> connecto send codex-4 --ask &lt;&lt;'EOF'
+Review the migration in db/2031_orders.sql. Anything unsafe?
+EOF
+<span class="c">request r12</span> <span class="m">· the reply arrives when codex-4 finishes</span></div>
+        <a class="more" href="docs/agents.html">The connecto command →</a>
+      </article>
+
+      <article class="card rv" style="--d:.08s">
+        <div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3M13 15h4"/></svg></div>
+        <h3>Real terminals</h3>
+        <p>Not a chat wrapper. The actual CLIs in a real terminal, with their own interface, slash commands and login. Paste, select, drop files in.</p>
+        <a class="more" href="docs/terminals.html">Projects and terminals →</a>
+      </article>
+
+      <article class="card rv">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M13 3 4 14h7l-1 7 9-11h-7z"/></svg></div>
+        <h3>Automations</h3>
+        <p>Teach Connecto to answer a prompt for you. When a terminal shows the screen you described, it presses the keys you chose.</p>
+        <a class="more" href="docs/automations.html">Automations →</a>
+      </article>
+
+      <article class="card rv" style="--d:.08s">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9"/></svg></div>
+        <h3>Skills &amp; Plugins packages</h3>
+        <p>Bundle skills, subagents, commands and plugin settings once. Connecto installs them into every project that uses the package and keeps them up to date.</p>
+        <a class="more" href="docs/packages.html">Packages →</a>
+      </article>
+
+      <article class="card rv" style="--d:.16s">
+        <div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/><path d="M17 3v4a2 2 0 0 0 2 2h2M7 21v-4a2 2 0 0 0-2-2H3"/></svg></div>
+        <h3>Isolated or system</h3>
+        <p>Give a project its own private login, history and settings for each tool, or let it use your everyday <code>~/.claude</code> and <code>~/.codex</code>.</p>
+        <a class="more" href="docs/isolation.html">Isolated and system terminals →</a>
+      </article>
+
+      <article class="card w3 rv">
+        <div class="ico"><svg viewBox="0 0 24 24"><rect x="2" y="4" width="9" height="7" rx="1.5"/><rect x="13" y="13" width="9" height="7" rx="1.5"/><path d="M6.5 11v3a3 3 0 0 0 3 3H13M17.5 13v-3a3 3 0 0 0-3-3H11"/></svg></div>
+        <h3>Remote sessions</h3>
+        <p>Drive the agents on another Mac from this one. Pair with a six-digit code, then watch and type into its terminals over an encrypted direct link.</p>
+        <a class="more" href="docs/remote.html">Remote sessions →</a>
+      </article>
+
+      <article class="card w3 rv" style="--d:.08s">
+        <div class="ico red"><svg viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg></div>
+        <h3>One brake for everything</h3>
+        <p><kbd>⌘</kbd> <kbd>.</kbd> pauses every agent action: sends, keys, new terminals, automations, remote input. An agent cannot lift it. Every action is written to a hash-chained audit log with secrets redacted.</p>
+        <a class="more" href="docs/safety.html">Pause, audit and redaction →</a>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="automations">
+  <div class="wrap">
+
+    <div class="split rv">
+      <div>
+        <span class="kicker">Automations</span>
+        <h2>Stop babysitting permission prompts.</h2>
+        <p>An automation is a small rule: when a terminal shows this, press these keys. You describe it in plain words, or paste a screenshot, and an agent writes the rule with you.</p>
+        <ul>
+          <li>A local text trigger runs first, so the classifier is called only when it could matter.</li>
+          <li>A classifier model (Jev, with your own key) decides whether the screen really is the one you meant.</li>
+          <li>Below your confidence threshold, Connecto asks you instead of typing.</li>
+          <li>Rate limits, a per-terminal cutoff, and Pause all apply. Every call is in the history.</li>
+        </ul>
+        <a class="more" href="docs/automations.html">How automations work →</a>
+      </div>
+      <div class="vis">
+        <div class="flow" id="flow">
+          <div class="step"><span class="n">1</span><div><b>The screen settles</b><span>Connecto reads the bottom of the terminal once it stops changing.</span></div></div>
+          <div class="step"><span class="n">2</span><div><b>Trigger text matches</b><span><code>"Do you want to make this edit"</code></span></div></div>
+          <div class="step"><span class="n">3</span><div><b>The classifier agrees</b><span><code>edit_prompt</code> at 94%, above your 80% threshold.</span></div></div>
+          <div class="step"><span class="n">4</span><div><b>Keys are typed</b><span class="keys"><kbd>down</kbd><kbd>enter</kbd></span></div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="split flip rv" id="packages">
+      <div>
+        <span class="kicker">Skills &amp; Plugins packages</span>
+        <h2>Your team's skills, in every project.</h2>
+        <p>A package is a folder of skills, subagents, commands, hooks and plugin settings for Claude Code and Codex. Pick a default, add more per project, and Connecto copies the right files in.</p>
+        <ul>
+          <li>The built-in package ships team workflows where each tool reviews the other's work.</li>
+          <li>Packages can extend one another, so a team base plus a project layer just works.</li>
+          <li>Updates remove what a package dropped and leave files you edited alone.</li>
+          <li>Settings are merged, never overwritten: keys you set stay yours.</li>
+        </ul>
+        <a class="more" href="docs/packages.html">How packages work →</a>
+      </div>
+      <div class="vis">
+<div class="tree"><span class="m">Connecto Home/packages/</span>
+└─ <span class="c">team-tools/</span>
+   ├─ package.json            <span class="m">name, description, extends</span>
+   ├─ <span class="c">.claude/</span>
+   │  ├─ skills/review/SKILL.md
+   │  ├─ agents/architect.md
+   │  ├─ commands/ship.md
+   │  └─ settings.json        <span class="m">merged into the project's</span>
+   ├─ <span class="c">.codex/</span>
+   │  └─ agents/critic.toml
+   └─ <span class="c">.agents/</span>
+      └─ skills/review/SKILL.md
+
+<span class="r">→ installed into each project that uses it</span></div>
+      </div>
+    </div>
+
+    <div class="split rv" id="isolation">
+      <div>
+        <span class="kicker">Isolated and system terminals</span>
+        <h2>Keep a project separate. Or don't.</h2>
+        <p>For each project, and for each tool, you choose where the CLI keeps its login, history and configuration.</p>
+        <ul>
+          <li><b>System default</b> (the default) uses your own <code>~/.claude</code> or <code>~/.codex</code>, exactly like a terminal you opened yourself.</li>
+          <li><b>Isolated</b> (advanced) gives the project a private profile. A client project never sees your personal account, plugins or history.</li>
+          <li>Separately, choose how agents launch: skip permission checks, let a model review each action, or ask before acting.</li>
+        </ul>
+        <a class="more" href="docs/isolation.html">Isolated and system terminals →</a>
+      </div>
+      <div class="vis">
+        <div class="modes">
+          <div class="mode sel">
+            <h4>System default <small>default</small></h4>
+            <p>Your everyday login, settings and plugins. No second sign-in.</p>
+            <code>~/.claude · ~/.codex</code>
+          </div>
+          <div class="mode">
+            <h4>Isolated <small>advanced</small></h4>
+            <p>Own login, own history, own settings. Nothing shared with other projects.</p>
+            <code>…/connecto/projects/&lt;id&gt;/profiles/claude</code>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="split flip rv" id="remote">
+      <div>
+        <span class="kicker">Remote sessions</span>
+        <h2>The agents on your other Mac, in this window.</h2>
+        <p>Leave the heavy work running on a desktop and check in from a laptop. A paired host appears in the sidebar like a project, with its terminals live.</p>
+        <ul>
+          <li>Pair with a six-digit code that lasts two minutes and works once.</li>
+          <li>Direct encrypted connection, with a relay only when a direct path cannot be found.</li>
+          <li>Watch, type, use the mouse, add, rename, restart and close terminals.</li>
+          <li>Off until you turn it on. Paired devices are listed and can be revoked.</li>
+        </ul>
+        <a class="more" href="docs/remote.html">Remote sessions →</a>
+      </div>
+      <div class="vis">
+        <div class="pair">
+          <div class="code" id="paircode">482 913</div>
+          <div class="ttl">Valid for two minutes and for one device</div>
+          <div class="bar"><i></i></div>
+          <div class="macs"><span class="mac">laptop</span><span class="wire"></span><span class="mac">studio-mac</span></div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<section id="clis">
+  <div class="wrap">
+    <div class="sec-head center rv">
+      <span class="kicker">Agents</span>
+      <h2>Two today. Three more next.</h2>
+      <p>Connecto talks to each CLI through an adapter, so a new agent joins the same window, the same <code>connecto</code> command and the same brake as the others.</p>
+    </div>
+    <div class="road rv">
+      <div class="cli live"><b>Claude Code</b><span>available</span><p>Terminals, bridge, automations, packages, history.</p></div>
+      <div class="cli live"><b>Codex</b><span>available</span><p>Terminals, bridge, automations, packages, history.</p></div>
+      <div class="cli soon"><b>Gemini CLI</b><span>next</span><p>Integration in progress.</p></div>
+      <div class="cli soon"><b>Cursor CLI</b><span>next</span><p>Integration in progress.</p></div>
+      <div class="cli soon"><b>opencode</b><span>next</span><p>Integration in progress.</p></div>
+    </div>
+    <p class="req"><a href="docs/agents-supported.html">Supported agents and what is planned →</a></p>
+  </div>
+</section>
+
+<section id="download" class="get">
+  <div class="wrap">
+    <span id="donate" class="anchor" aria-hidden="true"></span>
+    <div class="donate-box compact rv">
+      <span class="kicker">Open source</span>
+      <h2>Sustain open-source development.</h2>
+      <p>Connecto is free software under the AGPL-3.0, built in the open and funded by the people who use it. If it earns a place in your day, you can help keep it independent. <b>The download below is free, always.</b></p>
+      <div class="amounts">
+        <a class="amount" href="https://paypal.me/marcomanzi83/1EUR" target="_blank" rel="noopener">€1<small>Thank you</small></a>
+        <a class="amount" href="https://paypal.me/marcomanzi83/5EUR" target="_blank" rel="noopener">€5<small>Supporter</small></a>
+        <a class="amount" href="https://paypal.me/marcomanzi83/10EUR" target="_blank" rel="noopener">€10<small>Backer</small></a>
+        <a class="amount" href="https://paypal.me/marcomanzi83/20EUR" target="_blank" rel="noopener">€20<small>Sustainer</small></a>
+      </div>
+      <p class="donate-note">Opens PayPal with the amount filled in; you can change it there. Prefer code to coins? <a href="https://github.com/marcomanzi/connecto-community" target="_blank" rel="noopener">The source is on GitHub.</a></p>
+    </div>
+
+    <div class="sec-head center rv get-head">
+      <span class="kicker">Download</span>
+      <h2>Get Connecto.</h2>
+      <p>A native <span class="if-no-win">macOS app</span><span class="if-win" hidden>app for macOS and Windows</span>. No Connecto account: your agents use the logins you already have.</p>
+    </div>
+    <div class="dl rv" id="dl"></div>
+    <div class="unsigned"><b>The Mac builds are signed and notarized by Apple.</b> Open the disk image, drag Connecto to Applications, and open it. <a href="docs/install.html#unsigned">Step by step →</a> <span class="if-no-win">Linux and Windows are not available yet.</span><span class="if-win" hidden><br><b>Windows:</b> the build is not signed yet, so Windows SmartScreen warns the first time you start it: click <b>More info</b>, then <b>Run anyway</b>. <a href="docs/install.html#windows">Windows steps →</a> Linux is not available yet.</span></div>
+    <p class="req">Needs macOS<span class="if-win" hidden>, or Windows 10 (1809) or later on x86_64</span>, and Claude Code or Codex already installed. <a href="docs/install.html">Installation guide →</a></p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <a class="brand" href="./"><img class="mark" src="assets/img/icon-256.png" alt="">Connecto</a>
+    <span>Made by Marco Manzi.</span>
+    <nav>
+      <a href="docs/">Docs</a>
+      <a href="docs/install.html">Install</a>
+      <a href="docs/safety.html">Safety</a>
+      <a href="#download">Download</a>
+      <a href="https://github.com/marcomanzi/connecto-community" target="_blank" rel="noopener">Source</a>
+      <a href="#donate">Support</a>
+    </nav>
+  </div>
+</footer>
+
+<script src="assets/releases.js"></script>
+<script src="assets/downloads.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

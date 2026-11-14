@@ -1,0 +1,12 @@
+[Unit]
+Description=Count Connecto downloads into the site's downloads/stats.json
+After=docker.service
+
+[Service]
+Type=oneshot
+# Set the two folders for your server: where Caddy writes the download log
+# (caddy-snippet.caddy), and the site's downloads folder.
+ExecStart=/usr/bin/python3 -I /usr/local/lib/connecto/count-downloads.py \
+  --logs /var/log/caddy \
+  --downloads /var/www/connecto/downloads
+Nice=10

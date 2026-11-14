@@ -1,0 +1,1 @@
+{"columns":30,"tasks":[{"id":"x1","name":"漢字エージェント","label":"日本語のラベルがとても長い場合","tokenCount":5000,"contextWindowSize":100000},{"id":"x2","name":"e\u0301clair","label":"cafe\u0301 \u200bzero","tokenCount":5000}]}

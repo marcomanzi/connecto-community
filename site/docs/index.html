@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Introduction · Connecto docs</title>
+<meta name="description" content="What Connecto is, and where to find each feature in these docs.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="index">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Introduction</h1>
+<p class="lead">Connecto is a macOS app that runs coding agents in real terminals, side by side, and lets them work together.</p>
+
+<p>Today it runs <strong>Claude Code</strong> and <strong>Codex</strong>. Gemini CLI, Cursor CLI and opencode are next. Each agent runs as the CLI you already know, unchanged, in its own terminal. Connecto adds the parts that are missing when you run several of them at once:</p>
+
+<ul>
+  <li><strong>A workspace.</strong> Every project is open at the same time, each with up to 16 terminals, in one sidebar that shows which agent is working and which one is waiting for you.</li>
+  <li><strong>A way for agents to talk.</strong> Each terminal gets a <code>connecto</code> command, so an agent can open another terminal, ask it a question, and receive the answer when it is ready.</li>
+  <li><strong>Automations.</strong> Rules that answer a prompt for you when a terminal shows a screen you described.</li>
+  <li><strong>Skills &amp; Plugins packages.</strong> Skills, subagents, commands and plugin settings that Connecto installs into every project that uses them.</li>
+  <li><strong>Isolated or system profiles.</strong> A project uses your own login and settings by default; an advanced option gives it a private login and settings for each tool.</li>
+  <li><strong>Remote sessions.</strong> The terminals on another Mac, shown and driven from this one.</li>
+  <li><strong>One brake.</strong> Pause stops every agent action at once, and an audit log records what agents did.</li>
+</ul>
+
+<div class="cards">
+  <a href="install.html"><b>Install and first launch</b><span>What you need, and the first five minutes.</span></a>
+  <a href="agents.html"><b>Agents using other terminals</b><span>The <code>connecto</code> command.</span></a>
+  <a href="automations.html"><b>Automations</b><span>Answer prompts automatically.</span></a>
+  <a href="packages.html"><b>Skills &amp; Plugins packages</b><span>Share skills across projects.</span></a>
+  <a href="isolation.html"><b>Isolated and system terminals</b><span>Where logins and settings live.</span></a>
+  <a href="remote.html"><b>Remote sessions</b><span>Drive another Mac's agents.</span></a>
+</div>
+
+<h2>What Connecto is not</h2>
+<ul>
+  <li><strong>It is not a sandbox.</strong> Agents run as your user, with your files and your network. Read <a href="safety.html">Pause, audit and redaction</a> before giving an agent a task you would not give a colleague with your laptop.</li>
+  <li><strong>It is not a model provider.</strong> You sign in to each tool with your own account, and usage counts against your own plan.</li>
+  <li><strong>It does not replace the CLIs.</strong> It runs them. What you can do in Claude Code or Codex, you can do here.</li>
+</ul>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

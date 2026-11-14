@@ -1,0 +1,1 @@
+{"columns":10,"tasks":[{"id":"t2","name":"spec-writer","model":"claude-opus-4","label":"Reading every crate of the workspace and writing down what each module does, which platform it targets, and where the macOS assumptions are","tokenCount":1000000}]}

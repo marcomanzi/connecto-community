@@ -1,0 +1,25 @@
+{
+  "agent": "claude",
+  "enabled": false,
+  "keys": [
+    "down",
+    "enter"
+  ],
+  "match": "chrome_prompt",
+  "model": "jev-1.14.0",
+  "name": "Accept the Claude in Chrome prompt",
+  "question": {
+    "criteria": {
+      "chrome_prompt": "A heading `Claude in Chrome extension detected`, a short explanation (wording may vary), then two unnumbered options: `No, keep browser tools off` first and `Yes, use my browser` second, usually followed by a hint like `Enter to confirm · Esc to keep browser tools off`. The menu is still waiting for a choice.",
+      "other": "Anything else: a different prompt (workspace trust, Bypass Permissions warning, permission to run a command or edit a file); normal conversation; or the Chrome heading only in old scrollback while the session has moved on to a normal input box below it."
+    },
+    "instructions": "The text is the screen of a Claude Code terminal. Decide whether it is currently showing the `Claude in Chrome extension detected` prompt, still waiting for the user to pick an option.",
+    "type": "choice"
+  },
+  "threshold": 0.8,
+  "trigger": [
+    "Claude in Chrome extension detected",
+    "Yes, use my browser"
+  ],
+  "version": 1
+}

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Projects and terminals · Connecto docs</title>
+<meta name="description" content="The Connecto window: the project tree, terminal states, nested terminals and working inside a terminal.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="terminals">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Projects and terminals</h1>
+<p class="lead">The window is a sidebar tree of projects and their terminals, and the terminal you are looking at.</p>
+
+<h2>Projects</h2>
+<p>A project is a folder. Every project you open stays open and keeps running while you look at another one. The sidebar has two sections: <strong>PROJECTS</strong> and <strong>HOSTS</strong> (other Macs, see <a href="remote.html">Remote sessions</a>).</p>
+<ul>
+  <li><kbd>⌘</kbd> <kbd>O</kbd> opens a project, and <strong>File → Open Recent</strong> lists the last ten.</li>
+  <li><kbd>⌘</kbd> <kbd>1</kbd> to <kbd>⌘</kbd> <kbd>9</kbd> jump to a project. <kbd>⌘</kbd> <kbd>\</kbd> hides the sidebar, which becomes a narrow rail of project initials.</li>
+  <li>Each project row has a clock for its <a href="history.html">history</a> and a gear for its <a href="isolation.html#project-settings">project settings</a>. Right-click for Rename, History, Project settings and Close.</li>
+  <li>A project's dot shows its most urgent terminal, so you can see from a collapsed project that something needs you.</li>
+</ul>
+
+<h2>Terminals</h2>
+<p>A project holds up to <strong>16 terminals</strong>. Each one runs one agent CLI. Closed terminals do not count toward the limit: they move to the project's history.</p>
+<p>When you reopen Connecto, only the terminals that were working when it closed start again, and they resume their conversation. The others show <em>not started</em> and start when you look at them.</p>
+
+<h3>States</h3>
+<table>
+  <tr><th>State</th><th>Dot</th><th>Meaning</th></tr>
+  <tr><td>working</td><td><span class="sdot" style="background:#73f8fc"></span>cyan, pulsing</td><td>The agent is in the middle of a turn.</td></tr>
+  <tr><td>waiting for you</td><td><span class="sdot" style="background:#f5b85a"></span>amber</td><td>The agent has asked something and needs an answer.</td></tr>
+  <tr><td>needs login</td><td><span class="sdot" style="background:#f5b85a"></span>amber</td><td>The tool is not signed in for this project.</td></tr>
+  <tr><td>interrupted</td><td><span class="sdot" style="border:2px solid #f5b85a"></span>amber ring</td><td>Connecto was closed while this agent was mid-turn.</td></tr>
+  <tr><td>finished</td><td><span class="sdot" style="background:#5fd3a6;box-shadow:0 0 0 2px #0b1520,0 0 0 3px #5fd3a6"></span>green with a ring</td><td>The turn ended and you have not looked yet.</td></tr>
+  <tr><td>done</td><td><span class="sdot" style="background:#5fd3a6"></span>green check</td><td>A child terminal has delivered its answer.</td></tr>
+  <tr><td>idle</td><td><span class="sdot" style="background:#a9b5bf"></span>light grey</td><td>Ready for input.</td></tr>
+  <tr><td>not started, stopped</td><td><span class="sdot" style="border:1.5px solid #6d8494"></span>hollow</td><td>No process is running.</td></tr>
+  <tr><td>failed</td><td><span class="sdot" style="background:#e54b4b"></span>coral</td><td>The terminal could not start.</td></tr>
+</table>
+<p><kbd>⌘</kbd> <kbd>J</kbd> jumps to the next terminal that needs you.</p>
+
+<h3>Nested terminals</h3>
+<h3 id="names">Names</h3>
+<p>The id (<code>claude-3</code>, <code>codex-2</code>, <code>shell</code>) never changes: agents address terminals by it, and the row always shows it under the name. A name is only a label. Giving a Claude terminal a name also gives it to Claude as its session name: it is passed as <code>--name</code> whenever the terminal starts, and a name set on a terminal that is already running is typed to Claude as <code>/rename</code> once it sits at a quiet prompt (not in a turn, not at a permission prompt, and not while you are typing; the last name wins). That write is in the audit log like any other, and Pause stops it. A Codex terminal and a plain shell are only labelled in Connecto: Codex has a <code>/rename</code> command, but it is not used yet. The same happens when an agent's first <code>--ask</code> names a child, or a remote user renames a terminal.</p>
+<p>A terminal that an agent opens with <code>connecto add</code> appears under the terminal that opened it. If you gave it no name, it is named after the first thing it was asked.</p>
+<ul>
+  <li>You can fold a parent's children away.</li>
+  <li><strong>Terminal → Close Finished Children</strong> (<kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>K</kbd>) clears the ones that are done.</li>
+  <li>Closing a parent moves its children to the top level.</li>
+</ul>
+
+<h2>Inside a terminal</h2>
+<ul>
+  <li><kbd>⌘</kbd> <kbd>V</kbd> pastes. Drag to select, then <kbd>⌘</kbd> <kbd>C</kbd> copies. <kbd>⌘</kbd> <kbd>A</kbd> selects everything.</li>
+  <li>If the program has taken over the mouse, hold <kbd>⇧</kbd> while dragging to select anyway.</li>
+  <li><kbd>⇧</kbd> <kbd>Enter</kbd> inserts a new line without sending, like <kbd>⌥</kbd> <kbd>Enter</kbd>.</li>
+  <li><strong>Drop files</strong> onto the terminal to type their paths, escaped for the shell.</li>
+  <li><kbd>⌘</kbd> <kbd>R</kbd> renames the terminal. The robot icon on its row asks a small model for a <a href="history.html#utility-sessions">short title</a> instead.</li>
+</ul>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

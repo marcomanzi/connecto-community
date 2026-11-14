@@ -1,0 +1,13 @@
+# ADR 0013: the sandbox is removed
+
+**Context.** Sessions ran under a generated Seatbelt profile that contained writes (ADRs 0003, 0004). The user wants Claude and Codex to run freely with their bypass flags and use the whole Mac. The profile also blocked new PTYs, Unix sockets and `ps`, which the bridge needs. The profile rules, the canary, the hard-link scan and the profile-path rules for login and status (ADRs 0008, 0009, 0012) existed only for it.
+
+**Decision.** Delete `connecto-contain`. Tools run directly from the store (`PtySpec.program` is the store entry), always with their bypass flags and no Supervised mode. Status runs directly. Login still gets a new numbered generation, but older generations are kept, because nothing now deletes what a session could have locked. The home-folder refusal survives as `connecto-session/src/project_folder.rs`, since an agent with no sandbox could otherwise be pointed at the home folder or at Connecto's own state. Codex drops `features.unified_exec_tty=false`, which only the sandbox needed. Claude's own cross-session messaging, which the sandbox used to block, is switched off at launch: `crossSessionInbound: refuse`, `permissions.deny` and `--disallowedTools` for `SendMessage` and `ListAgents`. It ships in the same change, so no build has the sandbox gone and that route open.
+
+**Supersedes** 0003, 0004, 0008, 0009 and 0012.
+
+**Consequences.** Agents can write anywhere the account can. Writes are no longer contained, and the badge and README no longer claim it. Limiting Claude to its project folder stays future work. Hard links and leftover profiles stop being a warning.
+
+**Changed after the first manual run.** Claude's own outbound `SendMessage` and `ListAgents` are no longer denied (no `--disallowedTools`, no `permissions.deny`), because the user's `/dev-team` skill messages its subagents with them. `crossSessionInbound: refuse` stays, so other sessions still cannot reach a Connecto terminal. The trade-off: outbound cross-session sends can bypass the bridge's audit and Pause, and L3's extra turns (a send to a refusing session reports success, then a refusal starts a turn on the sender) may come back. Claude also now loads project skills, agents and settings (`--setting-sources user,project,local`, confirmed on 2.1.318 without a model call); project hooks run alongside Connecto's, which the user accepts.
+
+**Project settings.** Because project settings load, a project can set `disableAllHooks` or `disableBypassPermissionsMode`, which a launch flag cannot override. Connecto detects both at launch: hooks disabled turns that terminal's bridge off with a reason, bypass disabled shows a not-full-power warning. Bridge `env` is pinned in the launch settings, which outrank project `env`.

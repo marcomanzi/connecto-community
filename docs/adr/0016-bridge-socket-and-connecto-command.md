@@ -1,0 +1,17 @@
+# ADR 0016: one bridge socket and a `connecto` shell command
+
+**Context.** An agent in a Connecto terminal had no way to see or use the others except `claude -p` and `codex exec`, separate processes that share nothing with the terminal the user can see.
+
+**Decision.** The app owns one Unix socket, `/private/tmp/mg-<uid>/bridge-<pid>.sock`, in the checked private folder. Every terminal gets `CONNECTO_BRIDGE_SOCK`, and a `PATH` whose first entry, `<data>/cli/bin`, holds a `connecto` link to the hook helper. The same binary is the `connecto` command by program name. It sends one request frame (a hook frame with an empty token and a JSON payload) and prints the reply: a length, a JSON header, and for `read`, `result` and `drain` a body to the end of the stream. The ten operations are list, send, keys, read, result, watch, unwatch, add, start and close.
+
+Identity comes only from the peer process tree (`LOCAL_PEERPID`, then a parent walk against the live terminals' root pids). There is no token, and `CONNECTO_TERMINAL` is never trusted. The hook socket stays one-way. Bridge state is one thread that owns watches, inboxes, wakes and requests; actors report through a lossless per-slot outbox for what decides a final state and through a lossy bounded channel, with a counter, for the rest. Both tools' hooks print an inbox as `additionalContext` at `UserPromptSubmit` (Check 2: Codex accepts it, and hook commands get the session's environment).
+
+**Alternatives.** MCP tools (a process per terminal, capped reads, behaviour on Codex nobody had run), a shared folder (no sender identity), commands in the reply text (only at turn end), hook replies on the hook socket (would change the proven one-way path).
+
+**Consequences.** Terminals on an unverified version, or whose Codex hook hash cannot be read, are bridge off and say so. A newer build refreshes the helper in the store without touching the stored tools (`Store::refresh_hook`). Codex hooks are trusted by reading their hash through `codex app-server` in an empty `CODEX_HOME` (Check 2: the hash is the same, and a live profile is never touched), once per app run, a failure included.
+
+**Changed after the first manual run.** (1) `send --ask` tells the agent to end its turn, and a pending `result` for the asker says the same; the `ok` notice of an `--ask` request carries the reply in the sender's context, framed as another agent's words, cut at 3000 bytes, so the woken sender needs no `result` call and no polling loop. (2) `close` stops a terminal and then removes it, with the registry's rules for removal (never the last terminal, never when the list cannot be written, and only once the process has ended). The Gate, the Pause epoch, the attempt checks, the audit and the 250 ms self-close delay are unchanged.
+
+**Note.** The bridge is no longer the only route between Claude sessions: Claude's own `SendMessage` is allowed outward again (ADR 0013), and does not pass the bridge's audit or Pause.
+
+**Exit reasons and slow starts.** A request's unmatched clock now starts when the target is ready, with a 180 s cap, so a tool that loads servers for longer than 15 s still gets and answers an `--ask`. An exited terminal reports its status and last printed line in `list`, in the `exited` notice and in the results of the requests it ended. Text from another terminal is quoted after every line-end kind is turned into a newline.

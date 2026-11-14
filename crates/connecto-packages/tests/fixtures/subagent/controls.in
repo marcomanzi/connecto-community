@@ -1,0 +1,1 @@
+{"columns":60,"tasks":[{"id":"k1","name":"a\u0085b\u009bc\u007fd","model":"claude-opus-5-5\u001b[31m","effort":"\u0007hi","label":"line one\r\nline two \u001b[2J clear","tokenCount":2500}]}

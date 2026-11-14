@@ -1,0 +1,1 @@
+{"model":{"display_name":"Opus 5.5 [1M]"},"effort":{"level":"xhigh"},"context_window":{"used_percentage":150,"current_usage":{"input_tokens":1850000},"context_window_size":2000000},"cost":{"total_cost_usd":1234.567}}

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install and first launch · Connecto docs</title>
+<meta name="description" content="What Connecto needs, how to install it, and what to do the first time it opens.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="install">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Install and first launch</h1>
+<p class="lead">What you need, and what happens the first time Connecto opens.</p>
+
+<div class="note"><p><b>The current version is 0.1.8.</b> Download it from the <a href="../#download">home page</a>: <code>connecto-0.1.8-macos-aarch64.dmg</code> for Apple silicon, <code>connecto-0.1.8-macos-x86_64.dmg</code> for Intel, or <code>connecto-0.1.8-macos-universal.dmg</code> for both. Each file's SHA-256 is next to its button; <code>shasum -a 256 &lt;file&gt;</code> prints yours. <span class="if-no-win">Linux and Windows builds are not available yet.</span><span class="if-win" hidden>For Windows there is <code data-release-file="windows">a zip</code>: see <a href="#windows">On Windows</a>. Linux builds are not available yet.</span></p></div>
+
+<h2 id="unsigned">Opening it the first time</h2>
+<p>From 0.1.7 the Mac builds are <strong>signed with an Apple Developer ID and notarized by Apple</strong>. Open the disk image, drag <strong>Connecto</strong> to Applications and double-click it. macOS asks once whether to open an app downloaded from the internet: click <strong>Open</strong>.</p>
+<p>Builds up to 0.1.6 were not signed. If you still have one, macOS blocks its first launch: choose <strong>Done</strong>, then open <strong>System Settings → Privacy &amp; Security</strong> and click <strong>Open Anyway</strong> (<a href="https://support.apple.com/en-us/102445">Apple's guide</a>). Installing the current version over it is simpler.</p>
+
+<section class="if-win" hidden>
+<h2 id="windows">On Windows</h2>
+<p>The Windows build is a zip, <code data-release-file="windows">connecto-VERSION-windows-x86_64.zip</code>, from the <a href="../#download">home page</a>. It needs Windows 10 version 1809 or later, or Windows 11, on a 64-bit Intel or AMD PC (ARM64 Windows is not supported). Its SHA-256 is next to its button; in PowerShell, <code>Get-FileHash &lt;file&gt;</code> prints yours (in capitals; the letters are the same).</p>
+<ol>
+  <li>Unzip it into <code>%LOCALAPPDATA%\Programs</code>, so the programs end up in <code>%LOCALAPPDATA%\Programs\Connecto</code>: that is the folder Connecto updates itself in (see <a href="updates.html">Updates</a>). Keep the three programs together: <code>connecto-app.exe</code> (the app), <code>connecto-hook.exe</code> and <code>connecto.exe</code> (the helper the app installs for its terminals).</li>
+  <li>Double-click <strong>connecto-app.exe</strong>. The build is <strong>not signed</strong> yet, so Windows SmartScreen says "Windows protected your PC". Click <strong>More info</strong>, then <strong>Run anyway</strong>. (Or, before unzipping: right-click the zip, <strong>Properties</strong>, tick <strong>Unblock</strong>.) Do this only for a download from this site.</li>
+  <li>The first launch sets things up as on a Mac (below): it finds Claude Code and Codex, or installs them with their official Windows installers (<code>https://claude.ai/install.ps1</code> and <code>https://chatgpt.com/codex/install.ps1</code>). PowerShell 7 is optional: setup offers it, and without it the terminals use Windows PowerShell.</li>
+</ol>
+<p>Connecto keeps its data in <code>%APPDATA%\connecto</code>, and its keys and tokens in a secrets file there that only your account can read (see <a href="reference.html#secrets">Where secrets are kept</a>). Windows has no menu bar at the top of the screen, so the menu is inside the Connecto window. To remove Connecto, delete <code>%LOCALAPPDATA%\Programs\Connecto</code> and <code>%APPDATA%\connecto</code>.</p>
+</section>
+
+<h2>What you need</h2>
+<ul>
+  <li>A Mac: Apple silicon with macOS 11 or later, or an Intel Mac with macOS 10.15 or later. The agents themselves may ask for a newer macOS than Connecto does. <span class="if-no-win">Linux and Windows are not supported yet.</span><span class="if-win" hidden>Or a Windows PC (see <a href="#windows">On Windows</a>). Linux is not supported yet.</span></li>
+  <li>Nothing else has to be installed first. If you already have <strong>Claude Code</strong> or <strong>Codex</strong> (with <code>claude</code> and <code>codex</code> in <code>~/.local/bin</code>), Connecto uses them; if you pick one that is not on your Mac, Connecto installs it for you (see below). That needs an internet connection and no password.</li>
+  <li><code>jq</code>, only if you want the status line that the built-in package adds to Claude terminals.</li>
+</ul>
+
+<h2>The first launch sets everything up</h2>
+<p>You do not run anything by hand. The first time Connecto opens, it shows a short window:</p>
+<ol>
+  <li><strong>Welcome.</strong> One button, <em>Set up Connecto</em>.</li>
+  <li><strong>Which agents do you want?</strong> Claude Code, Codex or both; tap to choose. Both are chosen to begin with, and you can change this later in <strong>Settings → Agents</strong>. For one that is not on your Mac, the card says what Connecto will install and from where.</li>
+  <li><strong>A short checklist</strong> goes from waiting to done: <em>Getting Claude Code ready</em>, <em>Getting Codex ready</em>, <em>Preparing your workspace</em>. A missing agent is installed on the way, and its line shows each step and then the version that was installed.</li>
+  <li><strong>You're all set.</strong> It shows where each agent stands. <strong>Sign in</strong> opens each agent's own sign-in; you finish it in your browser. Or pick a folder to work in, or try a sample project.</li>
+</ol>
+<p>Connecto makes its own verified copy of each agent from the one already on your Mac, so an update to the one you use in your own terminal cannot change a session that is already running. It checks each program's signature, and it copies programs only: never profiles, settings or credentials. Connecto never sees your sign-in. If an agent is not on your Mac and you chose it, Connecto installs it as described below; if you skip that, the window says so and where to get it, and you can carry on with a plain terminal and add the agent later.</p>
+<h3>How an agent is installed</h3>
+<p>Connecto uses each vendor's own installer, from the vendor's own address, over HTTPS, and nothing else:</p>
+<table>
+  <tr><th>Agent</th><th>Installer</th><th>Where it goes</th></tr>
+  <tr><td>Claude Code</td><td><code>https://claude.ai/install.sh</code> (Anthropic)</td><td><code>~/.local/bin/claude</code>, with the program under <code>~/.local/share/claude/</code></td></tr>
+  <tr><td>Codex</td><td><code>https://chatgpt.com/codex/install.sh</code> (OpenAI)</td><td><code>~/.local/bin/codex</code>, with the program under <code>~/.codex/packages/</code></td></tr>
+</table>
+<p>Neither needs Node, Homebrew or an administrator password: both install into your own home folder. Connecto downloads the script, runs it with a minimal environment, and then checks that the program starts and prints its version. If you are offline, or the install fails, setup stays usable: it says what happened in plain words, and offers <strong>Try again</strong>, a link to the vendor's page, and <strong>Skip for now</strong>. You can add the agent later in <strong>Settings → Agents</strong>.</p>
+<p>If you quit in the middle, the next start picks up where it left off. <code>connecto-app provision</code> still exists for scripts, and to pick up a newer version of a tool by hand.</p>
+
+<h2>Agents in Settings</h2>
+<p><strong>Connecto → Settings → Agents</strong> always lists every agent Connecto supports, with where it stands: not installed, or installed with its version, and whether you are signed in on this Mac. <strong>Activate</strong> installs an agent that is missing (the same official installer, with its progress shown) and then takes you to its sign-in. <strong>Deactivate</strong> only hides the agent from the choices when you open a new terminal; nothing is uninstalled, and Activate brings it back. This is also where to add an agent you skipped during setup.</p>
+
+<h2>Open a project</h2>
+<ol>
+  <li>Start Connecto and choose <strong>File → Open Project…</strong> (<kbd>⌘</kbd> <kbd>O</kbd>). Pick the folder you want the agents to work in.</li>
+  <li>Press <kbd>⌘</kbd> <kbd>T</kbd> for a new terminal and choose the tool. <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>1</kbd> opens a Claude terminal directly, and <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>2</kbd> a Codex one. <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>3</kbd> opens a plain shell, your login shell in the project folder.</li>
+  <li>If the terminal says it <strong>needs login</strong>, follow the tool's own sign-in in the terminal.</li>
+</ol>
+
+<div class="note"><p><b>Which login?</b> A new project uses the <strong>System default</strong>: the tools run with your own <code>~/.claude</code> and <code>~/.codex</code>, so the login you already have works with no second sign-in. If a project must stay separate, switch it to <strong>Isolated (advanced)</strong> in its settings: it then gets a private profile and its own login. Projects set up by an earlier build keep whatever they had. See <a href="isolation.html">Isolated and system terminals</a>.</p></div>
+
+<h2>Folders Connecto refuses</h2>
+<p>Connecto will not open these as a project, because an agent working there could damage far more than a project:</p>
+<ul>
+  <li>your home folder itself;</li>
+  <li>Connecto's own data folder;</li>
+  <li>the tools' own state folders: <code>~/.claude</code>, <code>~/.codex</code> and <code>~/Library</code>.</li>
+</ul>
+
+<h2>Next steps</h2>
+<div class="cards">
+  <a href="terminals.html"><b>Projects and terminals</b><span>Find your way around the window.</span></a>
+  <a href="packages.html"><b>Choose a Connecto Home</b><span>Needed for automations and packages.</span></a>
+  <a href="safety.html"><b>Know the brake</b><span><kbd>⌘</kbd> <kbd>.</kbd> pauses every agent.</span></a>
+</div>
+</main>
+<script src="../assets/releases.js"></script>
+<script src="../assets/downloads.js"></script>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

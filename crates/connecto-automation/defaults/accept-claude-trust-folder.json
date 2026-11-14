@@ -1,0 +1,25 @@
+{
+  "agent": "claude",
+  "enabled": false,
+  "keys": [
+    "down",
+    "enter"
+  ],
+  "match": "trust_prompt",
+  "model": "jev-1.14.0",
+  "name": "Accept Claude folder trust",
+  "question": {
+    "criteria": {
+      "other": "Anything else: a different prompt (Chrome extension, Bypass Permissions warning, permission to run a command or edit a file); normal conversation; or the trust prompt only in old scrollback while the session has moved on to a normal input box below it.",
+      "trust_prompt": "A heading `Accessing workspace:` followed by a folder path, text like `Quick safety check: Is this a project you created or one you trust?` and `Claude Code'll be able to read, edit, and execute files here.`, then two unnumbered options: `No, exit` first and `Yes, I trust this folder` second, usually followed by `Enter to confirm · Esc to cancel`. The menu is still waiting for a choice."
+    },
+    "instructions": "The text is the screen of a Claude Code terminal. Decide whether it is currently showing the workspace trust prompt (`Accessing workspace:`), still waiting for the user to pick an option.",
+    "type": "choice"
+  },
+  "threshold": 0.8,
+  "trigger": [
+    "Accessing workspace",
+    "Yes, I trust this folder"
+  ],
+  "version": 1
+}

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Isolated and system terminals · Connecto docs</title>
+<meta name="description" content="Where each tool keeps its login and settings for a project, and how agents are launched.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="isolation">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Isolated and system terminals</h1>
+<p class="lead">For each project, you choose whether a tool runs with a private profile of its own or with your everyday one. Separately, you choose how much agents may do without asking.</p>
+
+<h2>Isolated or system default</h2>
+<p>Every agent CLI keeps a folder of its own: your login, your settings, your plugins, your conversation history. Connecto lets each project decide which folder a tool uses. The choice is made separately for Claude and for Codex. A new project uses the system default; isolated is an advanced option. A project that an earlier build set up keeps the mode it had.</p>
+<p>In system mode Connecto writes nothing into your <code>~/.claude</code> or <code>~/.codex</code>. It hands each launch its hooks on the command line (a settings file kept in Connecto's own run folder for Claude, <code>-c</code> options for Codex) and only reads the tool's transcripts to follow a turn. Anything the tool itself stores there, it stores as it does in your own terminal. Your own settings apply too: if they turn hooks off, Connecto cannot see that terminal's turns.</p>
+
+<table>
+  <tr><th></th><th>System default <span class="pill">default</span></th><th>Isolated (advanced)</th></tr>
+  <tr><td><strong>Profile folder</strong></td><td>Your own <code>~/.claude</code> or <code>~/.codex</code>.</td><td>A private one for this project, inside Connecto's data folder.</td></tr>
+  <tr><td><strong>Login</strong></td><td>The one you already have.</td><td>Its own. The project needs its own sign-in.</td></tr>
+  <tr><td><strong>Settings and plugins</strong></td><td>Yours, as in your own terminal.</td><td>Only the project's, plus its <a href="packages.html">packages</a>.</td></tr>
+  <tr><td><strong>History</strong></td><td>Mixed with your other sessions.</td><td>Kept with the project, apart from everything else.</td></tr>
+</table>
+
+<h3>When to use which</h3>
+<ul>
+  <li><strong>System default</strong> when you want Connecto to behave like your own terminal, with the plugins, memory and login you already rely on, and no second sign-in. Most people want this.</li>
+  <li><strong>Isolated (advanced)</strong> when a project must stay separate: client work on a different account, an experiment you do not want touching your setup, or a project where only the team's packages should apply.</li>
+</ul>
+
+<h3 id="project-settings">Changing it</h3>
+<p>Click the gear on the project's row to open <strong>Project Settings</strong>. Under <strong>Claude config</strong> and <strong>Codex config</strong>, choose <strong>System default</strong> or <strong>Isolated (advanced)</strong>. Restart the project's terminals to apply it.</p>
+
+<h3>The same in both</h3>
+<ul>
+  <li>The CLI that runs is Connecto's own copy of the binary.</li>
+  <li>A terminal inherits only <code>USER</code>, <code>LOGNAME</code>, <code>PATH</code> and <code>LANG</code> from your environment. A secret you exported in your shell profile is not passed to the agent.</li>
+  <li>Neither is a sandbox. See below.</li>
+</ul>
+
+<div class="note"><p><b>Logging in again.</b> In an isolated project (the advanced option), <strong>Log in</strong> starts a fresh profile for that tool and keeps the previous one on disk.</p></div>
+
+<h2 id="how-agents-are-launched">How agents are launched</h2>
+<p>This is a different question: how much may an agent do without asking? It is set once for the whole app, per tool, in <strong>Settings → HOW AGENTS ARE LAUNCHED</strong>.</p>
+
+<table>
+  <tr><th>Mode</th><th>Claude</th><th>Codex</th></tr>
+  <tr><td><strong>Bypass</strong> <span class="pill">default</span></td><td>Skip permission checks.</td><td>Skip approvals and the sandbox.</td></tr>
+  <tr><td><strong>Auto</strong></td><td>A model reviews each action.</td><td>Automatic review, sandboxed.</td></tr>
+  <tr><td><strong>Prompt</strong></td><td>Ask before acting: Claude's normal permission prompts.</td><td>Ask before acting: Codex's normal approvals.</td></tr>
+</table>
+
+<ul>
+  <li>The mode applies to every terminal started from then on, whoever starts it: you, another agent, or a remote user. A running terminal keeps its mode until it is restarted.</li>
+  <li>Agents working together run best without prompts, which is why Bypass is the default. With <strong>Auto</strong> or <strong>Prompt</strong>, an agent can stop at a permission prompt while nobody is looking. An <a href="automations.html">automation</a> can answer the ones you choose.</li>
+</ul>
+
+<div class="note warn"><p><b>Isolated does not mean sandboxed.</b> An isolated profile keeps <em>logins and settings</em> apart. It does not limit what an agent can touch. In Bypass mode an agent can change anything your account can change, in any project.</p></div>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

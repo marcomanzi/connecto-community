@@ -1,0 +1,23 @@
+{
+  "enabledPlugins": {
+    "frontend-design@anthropic-plugin-directory": true,
+    "codex@openai-codex": true,
+    "code-simplifier@anthropic-plugin-directory": true
+  },
+  "extraKnownMarketplaces": {
+    "openai-codex": {
+      "source": {
+        "source": "github",
+        "repo": "openai/codex-plugin-cc"
+      }
+    }
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/scripts/statusline.sh\""
+  },
+  "subagentStatusLine": {
+    "type": "command",
+    "command": "sh \"${CLAUDE_PROJECT_DIR:-.}/.claude/scripts/subagent-statusline.sh\""
+  }
+}

@@ -1,0 +1,30 @@
+[package]
+name = "connecto-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+frame-capture = ["dep:png"]
+test-endpoints = []
+ui-test-driver = []
+
+[dependencies]
+connecto-core.workspace = true
+eframe.workspace = true
+egui.workspace = true
+crossbeam-channel.workspace = true
+png = { version = "0.18", optional = true }
+rfd = "0.17"
+serde_json.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The native menu bar. Created after winit has made NSApp (in the eframe app
+# creator), so it replaces winit's default menu. See menu.rs.
+muda = { version = "0.21", default-features = false }

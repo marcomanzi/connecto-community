@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Automations · Connecto docs</title>
+<meta name="description" content="Rules that press keys for you when a terminal shows a screen you described.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="automations">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Automations</h1>
+<p class="lead">An automation watches your terminals for a screen you described and presses the keys you chose. The usual use: answering the same permission prompt for the hundredth time.</p>
+
+<h2>How one fires</h2>
+<ol>
+  <li><strong>The screen settles.</strong> Connecto waits until a terminal's screen stops changing (about one second, half a second when the terminal is asking for you), then reads the bottom of it. Only an automation whose trigger phrases are all on the screen is sent to Jev, which usually answers in a fraction of a second; the keys are typed as soon as the answer arrives.</li>
+  <li><strong>The trigger matches.</strong> Every phrase in the automation's trigger must be on the screen. This check is local and instant.</li>
+  <li><strong>The classifier decides.</strong> Only then is the screen text sent to <strong>Jev</strong>, a classifier model, with the automation's question. Secrets are redacted first.</li>
+  <li><strong>The keys are typed</strong>, if Jev's answer is the one the automation wants and its confidence is at or above your threshold.</li>
+</ol>
+<p>If Jev's best answer is the right one but it is less sure than your threshold, Connecto <strong>asks you</strong> instead of typing. Anything else, and nothing happens.</p>
+
+<h2>Set up</h2>
+<p>Open <strong>Terminal → Automations…</strong> and go to the <strong>Setup</strong> tab. You need three things:</p>
+<ul>
+  <li><strong>A Jev API key.</strong> Jev is a model from TypeSafe, and you use your own key. Connecto keeps it with its other secrets (see <a href="reference.html#secrets">Where secrets are kept</a>), never in a log.</li>
+  <li><strong>A Connecto Home.</strong> The folder where your automations live. Choose it in <strong>Settings</strong>. See <a href="packages.html#connecto-home">Connecto Home</a>.</li>
+  <li><strong>A login</strong> for the tool that will help you write automations.</li>
+</ul>
+
+<h2 id="defaults">The automations that come with Connecto</h2>
+<p>They come in two <strong>groups</strong>: <em>Accept defaults for Claude</em> (the five Claude screens) and <em>Accept defaults for Codex</em> (the Codex folder prompt). A group has one switch for all of it, opens to show its automations on a click anywhere on its line, and each automation inside still has its own switch. The group shows how many of its automations are on ("3 of 5 on"), and the All, Claude and Codex tabs filter groups like any other row. Your own automations stay loose rows below the groups. If you already had these automations, they are simply shown inside their group: nothing is copied again and nothing you switched on is switched off.</p>
+<p>A new install starts with six, ready to look at and <strong>switched off</strong>. Each one answers a first-run screen that Claude Code or Codex shows, so a newcomer's first terminal gets past it:</p>
+<table>
+  <tr><th>Name</th><th>Agent</th><th>What it does</th></tr>
+  <tr><td>Continue Claude welcome screen</td><td>Claude</td><td>Presses Enter on the "Welcome to Claude Code" security notes.</td></tr>
+  <tr><td>Choose the Dark theme in Claude setup</td><td>Claude</td><td>Presses Enter on the first-run text-style picker when Dark mode is selected.</td></tr>
+  <tr><td>Accept Claude folder trust</td><td>Claude</td><td>Answers "Yes, I trust this folder" on the workspace trust prompt.</td></tr>
+  <tr><td>Accept Claude Bypass Permissions warning</td><td>Claude</td><td>Answers "Yes, I accept" on the Bypass Permissions warning.</td></tr>
+  <tr><td>Accept the Claude in Chrome prompt</td><td>Claude</td><td>Answers "Yes, use my browser" on the Chrome extension prompt.</td></tr>
+  <tr><td>Accept the Codex folder prompt</td><td>Codex</td><td>Answers "Trust and continue" on Codex's folder prompt.</td></tr>
+</table>
+<p>They are off because an automation asks a model about the screen and types keys on its own, which needs your Jev key and your say-so. Some of them accept security prompts for you: switch on only the ones you want. Switch one on in the list once the key is set; until then the sheet says the key is not set.</p>
+<ul>
+  <li>They are put in your Connecto Home once. If you already have an automation with the same folder name, or for the same agent with the same trigger phrases, nothing is added and nothing is changed.</li>
+  <li>Delete one and it does not come back. Edit one, or switch it on, and it is yours: a later version never overwrites it. One you have not touched follows the newer text when a later version improves it.</li>
+</ul>
+
+<h2>Create an automation</h2>
+<ol>
+  <li>Click <strong>New automation</strong>, give it a name such as <em>Accept edits</em>, and choose <strong>Claude</strong> or <strong>Codex</strong>.</li>
+  <li>Describe it: <em>When the terminal shows…</em> and <em>Do this…</em>. Or leave both empty and paste a screenshot of the prompt into the session that opens.</li>
+  <li>A terminal opens with an agent that writes the rule with you. It checks its own work, and can test the trigger against a saved screen.</li>
+  <li>When it is finished, turn on <strong>Enabled</strong> yourself. The agent is told never to do that for you.</li>
+</ol>
+<p><strong>Open session</strong> on an automation takes you back to that conversation, to change the rule later.</p>
+
+<h2>The Automations sheet</h2>
+<p>A strip under the sheet's tabs filters the list: <strong>All</strong>, <strong>Claude</strong>, <strong>Codex</strong>, each with how many it holds (a plain shell cannot have automations). The tab you choose is remembered the next time you open the sheet, and <strong>New automation</strong> creates one for the selected agent. The tabs are reachable with the keyboard like any button. Click anywhere on a row's line to open or close it; its switch and buttons keep their own clicks.</p>
+<ul>
+  <li>Automations are listed in a section per agent, <strong>Claude</strong> and <strong>Codex</strong>. Click a row to open it.</li>
+  <li>Each row shows what it matches, what it types, its trigger, and a <strong>Fire at ≥ N%</strong> threshold you can adjust in steps of 5%, down to 55%.</li>
+  <li><strong>WAITING FOR YOU</strong> lists the times Connecto was unsure, with <strong>Approve</strong> and <strong>Dismiss</strong>. With the sheet closed, a banner in the main window says <em>Automation needs your OK</em>.</li>
+  <li><strong>Audit</strong> shows the exact request sent to Jev and the response, for each call.</li>
+  <li>The <strong>History</strong> tab lists recent calls and how each ended: fired, asked, no match, or an error.</li>
+</ul>
+
+<h2>The file</h2>
+<p>Each automation is a folder in <code>Connecto Home/automations/</code> with an <code>automation.json</code>. You rarely need to edit it by hand, but it is plain and readable:</p>
+<pre>{
+  "version": 1,
+  "name": "Approve edit prompts",
+  "enabled": false,
+  "agent": "claude",
+  "model": "jev-1.14.0",
+  "question": {
+    "type": "choice",
+    "instructions": "The text is the screen of a coding-agent terminal. Decide whether the terminal is showing a permission prompt that asks the user to approve a file edit.",
+    "criteria": {
+      "edit_prompt": "The screen shows a question like `Do you want to make this edit to &lt;file&gt;?` with numbered options. The prompt is still waiting for an answer.",
+      "other": "Anything else: normal conversation, a different permission prompt, or output that only mentions an edit prompt."
+    }
+  },
+  "match": "edit_prompt",
+  "keys": ["down", "enter"],
+  "trigger": ["Do you want to make this edit", "allow all edits during this session"],
+  "threshold": 0.8
+}</pre>
+
+<table>
+  <tr><th>Field</th><th>Rule</th></tr>
+  <tr><td><code>name</code></td><td>1 to 64 characters.</td></tr>
+  <tr><td><code>agent</code></td><td>Which tool's terminals it applies to.</td></tr>
+  <tr><td><code>question</code></td><td>Type <code>choice</code>: 2 to 32 named answers, one of them for "anything else". Type <code>noul</code>: a yes/no question, with <code>match</code> set to <code>"true"</code>.</td></tr>
+  <tr><td><code>match</code></td><td>The answer that fires the automation.</td></tr>
+  <tr><td><code>keys</code></td><td>1 to 20 keys: <code>enter esc tab shift-tab space backspace delete up down left right home end pageup pagedown insert f1</code>…<code>f12 ctrl-&lt;letter&gt; alt-&lt;letter&gt;</code>, or one printable character.</td></tr>
+  <tr><td><code>trigger</code></td><td>Required. 1 to 5 phrases of 3 to 200 characters. Case, extra spaces, line wraps and box borders are ignored.</td></tr>
+  <tr><td><code>threshold</code></td><td>Above 0.5, up to 1. The default is 0.8.</td></tr>
+</table>
+<p>Check a file from any terminal:</p>
+<pre>connecto automation check &lt;name&gt;
+connecto automation check &lt;name&gt; --screen screen.txt</pre>
+
+<h2>Limits that keep it safe</h2>
+<ul>
+  <li><strong>Pause stops automations.</strong> Nothing is checked and nothing is typed. If you approve a waiting one while paused, it is kept until you resume.</li>
+  <li>More than <strong>5 automatic key sequences in a minute</strong> into one terminal stops automations for that terminal. A rule that keeps firing is a rule that is wrong.</li>
+  <li>At most <strong>20 classifier calls a minute</strong> across all terminals, and each screen is judged once.</li>
+  <li>Only the <strong>bottom 60 lines</strong> of the screen are sent, at most 6000 characters, redacted.</li>
+  <li>An automation without a trigger does not run. Jev is never called for every screen.</li>
+</ul>
+
+<div class="note warn"><p><b>An automation that approves prompts removes a check.</b> Write the trigger and the question narrowly, for one kind of prompt. "Approve everything" is better done by choosing a <a href="isolation.html#how-agents-are-launched">launch mode</a> on purpose.</p></div>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

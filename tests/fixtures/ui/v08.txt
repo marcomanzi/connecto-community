@@ -1,0 +1,20 @@
+6000 click 300 300
+6600 key Enter
+8600 key Enter
+10600 key Down
+11000 key Enter
+13000 key Down
+13400 key Enter
+16000 press draft
+16300 text hello from the user
+17000 press to
+17250 press to:0
+17500 press send
+23000 press use:0
+23500 press to
+23750 press to:1
+24000 press send
+30000 press use:1
+30500 press to
+30750 press to:0
+31000 press send

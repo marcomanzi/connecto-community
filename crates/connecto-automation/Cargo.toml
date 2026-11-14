@@ -1,0 +1,23 @@
+[package]
+name = "connecto-automation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+crossbeam-channel.workspace = true
+connecto-core.workspace = true
+connecto-hook.workspace = true
+connecto-redact.workspace = true
+connecto-secrets.workspace = true
+connecto-session.workspace = true
+connecto-store.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls"] }

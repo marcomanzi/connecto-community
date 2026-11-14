@@ -1,0 +1,5 @@
+{"columns":5000,"tasks":[{"id":"w1","name":"clamped","tokenCount":1}]}
+{"columns":"80","tasks":[{"id":"w2","name":"string"}]}
+{"columns":80.5,"tasks":[{"id":"w3","name":"fraction"}]}
+{"columns":-3,"tasks":[{"id":"w4","name":"negative"}]}
+{"columns":true,"tasks":[{"id":"w5","name":"bool"}]}

@@ -1,0 +1,36 @@
+[package]
+name = "connecto-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+frame-capture = ["connecto-ui/frame-capture"]
+test-endpoints = ["connecto-session/test-endpoints", "connecto-ui/test-endpoints"]
+ui-test-driver = ["connecto-ui/ui-test-driver"]
+
+[dependencies]
+connecto-audit.workspace = true
+connecto-automation.workspace = true
+connecto-core.workspace = true
+connecto-net.workspace = true
+connecto-packages.workspace = true
+connecto-secrets.workspace = true
+connecto-update.workspace = true
+connecto-session.workspace = true
+connecto-store.workspace = true
+connecto-ui.workspace = true
+connecto-workspace.workspace = true
+serde_json.workspace = true
+signal-hook = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# A release build has no console: a fatal error at startup is shown in a
+# message box (see src/platform/windows.rs). Already used by connecto-ui.
+rfd = "0.17"

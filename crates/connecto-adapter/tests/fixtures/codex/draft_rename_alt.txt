@@ -1,0 +1,45 @@
+╭───────────────────────────────────────────────────────────────╮
+│ ✨ Update available! 0.166.0 -> 0.167.2                       │
+│ See https://github.com/openai/codex for installation options. │
+│                                                               │
+│ See full release notes:                                       │
+│ https://github.com/openai/codex/releases/latest               │
+╰───────────────────────────────────────────────────────────────╯
+
+
+  >_ OpenAI Codex (v0.166.0)
+     ~/workspace
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› /rename x
+
+  GPT-6-Astra medium · ~/workspace
+                                                                                                         ⚠ 1 warning · f2 to view

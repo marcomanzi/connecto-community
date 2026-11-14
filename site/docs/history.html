@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>History and utility sessions · Connecto docs</title>
+<meta name="description" content="Find and continue closed terminals, and let a small model title your terminals.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="history">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>History and utility sessions</h1>
+<p class="lead">A closed terminal is not gone. It moves to the project's history, where you can read it or pick the conversation up again.</p>
+
+<h2>History</h2>
+<p>Open it with <kbd>⌘</kbd> <kbd>Y</kbd>, or the clock on a project's row.</p>
+<ul>
+  <li><strong>Search</strong> by terminal name, by the task it was given, or by its last reply.</li>
+  <li><strong>Filter</strong> to this project or all projects, and to Claude or Codex.</li>
+  <li><strong>Continue</strong> reopens the terminal and resumes the same conversation in the tool.</li>
+  <li><strong>View transcript</strong> shows what was on the terminal.</li>
+</ul>
+<p>Each project keeps up to 500 closed terminals. Transcripts are stored with secrets redacted, up to 2 MiB each.</p>
+<p>An agent can use the history too: a terminal it closed with <code>connecto close</code> lands here like any other.</p>
+
+<h2 id="utility-sessions">Utility sessions</h2>
+<p>With a dozen terminals open, <em>claude-7</em> tells you nothing. Click the <strong>robot</strong> on a terminal's row and Connecto gives it a title of two to five words, taken from what the terminal is actually doing.</p>
+<p>The title is written by a small, separate Claude session that Connecto starts out of sight. It has no tools and cannot touch your files or the other terminals. It reads the terminal's task, its last reply and its screen, with secrets redacted, and returns a title.</p>
+<ul>
+  <li><strong>View → Utility Sessions</strong> lists the recent ones. <strong>Open session</strong> shows what the model was given and what it said.</li>
+  <li>The gear there sets the <strong>model</strong> (Haiku, Sonnet or Opus) and the <strong>effort</strong>. The default is Haiku at low effort, which is quick and costs little.</li>
+</ul>
+<div class="note"><p>A title uses your Claude plan, like any other Claude session.</p></div>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

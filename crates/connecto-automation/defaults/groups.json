@@ -1,0 +1,24 @@
+[
+  {
+    "id": "accept-defaults-claude",
+    "title": "Accept defaults for Claude",
+    "about": "Gets a new Claude Code terminal past its first-run screens: the welcome, the theme, the folder trust, the bypass warning and the Chrome prompt.",
+    "agent": "claude",
+    "members": [
+      "accept-claude-welcome",
+      "accept-claude-dark-theme",
+      "accept-claude-trust-folder",
+      "accept-claude-bypass-warning",
+      "accept-claude-chrome-prompt"
+    ]
+  },
+  {
+    "id": "accept-defaults-codex",
+    "title": "Accept defaults for Codex",
+    "about": "Gets a new Codex terminal past its first-run folder trust prompt.",
+    "agent": "codex",
+    "members": [
+      "accept-codex-folder-trust"
+    ]
+  }
+]

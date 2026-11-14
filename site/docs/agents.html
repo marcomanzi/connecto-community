@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents using other terminals · Connecto docs</title>
+<meta name="description" content="The connecto command: how an agent lists, reads, drives and questions the other terminals.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="agents">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Agents using other terminals</h1>
+<p class="lead">Every terminal has a <code>connecto</code> command. With it, an agent can see the other terminals in the project, ask them things, and be told when they answer.</p>
+
+<p>You do not have to teach it to them. Each agent is told about the command when its terminal starts, so you can simply write: <em>"open a Codex terminal and have it review this diff"</em>.</p>
+
+<h2>The commands</h2>
+<table>
+  <tr><th>Command</th><th>What it does</th></tr>
+  <tr><td><code>connecto list</code></td><td>The terminals in this project and what each is doing.</td></tr>
+  <tr><td><code>connecto send &lt;id&gt;</code></td><td>Types a message into another terminal. The message is read from standard input.</td></tr>
+  <tr><td><code>connecto send &lt;id&gt; --ask</code></td><td>Asks a question. Prints a request id; the answer is delivered to the asking agent when the other one finishes.</td></tr>
+  <tr><td><code>connecto result &lt;request&gt;</code></td><td>Just the final reply to a request.</td></tr>
+  <tr><td><code>connecto read &lt;id&gt;</code></td><td>Everything on that terminal's screen and scrollback.</td></tr>
+  <tr><td><code>connecto keys &lt;id&gt; &lt;key&gt;…</code></td><td>Presses keys there, for example <code>esc down enter</code>.</td></tr>
+  <tr><td><code>connecto watch &lt;id&gt;</code><br><code>connecto unwatch &lt;id&gt;</code></td><td>Be woken on every event in that terminal: it began, finished, was interrupted, needs the user, or exited.</td></tr>
+  <tr><td><code>connecto add claude|codex|shell [--name &lt;text&gt;]</code></td><td>Opens a new terminal, as a child of this one.</td></tr>
+  <tr><td><code>connecto start &lt;id&gt;</code></td><td>Starts a terminal that is not running.</td></tr>
+  <tr><td><code>connecto close &lt;id&gt;</code></td><td>Stops a terminal and moves it to the history.</td></tr>
+</table>
+
+<h2>Driving a shell terminal</h2>
+<p>A <code>shell</code> terminal is your login shell, not an agent, so it has no turns. Run a command in it with <code>connecto send shell '&lt;one command line&gt;'</code> (one line per send; use <code>;</code> or <code>&amp;&amp;</code> to join commands) and look at the result with <code>connecto read shell</code>, waiting a moment for a slow command. <code>connecto keys shell ctrl-c</code> interrupts it. <code>send --ask</code>, <code>watch</code> and <code>result</code> are refused for a shell, with a message that says to use send and read.</p>
+
+<h2>Asking and getting an answer</h2>
+<p><code>send --ask</code> is the one that makes agents a team. The asking agent sends its question and ends its turn. It does not wait, sleep or poll. When the other agent finishes, Connecto wakes the asker with the reply already in its context, labelled as another agent's words.</p>
+<pre>connecto add codex --name "review the diff"
+
+connecto send codex-4 --ask &lt;&lt;'EOF'
+Review the migration in db/2031_orders.sql. Is anything unsafe
+to run on a table with live writes?
+EOF</pre>
+<p>The new terminal appears in the sidebar under the one that opened it, so you can watch the reviewer work and step in at any point.</p>
+
+<h2>What you should know</h2>
+<ul>
+  <li><strong>Agents do not ask you first.</strong> One agent can type into another terminal without approval. That is the point, and it is why <a href="safety.html">Pause</a> exists.</li>
+  <li><strong>Pause is a full brake.</strong> While it is on, sends, keys, add, start, close and wakes are all refused, and the agent is told why. An agent cannot lift Pause.</li>
+  <li><strong>There is no rate limit.</strong> Two terminals that watch each other can keep waking each other, and every wake is a model turn on your plan. Pause stops it, and so does <code>unwatch</code>.</li>
+  <li><strong>Everything is recorded.</strong> Each agent action goes to the audit log with who did it and the text, with secrets redacted.</li>
+  <li><strong>Messages are limited to 4096 bytes</strong> after redaction. A longer one is refused, not cut short.</li>
+</ul>
+
+<div class="note"><p><b>Text on a screen can steer an agent.</b> An agent that reads another terminal reads whatever is there, including text that came from a web page or a file. Treat the reach of one agent as the reach of all the terminals it can drive.</p></div>
+
+<h2>Exit codes</h2>
+<table>
+  <tr><th>Code</th><th>Meaning</th></tr>
+  <tr><td><code>0</code></td><td>Done.</td></tr>
+  <tr><td><code>1</code></td><td>Refused, for example because Connecto is paused.</td></tr>
+  <tr><td><code>2</code></td><td>The command was written wrongly.</td></tr>
+  <tr><td><code>3</code></td><td>Connecto could not be reached.</td></tr>
+  <tr><td><code>4</code></td><td>There is no result yet.</td></tr>
+</table>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

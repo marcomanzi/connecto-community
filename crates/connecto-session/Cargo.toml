@@ -1,0 +1,56 @@
+[package]
+name = "connecto-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+test-endpoints = ["connecto-adapter/test-endpoints"]
+
+[dependencies]
+arc-swap.workspace = true
+crossbeam-channel.workspace = true
+connecto-adapter.workspace = true
+connecto-core.workspace = true
+connecto-audit.workspace = true
+connecto-gate.workspace = true
+connecto-hook.workspace = true
+connecto-pty.workspace = true
+connecto-redact.workspace = true
+connecto-store.workspace = true
+connecto-term.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal", "socket", "user"] }
+
+# The process tree (`process_tree`): libproc's BSD process info exists only on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc.workspace = true
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+sysinfo = { workspace = true, features = ["system"] }
+
+# Random bytes for tokens and ids (`platform::random_bytes`); Unix reads
+# /dev/urandom. Same version connecto-net already uses.
+[target.'cfg(windows)'.dependencies]
+getrandom = "0.3"
+# The named-pipe server of `local_socket` (Windows side): a safe API over
+# `CreateNamedPipeW` with first-instance and reject-remote flags, a security
+# descriptor from SDDL, and `GetNamedPipeClientProcessId` (`client_process_id`).
+# Its tokio streams give reads and writes that a time-out really cancels.
+interprocess = { workspace = true, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "io-util", "net"] }
+widestring = "1"
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["signal", "process", "socket", "user"] }

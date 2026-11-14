@@ -1,0 +1,4 @@
+# The built-in package ships `.claude/` folders; a global or local ignore of
+# `.claude/` must not hide them.
+!/builtin/*/.claude/
+!/builtin/*/.claude/**

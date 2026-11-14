@@ -1,0 +1,25 @@
+{
+  "agent": "codex",
+  "enabled": false,
+  "keys": [
+    "enter"
+  ],
+  "match": "match",
+  "model": "jev-1.14.0",
+  "name": "Accept the Codex folder prompt",
+  "question": {
+    "criteria": {
+      "match": "An active Codex folder trust prompt awaiting an answer: the title is `Folder access`, a folder path is shown, and the question begins `Trust this folder? Codex can read, edit, and run files here, subject to your permission settings.` It includes numbered options `1. Trust and continue` and `2. Quit`, with `enter continue` and `esc quit` hints. Option 1 is the default or currently selected option, so Enter trusts the folder. Accept any folder path. Ignore decorative borders, colors, and selection-marker glyphs; reject if option 2 is visibly selected.",
+      "other": "Anything else, including a different permission or trust question, an already-answered or dismissed prompt, normal conversation or command output quoting this prompt, or a menu where Quit is selected."
+    },
+    "instructions": "Decide whether the terminal text shows the active Codex Folder access prompt waiting for the user to trust a folder, where pressing Enter chooses Trust and continue. Use the prompt's text and menu structure, without relying on colors or decorative terminal chrome.",
+    "type": "choice"
+  },
+  "threshold": 0.8,
+  "trigger": [
+    "Folder access",
+    "Trust this folder?",
+    "Trust and continue"
+  ],
+  "version": 1
+}

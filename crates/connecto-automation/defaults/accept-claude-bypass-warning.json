@@ -1,0 +1,25 @@
+{
+  "agent": "claude",
+  "enabled": false,
+  "keys": [
+    "down",
+    "enter"
+  ],
+  "match": "bypass_warning",
+  "model": "jev-1.14.0",
+  "name": "Accept Claude Bypass Permissions warning",
+  "question": {
+    "criteria": {
+      "bypass_warning": "A heading `WARNING: Claude Code running in Bypass Permissions mode`, an explanation that Claude Code will not ask for approval and `By proceeding, you accept all responsibility ...`, then two unnumbered options: `No, exit` first and `Yes, I accept` second, usually followed by `Enter to confirm · Esc to cancel`. The menu is still waiting for a choice.",
+      "other": "Anything else: a different prompt (workspace trust, Chrome extension, permission to run a command or edit a file); normal conversation or the status bar merely mentioning bypass permissions; or the warning only in old scrollback while the session has moved on to a normal input box below it."
+    },
+    "instructions": "The text is the screen of a Claude Code terminal. Decide whether it is currently showing the startup warning `WARNING: Claude Code running in Bypass Permissions mode`, still waiting for the user to pick an option.",
+    "type": "choice"
+  },
+  "threshold": 0.8,
+  "trigger": [
+    "Bypass Permissions mode",
+    "Yes, I accept"
+  ],
+  "version": 1
+}

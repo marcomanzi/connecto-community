@@ -1,0 +1,6 @@
+# The builtin package files are embedded into the binary by
+# crates/connecto-packages/build.rs. They must have LF line endings on every
+# platform: a Windows checkout with core.autocrlf=true would otherwise embed
+# CRLF, which breaks the shell scripts and makes the Windows build differ.
+crates/connecto-packages/builtin/** text eol=lf
+*.sh text eol=lf

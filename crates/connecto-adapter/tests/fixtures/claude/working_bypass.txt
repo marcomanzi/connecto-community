@@ -1,0 +1,14 @@
+ ▐▛███▛█   Claude Code v2.1.322
+▝▜██████▀  Fable 5.2 · Claude Ultra
+ ▝▝   ▝▝   ~/.skainet-throwaway-home/workroot/remote-proj
+
+
+❯ Write a 120 word paragraph about lighthouses.
+
+✽ Doing… (4s · thinking)
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────── backend reviewer ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=…
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Commands and files · Connecto docs</title>
+<meta name="description" content="The connecto and connecto-app commands, where Connecto keeps its files, and its limits.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="reference">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Commands and files</h1>
+<p class="lead">The two commands, where things are kept, and the limits in one place.</p>
+
+<h2>connecto</h2>
+<p>Available inside every terminal. See <a href="agents.html">Agents using other terminals</a>.</p>
+<pre>connecto list
+connecto send &lt;id&gt; [--ask]
+connecto result &lt;request&gt;
+connecto read &lt;id&gt;
+connecto keys &lt;id&gt; &lt;key&gt;...
+connecto watch &lt;id&gt;
+connecto unwatch &lt;id&gt;
+connecto add claude|codex|shell [--name &lt;text&gt;]
+connecto start &lt;id&gt;
+connecto close &lt;id&gt;
+connecto automation check [path] [--screen &lt;file&gt;]
+connecto package check [id|path]</pre>
+
+<h2>connecto-app</h2>
+<p>From the downloaded app it is <code>/Applications/Connecto.app/Contents/MacOS/connecto-app</code>; the <code>connecto</code> command inside agent terminals is provided by the app, not installed on your <code>PATH</code>.</p>
+<table>
+  <tr><th>Command</th><th>What it does</th></tr>
+  <tr><td><code>connecto-app</code></td><td>Starts the app and restores your workspace.</td></tr>
+  <tr><td><code>connecto-app --project &lt;folder&gt;</code></td><td>Starts the app and opens that folder as well.</td></tr>
+  <tr><td><code>connecto-app provision</code></td><td>For scripts: copies your installed CLIs into Connecto's store (the app does this by itself at its first launch). Run it again to pick up a newer version of a tool.</td></tr>
+  <tr><td><code>connecto-app audit verify &lt;file&gt;</code></td><td>Checks that an audit log has not been edited.</td></tr>
+</table>
+
+<h2>Where things are kept</h2>
+<h3>The data folder</h3>
+<p><code>~/Library/Application Support/connecto/</code></p>
+<table>
+  <tr><th>Path</th><th>Holds</th></tr>
+  <tr><td><code>workspace.json</code></td><td>Open projects, their order and names, and the ten most recent.</td></tr>
+  <tr><td><code>settings.json</code></td><td>App settings: Connecto Home, launch modes, the utility model.</td></tr>
+  <tr><td><code>cli/</code></td><td>Connecto's copies of the agent CLIs.</td></tr>
+  <tr><td><code>projects/&lt;id&gt;/settings.json</code></td><td>A project's tools, config modes and packages.</td></tr>
+  <tr><td><code>projects/&lt;id&gt;/profiles/&lt;tool&gt;/</code></td><td>The private profile of an isolated project.</td></tr>
+  <tr><td><code>projects/&lt;id&gt;/history/</code></td><td>Closed terminals and their transcripts.</td></tr>
+  <tr><td><code>automations/history.jsonl</code></td><td>The record of automation calls.</td></tr>
+  <tr><td><code>audit/</code></td><td>Audit logs, one file per launch.</td></tr>
+  <tr><td><code>remote/</code></td><td>Remote access settings and the keys that may connect.</td></tr>
+</table>
+<h3 id="secrets">Where secrets are kept</h3>
+<p>The Jev key, this machine's device keys, the relay token and the keys of paired machines are kept in one file, <code>secrets/secrets.json</code> in the data folder. Only your account can read it: on a Mac the file is readable by you alone (mode 600, in a folder of mode 700), and on Windows it sits in your own <code>%APPDATA%</code>. It is replaced in one step on every change, so it is never left half written. This is how command-line tools such as <code>gh</code>, <code>ssh</code> and <code>aws</code> keep their credentials, and it means Connecto never asks for Keychain access.</p>
+<p>To keep secrets in the system store instead, turn on <strong>Settings → Remote Access → Store secrets in the system keychain</strong> (on Windows: <strong>Store secrets in Windows Credential Manager</strong>). The change takes effect at the next start, which moves the secrets across. Turning it off again moves them back to the file.</p>
+<p>Up to 0.1.7 the secrets were in the Keychain. The first start of 0.1.8 reads that Keychain item once, writes the file and deletes the item, so macOS asks one last time. If you refuse, Connecto starts with no secrets and does not ask again: this machine gets a new device identity, so paired machines have to be paired again, and the relay token and the Jev key have to be entered again.</p>
+
+<h3>Connecto Home</h3>
+<p>The folder you chose in Settings.</p>
+<table>
+  <tr><th>Path</th><th>Holds</th></tr>
+  <tr><td><code>automations/&lt;name&gt;/automation.json</code></td><td>One <a href="automations.html">automation</a>.</td></tr>
+  <tr><td><code>packages/&lt;id&gt;/</code></td><td>One <a href="packages.html">package</a>.</td></tr>
+</table>
+
+<h3>In each project</h3>
+<table>
+  <tr><th>Path</th><th>Holds</th></tr>
+  <tr><td><code>.claude/</code>, <code>.codex/</code>, <code>.agents/</code></td><td>Your own files, plus the ones packages installed.</td></tr>
+  <tr><td><code>.connecto/packages.lock</code></td><td>Which files Connecto installed, so updates leave yours alone.</td></tr>
+</table>
+
+<h2>Limits</h2>
+<table>
+  <tr><th>What</th><th>Limit</th></tr>
+  <tr><td>Terminals in a project</td><td>16 open</td></tr>
+  <tr><td>Terminal name</td><td>64 characters</td></tr>
+  <tr><td>A message between agents</td><td>4096 bytes after redaction</td></tr>
+  <tr><td>Closed terminals kept per project</td><td>500, transcripts up to 2 MiB each</td></tr>
+  <tr><td>Automatic key sequences into one terminal</td><td>5 a minute, then automations stop for it</td></tr>
+  <tr><td>Classifier calls</td><td>20 a minute, across all terminals</td></tr>
+  <tr><td>Screen text sent to the classifier</td><td>The bottom 60 lines, at most 6000 characters</td></tr>
+  <tr><td>A package</td><td>2000 files, 16 MiB</td></tr>
+  <tr><td>A pairing code</td><td>Two minutes, one device</td></tr>
+  <tr><td>Remote users on a host</td><td>One at a time</td></tr>
+</table>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remote sessions · Connecto docs</title>
+<meta name="description" content="Show and drive the terminals of another Mac from this one, paired by a six-digit code.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="remote">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Remote sessions</h1>
+<p class="lead">One Connecto can show and drive the terminals of another. Leave the agents running on a desktop, and check in from a laptop.</p>
+
+<p>The two machines connect directly, encrypted end to end. If a direct path cannot be found, traffic goes through a relay, still encrypted. The other Mac appears in your sidebar under <strong>HOSTS</strong>, and behaves like a project whose terminals are that machine's.</p>
+
+<h2>Pair two Macs</h2>
+<h3>On the Mac you want to reach</h3>
+<ol>
+  <li>Open <strong>Settings</strong> and find <strong>PAIR A DEVICE</strong>.</li>
+  <li>Click <strong>Pair a device</strong>. A six-digit code appears, such as <code>482 913</code>.</li>
+</ol>
+<p>The code is valid for two minutes and for one device. Pairing turns on <strong>Let other machines connect to this one</strong> and leaves it on.</p>
+
+<h3>On the Mac you are sitting at</h3>
+<ol>
+  <li>Click <strong>Add host</strong> in the sidebar.</li>
+  <li>Type a name for the machine and the six digits, then click <strong>Pair</strong>.</li>
+</ol>
+<p>That is all. This Mac now holds a device key in its secret store (see <a href="reference.html#secrets">Where secrets are kept</a>), and the other Mac lists it under <strong>PAIRED DEVICES</strong>, where you can <strong>Revoke</strong> it at any time.</p>
+
+<div class="note warn"><p><b>Whoever enters the code gets full control of that machine's terminals</b>, and through them, of everything that account can do. Read the code out only to yourself.</p></div>
+
+<h2>What you can do remotely</h2>
+<ul>
+  <li>Watch any terminal live, type into it, and use the mouse.</li>
+  <li>Add, rename, restart and close terminals.</li>
+  <li>Reconnect after a drop without losing output: the host keeps a buffer for each terminal.</li>
+</ul>
+<p>Not available on a remote host yet: its history, transcripts, and <strong>Continue</strong>.</p>
+<p>From the host's menu in the sidebar you can <strong>Connect</strong>, <strong>Disconnect</strong>, <strong>Rename host…</strong> and <strong>Forget host</strong>.</p>
+
+<h2>How it is protected</h2>
+<ul>
+  <li><strong>Off by default.</strong> A Mac accepts connections only after you turn remote access on.</li>
+  <li><strong>The code is hard to guess and useless afterwards.</strong> It works once, any attempt to use it burns it, and code requests are rate-limited.</li>
+  <li><strong>One remote user at a time.</strong></li>
+  <li><strong>Pause applies.</strong> While the host is paused, remote typing, resizing, terminal changes and pairing are refused.</li>
+  <li><strong>It is in the audit log.</strong> A remote user is recorded separately from you. Attaching is logged; typed input is logged as a count and a hash, never as text.</li>
+  <li><strong>The <code>connecto</code> command is never reachable remotely.</strong> A remote user drives terminals, not the bridge between them.</li>
+</ul>
+
+<h2>The relay</h2>
+<p><strong>Settings → RELAY</strong> holds the relay's address and, if the relay asks for one, an access token. The default is <code>https://relay.connecto.studio</code>. Leave the address empty to allow direct connections only.</p>
+<p>The relay helps two machines find each other and carries traffic when they cannot connect directly. It cannot read what passes through it.</p>
+<p>To use a relay of your own, see <a href="relay.html">Run your own relay</a>. Set the same relay address on both machines, with its token.</p>
+
+<h2>Advanced: an address and an SSH key</h2>
+<p>Instead of a code, you can authorize an SSH key you already have.</p>
+<ol>
+  <li>On the host, under <strong>ADVANCED: KEYS THAT MAY CONNECT</strong>, add the public key with <strong>Allow this key</strong>, and copy the machine's address with <strong>Copy address</strong>.</li>
+  <li>On the other Mac, click <strong>Add host</strong>, choose <strong>Advanced: use an address and an SSH key</strong>, and paste the address.</li>
+  <li>Compare the fingerprint on the <strong>CONFIRM THIS MACHINE</strong> screen with the one the host shows, then choose <strong>They match: connect</strong>.</li>
+</ol>
+<p>The key is used through your ssh-agent. Connecto never reads the private key.</p>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>
