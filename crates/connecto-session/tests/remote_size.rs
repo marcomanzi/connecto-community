@@ -108,3 +108,36 @@ fn without_a_peer_the_local_view_resizes_as_always() {
     );
     s.terminate();
 }
+
+#[test]
+fn a_click_in_the_local_view_takes_the_size_back_until_the_peer_resizes() {
+    let s = session(LOCAL);
+    s.set_remote_size_control(true);
+    s.resize_remote(REMOTE);
+    wait_for(&s, REMOTE);
+    let wish = GridSize { cols: 60, rows: 20 };
+    s.resize(wish);
+    assert_eq!(s.local_size_claims(), 0);
+
+    s.claim_local_size();
+    assert_eq!(s.local_size_claims(), 1);
+    wait_for(&s, wish);
+    // The local view's layout drives it again.
+    s.resize(LOCAL);
+    wait_for(&s, LOCAL);
+
+    // The peer takes it back at its next resize.
+    s.set_remote_size_control(true);
+    s.resize_remote(REMOTE);
+    wait_for(&s, REMOTE);
+    s.terminate();
+}
+
+#[test]
+fn a_click_when_no_peer_has_the_size_changes_nothing() {
+    let s = session(LOCAL);
+    s.claim_local_size();
+    assert_eq!(s.local_size_claims(), 0);
+    wait_for(&s, LOCAL);
+    s.terminate();
+}

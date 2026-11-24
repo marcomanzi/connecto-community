@@ -247,7 +247,11 @@ impl IrohNode {
                     let Ok(conn) = incoming.await else { return };
                     let conn = IrohConnection::new(local, conn, handle);
                     let boxed: Box<dyn Connection> = Box::new(conn);
-                    let _ = in_tx.try_send(boxed);
+                    // A full queue refuses it: closed now, so nothing of it
+                    // lives on outside what the host bounds.
+                    if let Err(refused) = in_tx.try_send(boxed) {
+                        refused.into_inner().close();
+                    }
                 });
             }
         });
@@ -397,8 +401,11 @@ impl IrohConnection {
         handle.spawn(async move {
             while let Ok((send, recv)) = accepting.accept_bi().await {
                 let stream = pump(&stream_handle, send, recv);
-                if tx.send(stream).is_err() {
-                    break;
+                // Never waits. A full accept queue drops this stream, which ends it
+                // for its peer, rather than holding up every other stream.
+                match tx.try_send(stream) {
+                    Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
                 }
             }
         });
@@ -445,7 +452,12 @@ fn pump(
         }
     });
     ChannelStream::new(
-        Box::new(move |frame| out_tx.blocking_send(frame).is_ok()),
+        // Never waits: a full queue is `Full`, and the sender decides.
+        Box::new(move |frame| match out_tx.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(tmpsc::error::TrySendError::Full(_)) => Err(NetError::Full),
+            Err(tmpsc::error::TrySendError::Closed(_)) => Err(NetError::Closed),
+        }),
         in_rx,
     )
 }
@@ -471,6 +483,16 @@ impl Connection for IrohConnection {
         let conn = self.conn.clone();
         let handle = self.handle.clone();
         let (send, recv) = run(&self.handle, CONNECT_TIMEOUT, async move {
+            conn.open_bi().await.map_err(net_err)
+        })??;
+        Ok(Box::new(pump(&handle, send, recv)))
+    }
+
+    fn open_stream_within(&self, timeout: Duration) -> Result<Box<dyn Stream>, NetError> {
+        let conn = self.conn.clone();
+        let handle = self.handle.clone();
+        // A stream opened after the wait is dropped unused: nothing is sent on it.
+        let (send, recv) = run(&self.handle, timeout.min(CONNECT_TIMEOUT), async move {
             conn.open_bi().await.map_err(net_err)
         })??;
         Ok(Box::new(pump(&handle, send, recv)))

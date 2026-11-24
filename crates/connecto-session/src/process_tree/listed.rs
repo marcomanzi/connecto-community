@@ -13,6 +13,14 @@ pub(crate) struct Known {
     started: u64,
 }
 
+impl Known {
+    /// A process for a test that never signals it: `pid`, started at `at`.
+    #[cfg(test)]
+    pub(crate) fn for_tests(pid: i32, at: u64) -> Self {
+        Self { pid, started: at }
+    }
+}
+
 fn sys_pid(pid: i32) -> Option<Pid> {
     u32::try_from(pid).ok().map(Pid::from_u32)
 }

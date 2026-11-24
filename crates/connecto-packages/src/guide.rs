@@ -3,7 +3,7 @@
 //! automations guide, so a user's own text in the file is kept.
 
 /// Bump whenever the text changes: a resumed session is told to re-read it.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 5;
 
 /// The record of how a package was made, kept by the authoring agent at the
 /// package root: never installed, and not part of the content hash.
@@ -11,6 +11,10 @@ pub const ORIGIN: &str = "ORIGIN.md";
 
 const BEGIN: &str = "<!-- connecto-packages:begin v";
 const END: &str = "<!-- connecto-packages:end -->";
+/// The markers an install under the earlier name wrote. A block with them is
+/// replaced by the current one, never left beside it.
+const LEGACY_BEGIN: &str = "<!-- magneto-packages:begin v";
+const LEGACY_END: &str = "<!-- magneto-packages:end -->";
 
 fn wrap(body: &str) -> String {
     format!("{BEGIN}{VERSION} -->\n{}\n{END}\n", body.trim_end())
@@ -26,10 +30,14 @@ pub fn apply(existing: Option<&str>, body: &str) -> Option<String> {
     let Some(text) = existing else {
         return Some(block);
     };
-    if let (Some(begin), Some(end_at)) = (text.find(BEGIN), text.find(END))
-        && begin < end_at
-    {
-        let mut end = end_at + END.len();
+    for (open, close) in [(BEGIN, END), (LEGACY_BEGIN, LEGACY_END)] {
+        let (Some(begin), Some(end_at)) = (text.find(open), text.find(close)) else {
+            continue;
+        };
+        if begin >= end_at {
+            continue;
+        }
+        let mut end = end_at + close.len();
         if text[end..].starts_with('\n') {
             end += 1;
         }
@@ -70,6 +78,7 @@ ORIGIN.md             how the package was made (see below)
   skills/<name>/SKILL.md      (front matter: name, description)
   agents/<name>.md            (front matter: name, description)
   commands/<name>.md
+  rules/<name>.md             always-on instructions, read like CLAUDE.md
   hooks/...                   scripts a hook may call
   settings.json               ONLY what the package must set: enabledPlugins,
                               extraKnownMarketplaces, statusLine, hooks ...
@@ -123,13 +132,15 @@ paths in it. `.claude/settings.local.json` is never installed.
 ## What to do
 
 1. Ask the user what the package is for, and which skills, agents, commands and
-   plugins to include. Offer what you can find:
-   - the user's own `~/.claude` and `~/.codex` (skills, agents, commands, and
-     the plugins enabled in `~/.claude/settings.json`);
-   - the skills and agents of their Connecto projects (the paths are in your
-     first message);
-   - the built-in `connecto` package (its files are listed in your first
-     message), which a package can extend instead of copying.
+   plugins to include. This package is your only objective: do not look
+   through the user's projects or folders on your own. Use the sources they
+   name, for example:
+   - "make it from project X": read that project's `.claude/`, `.codex/` and
+     `.agents/` and offer what is there (ask for its path if you cannot tell);
+   - their own `~/.claude` or `~/.codex`, when they point you at it;
+   - a repository or a folder they give you;
+   - the built-in `connecto` package (its path is in your first message),
+     which a package can extend instead of copying.
 2. Copy or write what they choose into the layout above. For plugins, set
    `enabledPlugins` (and `extraKnownMarketplaces` if the plugin comes from a
    marketplace) in `.claude/settings.json`; do not copy a plugin's cache.
@@ -151,6 +162,26 @@ tokens or credentials into a package.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_block_written_under_the_earlier_name_is_replaced_not_kept_beside() {
+        let old = "mine\n\n<!-- magneto-packages:begin v1 -->\nold body\n<!-- magneto-packages:end -->\nafter\n";
+        let out = apply(Some(old), "new body").unwrap_or_default();
+        assert!(
+            out.starts_with("mine\n\n<!-- connecto-packages:begin v"),
+            "{out}"
+        );
+        assert!(out.contains("new body") && out.ends_with("after\n"));
+        assert!(
+            !out.contains("magneto") && !out.contains("old body"),
+            "{out}"
+        );
+        assert_eq!(
+            apply(Some(&out), "new body"),
+            None,
+            "a second run changes nothing"
+        );
+    }
 
     #[test]
     fn a_new_file_gets_the_block_and_a_current_one_is_left_alone() {

@@ -1,0 +1,32 @@
+[package]
+name = "connecto-flutter-peer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-only"
+
+[lib]
+name = "connecto_flutter_peer"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+connecto-core = { path = "../../crates/connecto-core" }
+connecto-net = { path = "../../crates/connecto-net" }
+serde_json = "1"
+getrandom = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+# netdev 0.46 uses the Darwin in6_ifreq binding removed from iOS in libc 0.2.190.
+[target.'cfg(target_os = "ios")'.dependencies]
+libc = "=0.2.189"
+
+[dev-dependencies]
+tempfile = "3"
+
+[workspace]
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"

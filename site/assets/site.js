@@ -203,12 +203,6 @@
   if (odo) {
     var digits = $("#odo-digits"), text = $("#odo-text"), week = $("#odo-week"), ghost = $("#odo-ghost");
     var pill = $("#dl-float");
-    // The pill shows the same count once the odometer is out of view.
-    if (pill && "IntersectionObserver" in window) {
-      new IntersectionObserver(function (es) {
-        es.forEach(function (e) { pill.classList.toggle("away", e.isIntersecting); });
-      }, { threshold: 0.15 }).observe(odo);
-    }
     var MIN_CELLS = 6, shown = null, everLoaded = false;
     var whole = function (n) { return typeof n === "number" && isFinite(n) && n >= 0 && Math.floor(n) === n && n < 1e12; };
     var fmt = function (n) { return n.toLocaleString("en-US"); };
@@ -306,29 +300,107 @@
           if (!everLoaded) text.textContent = "The live count is resting. Check back soon.";
         });
     };
-    build(MIN_CELLS, true);
-    load();
-    setInterval(function () { if (!document.hidden) load(); }, 3 * 60 * 1000);
-    document.addEventListener("visibilitychange", function () { if (!document.hidden) load(); });
+    // A private audit view for the site owner: the counter stays hidden, and
+    // nothing is fetched, until the hidden trigger in the hero is clicked five
+    // times within three seconds. Then the floating pill shows the count for
+    // this page view only; a reload hides it again.
+    var counterOn = false;
+    var startCounter = function () {
+      if (counterOn) return;
+      counterOn = true;
+      build(MIN_CELLS, true);
+      load();
+      setInterval(function () { if (!document.hidden) load(); }, 3 * 60 * 1000);
+      document.addEventListener("visibilitychange", function () { if (!document.hidden) load(); });
+    };
+    var trigger = $("#count-trigger");
+    if (trigger) {
+      var taps = [];
+      trigger.addEventListener("click", function () {
+        var now = Date.now();
+        taps = taps.filter(function (t) { return now - t < 3000; });
+        taps.push(now);
+        if (taps.length < 5) return;
+        taps = [];
+        startCounter();
+      });
+    }
   }
 
-  // The cards and the platform texts come from assets/downloads.js, which reads
-  // assets/releases.js; the Windows texts appear once a Windows build is listed.
-  var dl = $("#dl");
+  // The download section and its file dialog come from assets/downloads.js,
+  // which reads assets/releases.js; the Windows and Linux texts appear once such
+  // a build is listed. Each product has one Download button that opens the
+  // dialog with every file for it, the visitor's system first.
   var D = window.ConnectoDownloads;
-  if (dl && D) {
-    var rel = window.CONNECTO_RELEASES || [];
+  var pick = $("#dl-pick");
+  if ($("#dl") && D) {
+    var products = {
+      connecto: { name: "Connecto", rel: window.CONNECTO_RELEASES || [], notes: true },
+      chat: { name: "Connecto Chat", rel: window.CONNECTO_CHAT_RELEASES || [], notes: false }
+    };
     var visitor = D.visitorPlatform(navigator);
-    var hasWin = D.applyPlatformTexts(document, rel);
+    var hasWin = D.applyPlatformTexts(document, products.connecto.rel);
     var hero = $("#hero-dl");
-    if (hero && hasWin && visitor === "windows") hero.textContent = "Download for Windows";
-    if (rel.length) {
-      dl.innerHTML = D.cardsHtml(rel, visitor);
-    } else {
-      dl.innerHTML = ["Apple silicon", "Intel"].map(function (t) {
-        return '<div class="dl-card"><h3>macOS · ' + t + '</h3><p>The first public build is being prepared.</p>' +
-          '<a class="btn btn-ghost" aria-disabled="true">Coming soon</a></div>';
-      }).join("");
+    if (hero && D.isMobile(navigator)) hero.textContent = "Download";
+    else if (hero && hasWin && visitor === "windows") hero.textContent = "Download for Windows";
+    document.querySelectorAll("[data-dl-summary]").forEach(function (p) {
+      var prod = products[p.getAttribute("data-dl-summary")];
+      p.textContent = prod && prod.rel.length ? D.summaryText(prod.rel) : "The first public build is being prepared.";
+    });
+    var opener = null;
+    var closePick = function () { if (pick.open) pick.close(); };
+    document.querySelectorAll(".dl-open").forEach(function (btn) {
+      var prod = products[btn.getAttribute("data-dl-product")];
+      if (!prod || !prod.rel.length) {
+        btn.textContent = "Coming soon";
+        btn.disabled = true;
+        return;
+      }
+      if (!pick || typeof pick.showModal !== "function") {
+        // No <dialog> support: the button shows the same chooser inline, under
+        // the cards, and hides it again on a second press.
+        var inline = $("#dl-inline");
+        if (!inline) return;
+        btn.setAttribute("aria-controls", "dl-inline");
+        btn.setAttribute("aria-expanded", "false");
+        btn.removeAttribute("aria-haspopup");
+        btn.addEventListener("click", function () {
+          var wasOpen = btn.getAttribute("aria-expanded") === "true";
+          document.querySelectorAll(".dl-open").forEach(function (b) { if (b.hasAttribute("aria-expanded")) b.setAttribute("aria-expanded", "false"); });
+          if (wasOpen) { inline.hidden = true; return; }
+          $("#dl-inline-title").textContent = "Download " + prod.name;
+          inline.querySelector(".pick-inline-body").innerHTML = D.pickHtml(prod.rel, visitor, { notes: prod.notes });
+          inline.hidden = false;
+          btn.setAttribute("aria-expanded", "true");
+          inline.focus();
+        });
+        return;
+      }
+      btn.addEventListener("click", function () {
+        $("#dl-pick-title").textContent = "Download " + prod.name;
+        $("#dl-pick-body").innerHTML = D.pickHtml(prod.rel, visitor, { notes: prod.notes });
+        opener = btn;
+        document.documentElement.classList.add("pick-open");
+        pick.showModal();
+        var firstDl = pick.querySelector(".pick-row .btn");
+        if (firstDl) firstDl.focus();
+        pick.querySelector(".pick-body").scrollTop = 0;
+      });
+    });
+    if (pick && typeof pick.showModal === "function") {
+      pick.querySelector(".pick-close").addEventListener("click", closePick);
+      // A click on the backdrop (outside the panel) closes it.
+      pick.addEventListener("click", function (e) { if (e.target === pick) closePick(); });
+      pick.addEventListener("close", function () {
+        document.documentElement.classList.remove("pick-open");
+        if (opener) opener.focus({ preventScroll: true });
+        opener = null;
+      });
+      // A link to another page section (the install guide stays a page) closes it.
+      pick.addEventListener("click", function (e) {
+        var a = e.target.closest && e.target.closest('a[href^="#"]');
+        if (a) closePick();
+      });
     }
   }
 })();

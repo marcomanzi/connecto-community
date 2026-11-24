@@ -4,11 +4,11 @@
 #   scripts/release/build-linux.sh x86_64
 #   scripts/release/build-linux.sh aarch64
 #
-# Run it on a Linux machine of that architecture (CI uses native runners). It
+# Run it on a Linux machine of that architecture (the release Mac runs it in Docker). It
 # only tars the programs; see README.md for what does and does not work on Linux.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-[ "$(uname -s)" = Linux ] || die "run this on Linux (CI: .github/workflows/release-build.yml)"
+[ "$(uname -s)" = Linux ] || die "run this on Linux (the release Mac: scripts/release/build-tag.sh)"
 ARCH="${1:-}"
 case "$ARCH" in
   x86_64) TARGET=x86_64-unknown-linux-gnu ;;

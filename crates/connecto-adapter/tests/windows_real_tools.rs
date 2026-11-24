@@ -1,7 +1,8 @@
 //! The Windows hook shapes against the real CLIs, without a model call and
 //! without an account: Claude fires `SessionStart` and `UserPromptSubmit` in
 //! `claude -p` before its request fails when it is not logged in, and
-//! `codex exec` fires `SessionStart` before its request fails.
+//! `codex exec` fires `SessionStart` before its request fails
+//! (`docs/windows-port.md` 4.8.2, 4.8.3).
 //!
 //! Ignored: they need the installed CLIs and a probe program. Run on Windows:
 //!
@@ -75,6 +76,7 @@ fn ctx(scratch: &Path, entry: PathBuf, project: &Path, profile: &str) -> LaunchC
     }
     LaunchCtx {
         entry,
+        cli_version: None,
         hook_binary: var("CONNECTO_M3_PROBE"),
         project: project.to_owned(),
         profile: scratch.join(profile),
@@ -83,6 +85,9 @@ fn ctx(scratch: &Path, entry: PathBuf, project: &Path, profile: &str) -> LaunchC
         run: scratch.join("run"),
         home: scratch.join("home"),
         inherited: inherited(scratch),
+        pi: Default::default(),
+        claude: Default::default(),
+        claude_cuts: Default::default(),
         session_id: "11111111-2222-4333-8444-555555555555".to_owned(),
         resume: None,
         hook_socket: r"\\.\pipe\connecto-hook-m3-probe".into(),
@@ -95,6 +100,7 @@ fn ctx(scratch: &Path, entry: PathBuf, project: &Path, profile: &str) -> LaunchC
             hooks: true,
             trust: None,
         },
+        package_text: None,
         initial_prompt: Some("say ok".to_owned()),
         session_name: None,
         model: None,

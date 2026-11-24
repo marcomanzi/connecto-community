@@ -1,4 +1,5 @@
-//! Inline rename of a terminal or a project (project-tree-ui R16).
+//! Inline rename of a terminal, a project or a project group (project-tree-ui
+//! R16), and the name of a new group.
 
 use egui::{Color32, FontId, Id, Key, Rect, Stroke, StrokeKind, Ui};
 
@@ -6,8 +7,15 @@ use crate::theme::{self, FieldStyle as _};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RenameTarget {
-    Terminal { project: String, terminal: String },
+    Terminal {
+        project: String,
+        terminal: String,
+    },
     Project(String),
+    /// A sidebar group's name.
+    Group(String),
+    /// The name of a group about to be made.
+    NewGroup,
 }
 
 pub(crate) enum RenameEnd {

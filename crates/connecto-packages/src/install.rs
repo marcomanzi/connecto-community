@@ -168,6 +168,10 @@ fn lock_path(project: &Path) -> PathBuf {
 }
 
 const LOCK_REL: &str = ".connecto/packages.lock";
+/// Where the lockfile was kept under the product's earlier name. It is read when
+/// there is no current one, and removed in the same step that writes (or
+/// removes) the current one, so the two never disagree.
+const LEGACY_LOCK_REL: &str = ".magneto/packages.lock";
 
 /// The project's lockfile; empty when there is none. A lockfile that names a
 /// path outside the tool folders is refused whole, before anything is touched.
@@ -179,7 +183,10 @@ pub fn read_lock(project: &Path) -> Result<Lock, String> {
         Ok(text) => Lock::parse(&text).ok_or_else(|| {
             format!("{LOCK_DIR}/{LOCK_FILE} is damaged: fix or delete it, then try again")
         })?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Lock::default()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match read_legacy_lock(project)? {
+            Some(lock) => lock,
+            None => return Ok(Lock::default()),
+        },
         Err(e) => return Err(format!("{LOCK_DIR}/{LOCK_FILE}: {e}")),
     };
     if let Some(bad) = lock.files.keys().find(|p| !fsx::tool_path(p)) {
@@ -188,6 +195,32 @@ pub fn read_lock(project: &Path) -> Result<Lock, String> {
         ));
     }
     Ok(lock)
+}
+
+/// The lockfile an install under the earlier name left, with the built-in
+/// package's id brought up to date; `None` when there is none.
+fn read_legacy_lock(project: &Path) -> Result<Option<Lock>, String> {
+    if fsx::has_link(project, LEGACY_LOCK_REL) {
+        return Ok(None);
+    }
+    let Ok(text) = fs::read_to_string(project.join(LEGACY_LOCK_REL)) else {
+        return Ok(None);
+    };
+    let mut lock = Lock::parse(&text)
+        .ok_or_else(|| format!("{LEGACY_LOCK_REL} is damaged: fix or delete it, then try again"))?;
+    for package in &mut lock.packages {
+        package.id = connecto_core::current_package_id(&package.id).to_owned();
+    }
+    for file in lock.files.values_mut() {
+        file.package = connecto_core::current_package_id(&file.package).to_owned();
+    }
+    Ok(Some(lock))
+}
+
+/// Whether the earlier name's lockfile is there to be taken over.
+fn legacy_lock_present(project: &Path) -> bool {
+    !fsx::has_link(project, LEGACY_LOCK_REL)
+        && fs::symlink_metadata(project.join(LEGACY_LOCK_REL)).is_ok_and(|m| m.is_file())
 }
 
 /// The writes of one install, undoable: every change first records what the
@@ -323,8 +356,8 @@ pub struct Outcome {
     pub changed: bool,
     pub written: Vec<String>,
     pub removed: Vec<String>,
-    /// Connecto's own files this install wrote or removed: the lockfile, and
-    /// `.claude/settings.json` when it was merged.
+    /// Connecto's own files this install wrote or removed: the lockfile (and
+    /// the earlier name's), and `.claude/settings.json` when it was merged.
     pub bookkeeping: Vec<String>,
     /// Left alone because the user changed them.
     pub skipped_modified: Vec<String>,
@@ -776,6 +809,11 @@ fn apply_inner(
         txn.write(LOCK_REL, lock.to_text().as_bytes())?;
     }
     out.bookkeeping.push(LOCK_REL.to_owned());
+    // The current lockfile now stands for the earlier one.
+    if legacy_lock_present(project) {
+        txn.remove(LEGACY_LOCK_REL)?;
+        out.bookkeeping.push(LEGACY_LOCK_REL.to_owned());
+    }
     if settings_changed {
         out.bookkeeping.push(SETTINGS.to_owned());
     }
@@ -786,7 +824,7 @@ fn apply_inner(
 
 /// Take out every package.
 pub fn remove_all(project: &Path) -> Result<Outcome, String> {
-    apply(project, &[], ProjectTools::Both)
+    apply(project, &[], ProjectTools::All)
 }
 
 #[cfg(test)]
@@ -814,6 +852,7 @@ mod tests {
             description: String::new(),
             version,
             extends: None,
+            requires: Vec::new(),
         };
         let exec = BTreeSet::new();
         let hash = crate::package::content_hash(&files, &exec, None);
@@ -843,7 +882,7 @@ mod tests {
         use crate::package::{Variant, WINDOWS_ONLY, builtin_for};
         for (variant, tools) in [
             (Variant::Claude, ProjectTools::Claude),
-            (Variant::Both, ProjectTools::Both),
+            (Variant::Both, ProjectTools::All),
         ] {
             let mac = Arc::new(builtin_for(variant, Platform::Unix).unwrap());
             let pc = Arc::new(builtin_for(variant, Platform::Windows).unwrap());
@@ -907,7 +946,7 @@ mod tests {
         use crate::package::{STATUSLINE_PS1, Variant, builtin_for};
         let dir = project("twins-codex");
         let pc = Arc::new(builtin_for(Variant::Both, Platform::Windows).unwrap());
-        apply_for(&dir, &[pc], ProjectTools::Both, Platform::Windows).unwrap();
+        apply_for(&dir, &[pc], ProjectTools::All, Platform::Windows).unwrap();
         assert!(dir.join(STATUSLINE_PS1).is_file());
         // The project is switched to Codex on the Mac: Claude's files go,
         // twins included.
@@ -919,10 +958,10 @@ mod tests {
 
         let dir = project("twins-user");
         let mine = package("mine", 1, &[(STATUSLINE_PS1, "mine")]);
-        apply_for(&dir, &[mine], ProjectTools::Both, Platform::Unix).unwrap();
+        apply_for(&dir, &[mine], ProjectTools::All, Platform::Unix).unwrap();
         assert_eq!(read(&dir, STATUSLINE_PS1), "mine");
         let mac = Arc::new(builtin_for(Variant::Both, Platform::Unix).unwrap());
-        let out = apply_for(&dir, &[mac], ProjectTools::Both, Platform::Unix).unwrap();
+        let out = apply_for(&dir, &[mac], ProjectTools::All, Platform::Unix).unwrap();
         assert!(out.removed.contains(&STATUSLINE_PS1.to_owned()), "{out:?}");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -948,12 +987,12 @@ mod tests {
             (".claude/a.md", "a"),
         ];
         let scripted = with_exec(&package("p", 1, &files), &[".claude/hooks/run.sh"]);
-        let out = apply(&dir, std::slice::from_ref(&scripted), ProjectTools::Both).unwrap();
+        let out = apply(&dir, std::slice::from_ref(&scripted), ProjectTools::All).unwrap();
         assert_eq!(out.written.len(), 2);
         assert_eq!(read(&dir, ".claude/hooks/run.sh"), "#!/bin/sh\n");
-        let out = apply(&dir, &[scripted], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[scripted], ProjectTools::All).unwrap();
         assert!(!out.changed, "{out:?}");
-        let out = apply(&dir, &[package("p", 2, &files)], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[package("p", 2, &files)], ProjectTools::All).unwrap();
         assert!(!out.changed && out.skipped_modified.is_empty(), "{out:?}");
         assert_eq!(out.installed[0].version, 2);
     }
@@ -967,23 +1006,23 @@ mod tests {
             (".claude/a.md", "a"),
         ];
         let scripted = with_exec(&package("p", 1, &files), &[".claude/hooks/run.sh"]);
-        let out = apply(&dir, std::slice::from_ref(&scripted), ProjectTools::Both).unwrap();
+        let out = apply(&dir, std::slice::from_ref(&scripted), ProjectTools::All).unwrap();
         assert_eq!(out.written.len(), 2);
         assert_eq!(mode(&dir, ".claude/hooks/run.sh") & 0o111, 0o111);
         assert_eq!(mode(&dir, ".claude/a.md") & 0o111, 0);
         // The same again changes nothing.
-        let out = apply(&dir, &[scripted], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[scripted], ProjectTools::All).unwrap();
         assert!(!out.changed, "{out:?}");
         // The package drops the bit: same bytes, yet the file is updated and
         // not taken for one the user changed.
-        let out = apply(&dir, &[package("p", 2, &files)], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[package("p", 2, &files)], ProjectTools::All).unwrap();
         assert_eq!(out.written, [".claude/hooks/run.sh"]);
         assert!(out.skipped_modified.is_empty());
         assert_eq!(mode(&dir, ".claude/hooks/run.sh") & 0o111, 0);
         assert_eq!(read(&dir, ".claude/hooks/run.sh"), "#!/bin/sh\n");
         // And back, as for a script installed before modes were kept.
         let scripted = with_exec(&package("p", 3, &files), &[".claude/hooks/run.sh"]);
-        let out = apply(&dir, &[scripted], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[scripted], ProjectTools::All).unwrap();
         assert_eq!(out.written, [".claude/hooks/run.sh"]);
         assert_eq!(mode(&dir, ".claude/hooks/run.sh") & 0o111, 0o111);
     }
@@ -993,10 +1032,10 @@ mod tests {
     fn a_script_the_user_edited_keeps_its_content_and_its_mode() {
         let dir = project("exec-edited");
         let files = [(".claude/run.sh", "one")];
-        apply(&dir, &[package("p", 1, &files)], ProjectTools::Both).unwrap();
+        apply(&dir, &[package("p", 1, &files)], ProjectTools::All).unwrap();
         fs::write(dir.join(".claude/run.sh"), "mine").unwrap();
         let scripted = with_exec(&package("p", 2, &files), &[".claude/run.sh"]);
-        let out = apply(&dir, &[scripted], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[scripted], ProjectTools::All).unwrap();
         assert_eq!(out.skipped_modified, [".claude/run.sh"]);
         assert_eq!(mode(&dir, ".claude/run.sh") & 0o111, 0);
         assert_eq!(read(&dir, ".claude/run.sh"), "mine");
@@ -1007,14 +1046,14 @@ mod tests {
     fn a_rollback_puts_back_the_mode_of_a_file_it_rewrote() {
         let dir = project("exec-rollback");
         let files = [(".claude/run.sh", "one")];
-        apply(&dir, &[package("p", 1, &files)], ProjectTools::Both).unwrap();
+        apply(&dir, &[package("p", 1, &files)], ProjectTools::All).unwrap();
         fs::create_dir_all(dir.join(".claude/z")).unwrap();
         fs::write(dir.join(".claude/z/keep"), "k").unwrap();
         let v2 = with_exec(
             &package("p", 2, &[(".claude/run.sh", "one"), (".claude/z", "f")]),
             &[".claude/run.sh"],
         );
-        assert!(apply(&dir, &[v2], ProjectTools::Both).is_err());
+        assert!(apply(&dir, &[v2], ProjectTools::All).is_err());
         assert_eq!(mode(&dir, ".claude/run.sh") & 0o111, 0);
     }
 
@@ -1022,7 +1061,7 @@ mod tests {
     fn an_edited_file_where_a_folder_is_now_needed_is_skipped_not_fatal() {
         let dir = project("file-above");
         let v1 = package("p", 1, &[(".claude/a", "one"), (".claude/c.md", "c1")]);
-        apply(&dir, &[v1], ProjectTools::Both).unwrap();
+        apply(&dir, &[v1], ProjectTools::All).unwrap();
         fs::write(dir.join(".claude/a"), "mine").unwrap();
         let v2 = || {
             package(
@@ -1037,7 +1076,7 @@ mod tests {
         };
         // Twice: the second time the lockfile no longer knows `.claude/a`.
         for round in 0..2 {
-            let out = apply(&dir, &[v2()], ProjectTools::Both).unwrap();
+            let out = apply(&dir, &[v2()], ProjectTools::All).unwrap();
             assert_eq!(out.skipped_modified, [".claude/a"], "round {round}");
             let warning = out.warnings.iter().find(|w| w.starts_with(".claude/a:"));
             assert!(
@@ -1051,7 +1090,7 @@ mod tests {
         }
         // Once the file is out of the way, the files under it arrive.
         fs::remove_file(dir.join(".claude/a")).unwrap();
-        let out = apply(&dir, &[v2()], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[v2()], ProjectTools::All).unwrap();
         assert!(out.skipped_modified.is_empty() && out.warnings.is_empty());
         assert_eq!(read(&dir, ".claude/a/b"), "b");
         assert_eq!(read(&dir, ".claude/a/deep/c"), "c");
@@ -1076,7 +1115,7 @@ mod tests {
                 (".codex/agents/x.toml", "x"),
             ],
         );
-        let out = apply(&dir, &[v1], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[v1], ProjectTools::All).unwrap();
         assert!(out.changed);
         assert_eq!(out.written.len(), 3);
         assert_eq!(read(&dir, ".claude/skills/a/SKILL.md"), "a1");
@@ -1091,10 +1130,10 @@ mod tests {
                 (".codex/agents/x.toml", "x"),
             ],
         );
-        assert!(!apply(&dir, &[v1], ProjectTools::Both).unwrap().changed);
+        assert!(!apply(&dir, &[v1], ProjectTools::All).unwrap().changed);
         // Version 2 changes one file and drops two.
         let v2 = package("p", 2, &[(".claude/skills/a/SKILL.md", "a2")]);
-        let out = apply(&dir, &[v2], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[v2], ProjectTools::All).unwrap();
         assert_eq!(out.written, [".claude/skills/a/SKILL.md"]);
         assert_eq!(out.removed.len(), 2);
         assert_eq!(read(&dir, ".claude/skills/a/SKILL.md"), "a2");
@@ -1111,29 +1150,80 @@ mod tests {
         assert!(!dir.join(".claude").exists());
     }
 
+    /// A project an install under the earlier name set up: its lockfile is in
+    /// `.magneto/` and names the built-in package `magneto`.
+    fn legacy_project(name: &str) -> PathBuf {
+        let dir = project(name);
+        let v1 = package("connecto", 1, &[(".claude/skills/a/SKILL.md", "a1")]);
+        apply(&dir, &[v1], ProjectTools::All).unwrap();
+        let text = read(&dir, ".connecto/packages.lock").replace("connecto", "magneto");
+        fs::remove_dir_all(dir.join(".connecto")).unwrap();
+        fs::create_dir_all(dir.join(".magneto")).unwrap();
+        fs::write(dir.join(".magneto/packages.lock"), text).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_lockfile_from_the_earlier_name_is_read_with_the_current_package_id() {
+        let dir = legacy_project("legacy-read");
+        let lock = read_lock(&dir).unwrap();
+        assert_eq!(lock.packages[0].id, "connecto");
+        assert!(lock.files.values().all(|f| f.package == "connecto"));
+        // Reading changes nothing on disk.
+        assert!(dir.join(".magneto/packages.lock").is_file());
+        assert!(!dir.join(".connecto").exists());
+    }
+
+    #[test]
+    fn the_next_install_takes_the_earlier_lockfile_over_and_updates_untouched_files() {
+        let dir = legacy_project("legacy-update");
+        fs::write(dir.join(".magneto/other"), "kept").unwrap();
+        let v2 = package("connecto", 2, &[(".claude/skills/a/SKILL.md", "a2")]);
+        let out = apply(&dir, &[v2], ProjectTools::All).unwrap();
+        // The file was the package's and unedited, so it is updated, not skipped.
+        assert_eq!(out.written, [".claude/skills/a/SKILL.md"], "{out:?}");
+        assert_eq!(read(&dir, ".claude/skills/a/SKILL.md"), "a2");
+        assert!(dir.join(".connecto/packages.lock").is_file());
+        assert!(!dir.join(".magneto/packages.lock").exists());
+        assert_eq!(read(&dir, ".magneto/other"), "kept", "other files stay");
+        // Again: nothing changes and the old lockfile does not come back.
+        let v2 = package("connecto", 2, &[(".claude/skills/a/SKILL.md", "a2")]);
+        assert!(!apply(&dir, &[v2], ProjectTools::All).unwrap().changed);
+        assert!(!dir.join(".magneto/packages.lock").exists());
+    }
+
+    #[test]
+    fn removing_everything_does_not_let_the_earlier_lockfile_come_back() {
+        let dir = legacy_project("legacy-remove");
+        let out = remove_all(&dir).unwrap();
+        assert_eq!(out.removed, [".claude/skills/a/SKILL.md"]);
+        assert!(!dir.join(".magneto").exists());
+        assert!(read_lock(&dir).unwrap().packages.is_empty());
+    }
+
     #[test]
     fn a_file_the_user_edited_is_skipped_and_reported() {
         let dir = project("modified");
         let v1 = package("p", 1, &[(".claude/a.md", "one"), (".claude/b.md", "b")]);
-        apply(&dir, &[v1], ProjectTools::Both).unwrap();
+        apply(&dir, &[v1], ProjectTools::All).unwrap();
         fs::write(dir.join(".claude/a.md"), "mine").unwrap();
         let v2 = package("p", 2, &[(".claude/a.md", "two")]);
-        let out = apply(&dir, &[v2], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[v2], ProjectTools::All).unwrap();
         assert_eq!(out.skipped_modified, [".claude/a.md"]);
         assert_eq!(read(&dir, ".claude/a.md"), "mine");
         assert_eq!(out.removed, [".claude/b.md"]);
         // Still reported on the next check, still untouched.
         let v2 = package("p", 2, &[(".claude/a.md", "two")]);
-        let out = apply(&dir, &[v2], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[v2], ProjectTools::All).unwrap();
         assert_eq!(out.skipped_modified, [".claude/a.md"]);
         // A dropped file the user edited stays too.
-        let out = apply(&dir, &[], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[], ProjectTools::All).unwrap();
         assert_eq!(out.skipped_modified, [".claude/a.md"]);
         assert_eq!(read(&dir, ".claude/a.md"), "mine");
         // A file that was there before and differs is not Connecto's to replace.
         fs::write(dir.join(".claude/c.md"), "theirs").unwrap();
         let v3 = package("p", 3, &[(".claude/c.md", "ours")]);
-        let out = apply(&dir, &[v3], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[v3], ProjectTools::All).unwrap();
         assert_eq!(out.skipped_modified, [".claude/c.md"]);
         assert_eq!(read(&dir, ".claude/c.md"), "theirs");
     }
@@ -1147,7 +1237,7 @@ mod tests {
             &[(".claude/a.md", "base"), (".claude/b.md", "b")],
         );
         let top = package("top", 1, &[(".claude/a.md", "top")]);
-        apply(&dir, &[base, top], ProjectTools::Both).unwrap();
+        apply(&dir, &[base, top], ProjectTools::All).unwrap();
         assert_eq!(read(&dir, ".claude/a.md"), "top");
         assert_eq!(read(&dir, ".claude/b.md"), "b");
         let lock = read_lock(&dir).unwrap();
@@ -1173,6 +1263,31 @@ mod tests {
         assert_eq!(out.removed, [".claude/a.md"]);
     }
 
+    /// A set of tools takes each chosen tool's folders: Claude and Pi get
+    /// `.claude` and `.agents`, not `.codex`; switching to Codex and Pi
+    /// removes the Claude files and adds `.codex`.
+    #[test]
+    fn a_set_of_tools_installs_the_folders_of_each_chosen_tool() {
+        use connecto_core::ToolKind;
+        let files = [
+            (".claude/a.md", "c"),
+            (".codex/b.toml", "x"),
+            (".agents/s/SKILL.md", "s"),
+        ];
+        let dir = project("tool-set");
+        let claude_pi = ProjectTools::from_tools([ToolKind::Claude, ToolKind::Pi]).unwrap();
+        apply(&dir, &[package("p", 1, &files)], claude_pi).unwrap();
+        assert!(dir.join(".claude/a.md").is_file());
+        assert!(dir.join(".agents/s/SKILL.md").is_file());
+        assert!(!dir.join(".codex").exists());
+        let codex_pi = ProjectTools::from_tools([ToolKind::Codex, ToolKind::Pi]).unwrap();
+        let out = apply(&dir, &[package("p", 1, &files)], codex_pi).unwrap();
+        assert!(!dir.join(".claude").exists());
+        assert!(dir.join(".codex/b.toml").is_file());
+        assert!(dir.join(".agents/s/SKILL.md").is_file());
+        assert_eq!(out.removed, [".claude/a.md"]);
+    }
+
     #[test]
     fn settings_are_merged_without_replacing_the_users_and_unmerged_exactly() {
         let dir = project("settings");
@@ -1189,7 +1304,7 @@ mod tests {
             "permissions": {"allow": ["Bash(ls)", "Bash(pwd)"]}
         }"#;
         let p = package("p", 1, &[(".claude/settings.json", fragment)]);
-        let out = apply(&dir, std::slice::from_ref(&p), ProjectTools::Both).unwrap();
+        let out = apply(&dir, std::slice::from_ref(&p), ProjectTools::All).unwrap();
         assert!(out.changed);
         assert!(
             out.warnings.iter().any(|w| w.contains("statusLine")),
@@ -1206,13 +1321,13 @@ mod tests {
             json!(["Bash(ls)", "Bash(pwd)"])
         );
         // Again: nothing changes, nothing is recorded twice.
-        assert!(!apply(&dir, &[p], ProjectTools::Both).unwrap().changed);
+        assert!(!apply(&dir, &[p], ProjectTools::All).unwrap().changed);
         // The user adds a key of their own meanwhile.
         let mut value = now.clone();
         value["env"] = json!({"A": "1"});
         fs::write(dir.join(".claude/settings.json"), value.to_string()).unwrap();
         // Out again: exactly what was added goes, the rest stays.
-        let out = apply(&dir, &[], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[], ProjectTools::All).unwrap();
         assert!(out.changed);
         let back: Value = serde_json::from_str(&read(&dir, ".claude/settings.json")).unwrap();
         assert_eq!(
@@ -1238,10 +1353,10 @@ mod tests {
                 r#"{"enabledPlugins":{"a@b":true}}"#,
             )],
         );
-        apply(&dir, &[p], ProjectTools::Both).unwrap();
+        apply(&dir, &[p], ProjectTools::All).unwrap();
         assert!(dir.join(".claude/settings.json").is_file());
         let p2 = package("p", 2, &[(".claude/a.md", "a")]);
-        apply(&dir, &[p2], ProjectTools::Both).unwrap();
+        apply(&dir, &[p2], ProjectTools::All).unwrap();
         assert!(!dir.join(".claude/settings.json").exists());
         assert!(dir.join(".claude/a.md").is_file());
         // A Codex-only project gets no settings.json.
@@ -1271,7 +1386,7 @@ mod tests {
                 (".claude/x.md", "x"),
             ],
         );
-        let out = apply(&dir, &[p], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[p], ProjectTools::All).unwrap();
         assert!(out.warnings.iter().any(|w| w.contains("not a JSON object")));
         assert_eq!(read(&dir, ".claude/settings.json"), "{ nope");
         assert!(dir.join(".claude/x.md").is_file());
@@ -1283,12 +1398,12 @@ mod tests {
         fs::create_dir_all(dir.join(".connecto")).unwrap();
         fs::write(dir.join(".connecto/packages.lock"), "garbage").unwrap();
         let p = package("p", 1, &[(".claude/a.md", "a")]);
-        assert!(apply(&dir, std::slice::from_ref(&p), ProjectTools::Both).is_err());
+        assert!(apply(&dir, std::slice::from_ref(&p), ProjectTools::All).is_err());
         assert!(!dir.join(".claude").exists());
         fs::remove_file(dir.join(".connecto/packages.lock")).unwrap();
         let outside = project("outside");
         crate::platform::link_dir(&outside, &dir.join(".claude")).unwrap();
-        let out = apply(&dir, &[p], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[p], ProjectTools::All).unwrap();
         assert!(out.warnings.iter().any(|w| w.contains("unsafe")));
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
     }
@@ -1335,7 +1450,7 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             fs::write(base.join("victim"), "victim").unwrap();
             lock_with(&dir, key);
-            let err = apply(&dir, &[], ProjectTools::Both).unwrap_err();
+            let err = apply(&dir, &[], ProjectTools::All).unwrap_err();
             assert!(err.contains("not inside"), "{key}: {err}");
             assert_eq!(
                 fs::read_to_string(base.join("victim")).unwrap(),
@@ -1354,7 +1469,7 @@ mod tests {
         let dir = project("badsource");
         let good = package("p", 1, &[(".claude/a.md", "a")]);
         let bad = package("q", 1, &[("../escape.md", "x")]);
-        let err = apply(&dir, &[good, bad], ProjectTools::Both).unwrap_err();
+        let err = apply(&dir, &[good, bad], ProjectTools::All).unwrap_err();
         assert!(err.contains("not inside"), "{err}");
         assert!(!dir.join(".claude").exists() && !dir.join(".connecto").exists());
         assert!(!dir.parent().unwrap().join("escape.md").exists());
@@ -1383,7 +1498,7 @@ mod tests {
         ] {
             let good = package("p", 1, &[(".claude/a.md", "a")]);
             let bad_package = package("q", 1, &[(bad.as_str(), "x")]);
-            let err = apply(&dir, &[good, bad_package], ProjectTools::Both).unwrap_err();
+            let err = apply(&dir, &[good, bad_package], ProjectTools::All).unwrap_err();
             assert!(err.contains("not inside"), "{bad}: {err}");
             assert!(!dir.join(".claude").exists() && !dir.join(".connecto").exists());
             assert!(!Path::new(&outside).exists(), "{bad}");
@@ -1398,7 +1513,7 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         crate::platform::link_dir(&outside, &dir.join(".connecto")).unwrap();
         let p = package("p", 1, &[(".claude/a.md", "a")]);
-        assert!(apply(&dir, std::slice::from_ref(&p), ProjectTools::Both).is_err());
+        assert!(apply(&dir, std::slice::from_ref(&p), ProjectTools::All).is_err());
         assert!(
             fs::read_dir(&outside).unwrap().next().is_none(),
             "nothing written through the link"
@@ -1416,7 +1531,7 @@ mod tests {
                 dir.join(".claude/.a.md.connecto-tmp"),
             )
             .unwrap();
-            apply(&dir, &[p], ProjectTools::Both).unwrap();
+            apply(&dir, &[p], ProjectTools::All).unwrap();
             assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "v");
         }
     }
@@ -1433,7 +1548,7 @@ mod tests {
                 (".claude/settings.json", r#"{"x":1}"#),
             ],
         );
-        apply(&dir, &[v1], ProjectTools::Both).unwrap();
+        apply(&dir, &[v1], ProjectTools::All).unwrap();
         let lock_before = fs::read_to_string(dir.join(".connecto/packages.lock")).unwrap();
         // `.claude/z` is a folder, so writing the file there fails after a.md
         // was rewritten and gone.md removed.
@@ -1448,7 +1563,7 @@ mod tests {
                 (".claude/settings.json", r#"{"y":2}"#),
             ],
         );
-        let err = apply(&dir, &[v2], ProjectTools::Both).unwrap_err();
+        let err = apply(&dir, &[v2], ProjectTools::All).unwrap_err();
         assert!(err.contains("nothing was changed"), "{err}");
         assert_eq!(read(&dir, ".claude/a.md"), "one");
         assert_eq!(read(&dir, ".claude/gone.md"), "gone");
@@ -1461,7 +1576,7 @@ mod tests {
         // Retrying with the obstacle gone works.
         fs::remove_dir_all(dir.join(".claude/z")).unwrap();
         let v2 = package("p", 2, &[(".claude/a.md", "two")]);
-        assert!(apply(&dir, &[v2], ProjectTools::Both).unwrap().changed);
+        assert!(apply(&dir, &[v2], ProjectTools::All).unwrap().changed);
     }
 
     #[test]
@@ -1477,7 +1592,7 @@ mod tests {
                 (".claude/z", "f"),
             ],
         );
-        assert!(apply(&dir, &[p], ProjectTools::Both).is_err());
+        assert!(apply(&dir, &[p], ProjectTools::All).is_err());
         assert!(!dir.join(".claude/a.md").exists());
         assert!(!dir.join(".codex").exists() && !dir.join(".connecto").exists());
     }
@@ -1493,13 +1608,13 @@ mod tests {
                 r#"{"enabledPlugins":{"a@x":true,"b@x":true},"extraKnownMarketplaces":{"m":{"source":{"repo":"r"}}},"list":["one"]}"#,
             )],
         );
-        apply(&dir, &[p], ProjectTools::Both).unwrap();
+        apply(&dir, &[p], ProjectTools::All).unwrap();
         let mut value: Value = serde_json::from_str(&read(&dir, ".claude/settings.json")).unwrap();
         value["enabledPlugins"]["mine@x"] = json!(true);
         value["extraKnownMarketplaces"]["m"]["source"]["extra"] = json!(1);
         value["list"] = json!(["one", "mine"]);
         fs::write(dir.join(".claude/settings.json"), value.to_string()).unwrap();
-        let out = apply(&dir, &[], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[], ProjectTools::All).unwrap();
         assert!(out.changed);
         let back: Value = serde_json::from_str(&read(&dir, ".claude/settings.json")).unwrap();
         assert_eq!(
@@ -1518,19 +1633,19 @@ mod tests {
         // File to folder: `a` is replaced by `a/b`, then a later file fails.
         let dir = project("swap-file-folder");
         let v1 = package("p", 1, &[(".claude/a", "file a")]);
-        apply(&dir, &[v1], ProjectTools::Both).unwrap();
+        apply(&dir, &[v1], ProjectTools::All).unwrap();
         let lock_before = read(&dir, ".connecto/packages.lock");
         fs::create_dir_all(dir.join(".claude/z")).unwrap();
         fs::write(dir.join(".claude/z/keep"), "k").unwrap();
         let v2 = package("p", 2, &[(".claude/a/b", "b"), (".claude/z", "blocked")]);
-        let err = apply(&dir, &[v2], ProjectTools::Both).unwrap_err();
+        let err = apply(&dir, &[v2], ProjectTools::All).unwrap_err();
         assert!(err.contains("nothing was changed"), "{err}");
         assert_eq!(read(&dir, ".claude/a"), "file a");
         assert_eq!(read(&dir, ".connecto/packages.lock"), lock_before);
         // Folder to file: `a/b` is replaced by the file `a`, then a later file fails.
         let dir = project("swap-folder-file");
         let v1 = package("p", 1, &[(".claude/a/b", "file b")]);
-        apply(&dir, &[v1], ProjectTools::Both).unwrap();
+        apply(&dir, &[v1], ProjectTools::All).unwrap();
         let lock_before = read(&dir, ".connecto/packages.lock");
         fs::create_dir_all(dir.join(".claude/z")).unwrap();
         fs::write(dir.join(".claude/z/keep"), "k").unwrap();
@@ -1539,7 +1654,7 @@ mod tests {
             2,
             &[(".claude/a", "now a file"), (".claude/z", "blocked")],
         );
-        assert!(apply(&dir, &[v2], ProjectTools::Both).is_err());
+        assert!(apply(&dir, &[v2], ProjectTools::All).is_err());
         assert_eq!(read(&dir, ".claude/a/b"), "file b");
         assert_eq!(read(&dir, ".connecto/packages.lock"), lock_before);
     }
@@ -1557,11 +1672,68 @@ mod tests {
                 r#"{"enabledPlugins":{"a@b":true}}"#,
             )],
         );
-        apply(&dir, &[p], ProjectTools::Both).unwrap();
+        apply(&dir, &[p], ProjectTools::All).unwrap();
         assert!(read(&dir, ".claude/settings.json").contains("a@b"));
-        let out = apply(&dir, &[], ProjectTools::Both).unwrap();
+        let out = apply(&dir, &[], ProjectTools::All).unwrap();
         assert!(out.changed);
         let back: Value = serde_json::from_str(&read(&dir, ".claude/settings.json")).unwrap();
         assert_eq!(back, json!({}), "the plugin is no longer enabled");
+    }
+
+    /// A project that has the built-in package from before the status recap
+    /// (version 8) gets it through the usual update: the rule for Claude, and
+    /// for the other agents a lockfile that names the built-in package, which
+    /// is what the launcher passes them the recap on. The project's own
+    /// `AGENTS.md` and `CLAUDE.md` are not touched.
+    #[test]
+    fn a_project_with_the_earlier_builtin_gets_the_status_recap_on_update() {
+        use crate::package::{STATUS_RULE, Variant, builtin};
+        use connecto_core::ToolKind;
+        use connecto_session::package_text::has_builtin;
+        for tools in [
+            ProjectTools::All,
+            ProjectTools::Claude,
+            ProjectTools::Codex,
+            ProjectTools::Pi,
+            ProjectTools::Antigravity,
+            ProjectTools::OpenCode,
+        ] {
+            let dir = project(&format!("recap-{tools:?}"));
+            let own = "mine  \r\n\r\n";
+            fs::write(dir.join("CLAUDE.md"), own).unwrap();
+            fs::write(dir.join("AGENTS.md"), own).unwrap();
+            let new = builtin(Variant::for_tools(tools)).unwrap();
+            let mut old = new.clone();
+            old.files.retain(|p, _| p != STATUS_RULE);
+            old.manifest.version = 8;
+            old.hash = crate::package::content_hash(&old.files, &old.exec, None);
+            apply(&dir, &[Arc::new(old)], tools).unwrap();
+            assert!(!dir.join(STATUS_RULE).exists());
+            assert!(has_builtin(&dir), "{tools:?}");
+            let out = apply(&dir, &[Arc::new(new)], tools).unwrap();
+            assert!(out.installed[0].version >= 9, "{tools:?}");
+            assert!(has_builtin(&dir), "{tools:?}");
+            assert_eq!(
+                out.changed,
+                tools.allows(ToolKind::Claude),
+                "{tools:?}: {out:?}"
+            );
+            assert_eq!(
+                dir.join(STATUS_RULE).is_file(),
+                tools.allows(ToolKind::Claude),
+                "{tools:?}"
+            );
+            for written in out.written.iter().chain(&out.bookkeeping) {
+                assert!(
+                    written.starts_with(".claude/")
+                        || written.starts_with(".agents/")
+                        || written.starts_with(".connecto/"),
+                    "{tools:?}: {written}"
+                );
+            }
+            assert_eq!(read(&dir, "CLAUDE.md"), own);
+            assert_eq!(read(&dir, "AGENTS.md"), own);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }

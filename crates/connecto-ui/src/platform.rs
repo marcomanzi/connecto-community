@@ -172,6 +172,18 @@ pub(crate) fn is_select_all(modifiers: &Modifiers) -> bool {
         || (modifiers.ctrl && modifiers.shift && !modifiers.alt)
 }
 
+/// Copy the selection exactly as the screen shows it (the copy key gives the
+/// clean copy): Cmd+Shift+C on macOS, Ctrl+Shift+C elsewhere.
+pub(crate) fn is_copy_as_shown(modifiers: &Modifiers) -> bool {
+    modifiers.command && modifiers.shift && !modifiers.alt
+}
+
+/// The keys of [`is_copy_as_shown`], for tooltips.
+#[cfg(target_os = "macos")]
+pub(crate) const COPY_AS_SHOWN_KEYS: &str = "Cmd+Shift+C";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const COPY_AS_SHOWN_KEYS: &str = "Ctrl+Shift+C";
+
 /// Off macOS the system turns Ctrl+C and Ctrl+X into Copy and Cut before the
 /// window sees a key. With nothing selected they are the shell's keys, so they
 /// go to the terminal as the Ctrl keys they were (Ctrl+C interrupts, as in
@@ -206,10 +218,19 @@ pub(crate) const COPY_CLEARS_SELECTION: bool = true;
 
 // ---------- dropped files ----------
 
-/// One dropped path as the shell reads it. Unix shells: a backslash before
-/// every character the shell would read as syntax.
-#[cfg(not(windows))]
+/// One dropped path as this computer's shell reads it: [`quote_posix`], or
+/// [`quote_powershell`] on Windows.
 pub(crate) fn quote_dropped_path(path: &str, out: &mut String) {
+    if cfg!(windows) {
+        quote_powershell(path, out);
+    } else {
+        quote_posix(path, out);
+    }
+}
+
+/// One path as a Unix shell reads it: a backslash before every character
+/// the shell would read as syntax.
+pub(crate) fn quote_posix(path: &str, out: &mut String) {
     for c in path.chars() {
         if !(c.is_alphanumeric() || "_-./,:@%+=~".contains(c)) {
             out.push('\\');
@@ -221,8 +242,7 @@ pub(crate) fn quote_dropped_path(path: &str, out: &mut String) {
 /// One dropped path as PowerShell reads it: as is when it has only plain
 /// characters, else in single quotes (nothing inside is expanded) with each
 /// `'` doubled. A backslash is the path separator here, not an escape.
-#[cfg(windows)]
-pub(crate) fn quote_dropped_path(path: &str, out: &mut String) {
+pub(crate) fn quote_powershell(path: &str, out: &mut String) {
     let plain = path
         .chars()
         .all(|c| c.is_alphanumeric() || "_-./\\:".contains(c));
@@ -277,6 +297,35 @@ pub(crate) fn reduce_motion() -> bool {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn reduce_motion() -> bool {
     false
+}
+
+/// Open a saved file with the app the system picks for it.
+pub(crate) fn open_file(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+}
+
+/// Show a saved file in its folder (Finder on macOS).
+pub(crate) fn reveal(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(folder) = path.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+    }
+    #[cfg(windows)]
+    {
+        let mut select = std::ffi::OsString::from("/select,");
+        select.push(path);
+        let _ = std::process::Command::new("explorer").arg(select).spawn();
+    }
 }
 
 /// Open a web page in the default browser.

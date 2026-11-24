@@ -40,9 +40,17 @@ pub fn hook_binary() -> PathBuf {
                 .status()
                 .unwrap();
             assert!(status.success());
+            // The profile folder (target/debug) is above the test binary:
+            // one level up from deps/, or more in cargo's newer layout
+            // (build/<package>/<hash>/out/).
+            let name = format!("connecto-hook{}", std::env::consts::EXE_SUFFIX);
             let test_exe = std::env::current_exe().unwrap();
-            let profile_dir = test_exe.parent().unwrap().parent().unwrap();
-            profile_dir.join(format!("connecto-hook{}", std::env::consts::EXE_SUFFIX))
+            test_exe
+                .ancestors()
+                .skip(1)
+                .map(|dir| dir.join(&name))
+                .find(|helper| helper.is_file())
+                .expect("the hook helper next to the profile's binaries")
         })
         .clone()
 }

@@ -1,5 +1,5 @@
 {
   "name": "Connecto",
-  "description": "Connecto's team workflows for Claude only: reviewers and critics run as Claude terminals.",
-  "version": 1
+  "description": "Connecto's team workflows and a second opinion for Claude only: every role runs in its own Claude terminal. Also how to set up a project's Agentic Works.",
+  "version": 10
 }

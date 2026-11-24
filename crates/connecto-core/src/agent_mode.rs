@@ -11,12 +11,18 @@ use crate::ToolKind;
 pub enum AgentMode {
     /// Nothing asks: Claude `--dangerously-skip-permissions`, Codex
     /// `--dangerously-bypass-approvals-and-sandbox` (`--yolo`). The behaviour
-    /// before this choice existed, and the default.
+    /// before this choice existed, and the default. Pi never asks before a
+    /// tool call; for it this mode also trusts the project's own `.pi`
+    /// resources (`--approve`), and the other two leave Pi's trust question.
+    /// Antigravity: `--dangerously-skip-permissions`. OpenCode: `--auto`
+    /// (every permission not explicitly denied is granted).
     #[default]
     Bypass,
     /// The tool's own automatic mode: Claude `--permission-mode auto` (a model
     /// classifier reviews actions), Codex `--approve-for-me` (automatic review,
-    /// on-request approvals, workspace-write sandbox).
+    /// on-request approvals, workspace-write sandbox), Antigravity `--mode
+    /// auto` (where the account offers it; else its normal prompts).
+    /// OpenCode has no reviewing mode: its normal prompts.
     Auto,
     /// No flag: the tool's normal permission prompts.
     Prompt,
@@ -46,6 +52,9 @@ impl AgentMode {
 pub struct LaunchModes {
     pub claude: AgentMode,
     pub codex: AgentMode,
+    pub pi: AgentMode,
+    pub antigravity: AgentMode,
+    pub opencode: AgentMode,
 }
 
 impl LaunchModes {
@@ -54,6 +63,9 @@ impl LaunchModes {
         match tool {
             ToolKind::Claude => self.claude,
             ToolKind::Codex => self.codex,
+            ToolKind::Pi => self.pi,
+            ToolKind::Antigravity => self.antigravity,
+            ToolKind::OpenCode => self.opencode,
             // A shell has no permissions to ask about; nothing reads this.
             ToolKind::Shell => AgentMode::Prompt,
         }
@@ -64,6 +76,9 @@ impl LaunchModes {
         match tool {
             ToolKind::Claude => self.claude = mode,
             ToolKind::Codex => self.codex = mode,
+            ToolKind::Pi => self.pi = mode,
+            ToolKind::Antigravity => self.antigravity = mode,
+            ToolKind::OpenCode => self.opencode = mode,
             ToolKind::Shell => {}
         }
         self
@@ -79,6 +94,8 @@ mod tests {
         let modes = LaunchModes::default();
         assert_eq!(modes.for_tool(ToolKind::Claude), AgentMode::Bypass);
         assert_eq!(modes.for_tool(ToolKind::Codex), AgentMode::Bypass);
+        assert_eq!(modes.for_tool(ToolKind::Antigravity), AgentMode::Bypass);
+        assert_eq!(modes.for_tool(ToolKind::OpenCode), AgentMode::Bypass);
     }
 
     #[test]
@@ -94,5 +111,8 @@ mod tests {
         let modes = LaunchModes::default().with(ToolKind::Codex, AgentMode::Auto);
         assert_eq!(modes.codex, AgentMode::Auto);
         assert_eq!(modes.claude, AgentMode::Bypass);
+        let modes = modes.with(ToolKind::Antigravity, AgentMode::Prompt);
+        assert_eq!(modes.antigravity, AgentMode::Prompt);
+        assert_eq!(modes.codex, AgentMode::Auto);
     }
 }

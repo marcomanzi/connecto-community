@@ -85,10 +85,16 @@ impl Variant {
     /// The form that fits a project's Tools setting.
     #[must_use]
     pub const fn for_tools(tools: ProjectTools) -> Self {
-        match tools {
-            ProjectTools::Claude => Self::Claude,
-            ProjectTools::Codex => Self::Codex,
-            ProjectTools::Both => Self::Both,
+        if tools.len() > 1 {
+            // Two or more tools: the teams choose among the available ones
+            // (a tool the project does not allow cannot be started).
+            Self::Both
+        } else if tools.allows(connecto_core::ToolKind::Claude) {
+            Self::Claude
+        } else {
+            // A project of Pi, Antigravity or OpenCode alone runs everything
+            // in one tool, as a Codex one does, and reads the same skills.
+            Self::Codex
         }
     }
 
@@ -135,11 +141,18 @@ pub fn is_claude(path: &str) -> bool {
 #[must_use]
 pub fn wanted(path: &str, tools: ProjectTools) -> bool {
     use connecto_core::ToolKind;
-    tools.allows(if is_claude(path) {
-        ToolKind::Claude
+    if is_claude(path) {
+        tools.allows(ToolKind::Claude)
+    } else if path.starts_with(".agents/") {
+        // The skills folder is Codex's, Pi's, Antigravity's and OpenCode's
+        // alike.
+        tools.allows(ToolKind::Codex)
+            || tools.allows(ToolKind::Pi)
+            || tools.allows(ToolKind::Antigravity)
+            || tools.allows(ToolKind::OpenCode)
     } else {
-        ToolKind::Codex
-    })
+        tools.allows(ToolKind::Codex)
+    }
 }
 
 /// SHA-256 of a file's bytes, as lowercase hex.
@@ -359,7 +372,30 @@ pub fn builtin(variant: Variant) -> Result<Package, String> {
 /// installs it. Every platform embeds every file, so both forms can be checked
 /// anywhere.
 pub(crate) fn builtin_for(variant: Variant, platform: Platform) -> Result<Package, String> {
-    let folder = variant.folder();
+    embedded_package(variant.folder(), BUILTIN_ID, platform)
+}
+
+/// The built-in package's always-on rule for Claude: end a task with a status
+/// recap. Claude Code reads every `.claude/rules/*.md` like `CLAUDE.md`.
+pub const STATUS_RULE: &str = ".claude/rules/connecto-status.md";
+
+/// Id of the built-in Game Dev package (Godot), ADR 0037.
+pub const GAME_DEV_ID: &str = connecto_core::GAME_DEV_PACKAGE_ID;
+
+/// Whether `id` names a package built into Connecto (never a folder in
+/// Connecto Home: such a folder is not read).
+#[must_use]
+pub fn is_builtin(id: &str) -> bool {
+    connecto_hook::package::BUILTIN_IDS.contains(&id)
+}
+
+/// The built-in Game Dev package. One form for every agent: the installer
+/// takes the tool folders each project's Tools setting allows.
+pub fn game_dev() -> Result<Package, String> {
+    embedded_package(GAME_DEV_ID, GAME_DEV_ID, Platform::CURRENT)
+}
+
+fn embedded_package(folder: &str, id: &str, platform: Platform) -> Result<Package, String> {
     let mut files = BTreeMap::new();
     let mut exec = BTreeSet::new();
     let mut manifest = None;
@@ -383,7 +419,7 @@ pub(crate) fn builtin_for(variant: Variant, platform: Platform) -> Result<Packag
     common.retain(|path, _| !WINDOWS_ONLY.contains(&path.as_str()));
     let hash = content_hash(&common, &exec, manifest.extends.as_deref());
     Ok(Package {
-        id: BUILTIN_ID.to_owned(),
+        id: id.to_owned(),
         manifest,
         files,
         exec,
@@ -396,6 +432,7 @@ pub(crate) fn builtin_for(variant: Variant, platform: Platform) -> Result<Packag
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use connecto_core::ToolKind;
 
     #[test]
     fn the_builtin_package_has_three_variants_with_the_right_content() {
@@ -437,46 +474,424 @@ mod tests {
                 codex,
                 "{variant:?}: .agents/skills"
             );
+            // Every role runs in a Connecto terminal: no agent definitions.
+            assert!(!has(&package, ".codex/"), "{variant:?}: .codex");
+            assert!(
+                !has(&package, ".claude/agents/"),
+                "{variant:?}: .claude/agents"
+            );
+            for team in ["daily-team", "dev-team", "brainstorm-team"] {
+                if claude {
+                    assert!(
+                        package
+                            .files
+                            .contains_key(&format!(".claude/skills/{team}/SKILL.md")),
+                        "{variant:?}: {team}"
+                    );
+                }
+                if codex {
+                    assert!(
+                        package
+                            .files
+                            .contains_key(&format!(".agents/skills/{team}/SKILL.md")),
+                        "{variant:?}: {team}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every agent of a project with the built-in package ends a task with the
+    /// four-point status recap: Claude from `.claude/rules`, the others from
+    /// the launcher, which passes the same text compiled into Connecto.
+    #[test]
+    fn every_variant_carries_the_end_of_task_status_recap() {
+        for (variant, claude) in [
+            (Variant::Both, true),
+            (Variant::Claude, true),
+            (Variant::Codex, false),
+        ] {
+            let package = builtin(variant).unwrap();
+            assert!(package.manifest.version >= 9, "{variant:?}: bump VERSION");
             assert_eq!(
-                has(&package, ".codex/agents/"),
-                codex,
-                "{variant:?}: .codex/agents"
+                package.files.contains_key(STATUS_RULE),
+                claude,
+                "{variant:?}"
+            );
+            // Nothing the launcher would read: the others' text is Connecto's.
+            assert!(
+                !package
+                    .files
+                    .keys()
+                    .any(|p| p.starts_with(".agents/instructions")),
+                "{variant:?}"
+            );
+            if let Some(rule) = package.files.get(STATUS_RULE) {
+                assert_eq!(
+                    std::str::from_utf8(rule).unwrap(),
+                    connecto_session::package_text::STATUS_RECAP,
+                    "{variant:?}: one text for every agent"
+                );
+            }
+        }
+        let text = connecto_session::package_text::STATUS_RECAP;
+        for wanted in [
+            "**Done**",
+            "**Committed/pushed**",
+            "branch + hash",
+            "committed locally",
+            "pushed",
+            "**Not done / blocked**",
+            "**Waiting on user**",
+            "yes/no",
+        ] {
+            assert!(text.contains(wanted), "{wanted}");
+        }
+    }
+
+    /// The skill that is not a team: how to set up Agentic Works.
+    const WORKS_SKILL: &str = "/skills/agentic-works/SKILL.md";
+
+    /// The skill that is a single consultation, not a team (ADR 0045).
+    const SECOND_OPINION: &str = "/skills/second-opinion/SKILL.md";
+
+    /// The team skills of one variant, by path.
+    fn skill_texts(package: &Package) -> Vec<(String, String)> {
+        package
+            .files
+            .iter()
+            .filter(|(path, _)| {
+                path.ends_with("/SKILL.md")
+                    && !path.ends_with(WORKS_SKILL)
+                    && !path.ends_with(SECOND_OPINION)
+            })
+            .map(|(path, data)| (path.clone(), String::from_utf8(data.clone()).unwrap()))
+            .collect()
+    }
+
+    /// The effort rubric every skill that starts terminals carries.
+    const RUBRIC: [&str; 4] = [
+        "- `low`: a trivial edit",
+        "- `medium`: a normal feature or fix",
+        "- `high`: work across modules or crates, concurrency, security, or a risk of losing data",
+        "- `xhigh`: only a rare, very hard problem",
+    ];
+
+    /// Every variant's teams take their agents from `connecto agents
+    /// --roles`, which knows the project's allowed CLIs and which are signed
+    /// in, and choose an effort with the rubric (ADR 0045). No variant keeps
+    /// a table of its own, nor the Argon models the roster replaced. A
+    /// Claude-only project's teams name no other CLI.
+    #[test]
+    fn each_variant_takes_its_agents_from_the_roster() {
+        for (variant, count) in [
+            (Variant::Claude, 3),
+            (Variant::Codex, 3),
+            (Variant::Both, 6),
+        ] {
+            let package = builtin(variant).unwrap();
+            let skills = skill_texts(&package);
+            assert_eq!(skills.len(), count, "{variant:?}");
+            for (path, body) in &skills {
+                assert!(body.contains("connecto agents --roles"), "{path}");
+                assert!(body.contains("(same CLI)"), "{path}");
+                assert!(
+                    body.contains("The reviewer gets the same effort as the coder."),
+                    "{path}"
+                );
+                for line in RUBRIC {
+                    assert!(body.contains(line), "{path}: {line}");
+                }
+                assert!(!body.contains("command -v"), "{path}");
+                assert!(!body.contains("gemini-4-argon"), "{path}");
+                assert!(!body.contains("aren't used by this team"), "{path}");
+                assert!(body.contains(r#"`unknown command "agents"`"#), "{path}");
+                assert!(body.contains("`(unverified)`"), "{path}");
+                // The teams that only the user starts say so to Pi too.
+                if !path.contains("daily-team") {
+                    assert!(body.contains("disable-model-invocation: true"), "{path}");
+                }
+                if variant == Variant::Claude {
+                    assert!(!body.to_lowercase().contains("codex"), "{path}");
+                    assert!(!body.to_lowercase().contains("antigravity"), "{path}");
+                }
+            }
+        }
+        let claude = builtin(Variant::Claude).unwrap();
+        let settings = String::from_utf8(claude.files[".claude/settings.json"].clone()).unwrap();
+        assert!(!settings.contains("codex"));
+        assert!(settings.contains("statusLine"));
+    }
+
+    /// The second opinion is in every variant, for each tool folder the
+    /// variant has; only the user starts it; it takes its agent from the
+    /// roster, labels a same-CLI opinion, and changes nothing (ADR 0045).
+    #[test]
+    fn every_variant_has_the_second_opinion_only_on_request() {
+        for (variant, sides) in [
+            (Variant::Both, &[".claude", ".agents"][..]),
+            (Variant::Claude, &[".claude"][..]),
+            (Variant::Codex, &[".agents"][..]),
+        ] {
+            let package = builtin(variant).unwrap();
+            for side in sides {
+                let path = format!("{side}{SECOND_OPINION}");
+                let body = String::from_utf8(package.files[&path].clone()).unwrap();
+                assert!(body.contains("connecto agents --roles"), "{path}");
+                assert!(body.contains("`second-opinion` line"), "{path}");
+                assert!(body.contains("Same CLI as mine"), "{path}");
+                assert!(body.contains("Read only"), "{path}");
+                for line in RUBRIC {
+                    assert!(body.contains(line), "{path}: {line}");
+                }
+                // Second review: an older `connecto` command, which does not
+                // know `agents`, is recognized too; then the opinion comes
+                // from the asker's own CLI, which the project allows, and is
+                // labelled so; and the label follows the terminal used.
+                assert!(body.contains(r#"`unknown command "agents"`"#), "{path}");
+                assert!(
+                    body.contains("start a fresh session of your own CLI"),
+                    "{path}"
+                );
+                // Third review: with an older Connecto, the other CLIs are
+                // tried first, and the same CLI comes only after them; an
+                // agent the user named is used when unverified too.
+                assert!(
+                    body.contains("first try the CLIs other than your own"),
+                    "{path}"
+                );
+                // Fourth review: a CLI the user named comes first there too,
+                // and is not swapped for another without asking.
+                assert!(
+                    body.contains("If the user named a CLI, try that one first"),
+                    "{path}"
+                );
+                assert!(
+                    body.contains("tell the user why and ask before trying another"),
+                    "{path}"
+                );
+                assert!(
+                    body.contains("Only when every other CLI has been refused or has failed"),
+                    "{path}"
+                );
+                assert!(body.contains("`ready` or `unverified`"), "{path}");
+                assert!(body.contains("Whenever that CLI is your own"), "{path}");
+                assert!(body.contains("`(unverified)`"), "{path}");
+                // Pi reads this field too, so it stays in `.agents` as well.
+                assert!(body.contains("disable-model-invocation: true"), "{path}");
+                if *side == ".agents" {
+                    assert!(!body.contains("$ARGUMENTS"), "{path}");
+                    let yaml = ".agents/skills/second-opinion/agents/openai.yaml";
+                    let yaml = String::from_utf8(package.files[yaml].clone()).unwrap();
+                    assert!(yaml.contains("allow_implicit_invocation: false"), "{yaml}");
+                }
+            }
+        }
+    }
+
+    /// The rules every team keeps, in every form: roles in Connecto terminals
+    /// briefed from the skill's role files, and at most 3 review rounds
+    /// before the user chooses a compromise.
+    #[test]
+    fn every_team_runs_its_roles_in_terminals_with_three_rounds_at_most() {
+        for variant in [Variant::Both, Variant::Claude, Variant::Codex] {
+            let package = builtin(variant).unwrap();
+            for (path, body) in skill_texts(&package) {
+                assert!(
+                    !body.contains("<!-- agents -->\n<!-- /agents -->"),
+                    "{path}"
+                );
+                assert!(body.contains("## Choosing the agents"), "{path}");
+                assert!(body.contains("at most 3"), "{path}");
+                assert!(body.contains("**Options:** two or three"), "{path}");
+                assert!(body.contains("Then wait for the user."), "{path}");
+                assert!(!body.contains("SendMessage"), "{path}");
+                assert!(!body.contains("subagent_type"), "{path}");
+                // Every role file is named by its skill, and every one named
+                // is there.
+                let dir = format!("{}roles/", path.trim_end_matches("SKILL.md"));
+                let roles: Vec<&str> = package
+                    .files
+                    .keys()
+                    .filter_map(|file| file.strip_prefix(dir.as_str()))
+                    .collect();
+                assert!(!roles.is_empty(), "{path}");
+                for role in &roles {
+                    assert!(body.contains(role), "{path}: {role}");
+                }
+                for (at, _) in body.match_indices("/roles/") {
+                    let name: String = body[at + 7..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
+                        .collect();
+                    if name.ends_with(".md") {
+                        assert!(roles.contains(&name.as_str()), "{path}: {name}");
+                    }
+                }
+                if path.starts_with(".agents/") {
+                    assert!(!body.contains("$ARGUMENTS"), "{path}");
+                    assert!(!body.contains("CLAUDE_SKILL_DIR"), "{path}");
+                }
+            }
+        }
+    }
+
+    /// Every variant teaches its agents `connecto works`, by itself (no team
+    /// roles), and lets the model pick it up when asked.
+    #[test]
+    fn every_variant_has_the_agentic_works_skill() {
+        for (variant, sides) in [
+            (Variant::Both, &[".claude", ".agents"][..]),
+            (Variant::Claude, &[".claude"][..]),
+            (Variant::Codex, &[".agents"][..]),
+        ] {
+            let package = builtin(variant).unwrap();
+            for side in sides {
+                let path = format!("{side}{WORKS_SKILL}");
+                let body = String::from_utf8(package.files[&path].clone()).unwrap();
+                for wanted in [
+                    "connecto works link",
+                    "connecto works publish",
+                    "connecto works test",
+                    "--agentic-works",
+                ] {
+                    assert!(body.contains(wanted), "{variant:?} {path}: {wanted}");
+                }
+                assert!(!body.contains("disable-model-invocation"), "{path}");
+            }
+            assert!(
+                !package
+                    .files
+                    .keys()
+                    .any(|f| f.contains("agentic-works/agents/")),
+                "{variant:?}: implicit invocation stays allowed"
             );
         }
     }
 
+    /// The daily team is how code changes are made by default, so the model
+    /// may pick it up by itself on every side, and a team's own coder or
+    /// reviewer (briefed by another agent) is told not to.
     #[test]
-    fn reviewers_use_the_same_cli_in_the_single_tool_variants() {
-        let text = |p: &Package, path: &str| {
-            String::from_utf8(p.files.get(path).cloned().unwrap()).unwrap()
+    fn every_variant_lets_the_model_start_the_daily_team() {
+        for (variant, sides) in [
+            (Variant::Both, &[".claude", ".agents"][..]),
+            (Variant::Claude, &[".claude"][..]),
+            (Variant::Codex, &[".agents"][..]),
+        ] {
+            let package = builtin(variant).unwrap();
+            for side in sides {
+                let path = format!("{side}/skills/daily-team/SKILL.md");
+                let body = String::from_utf8(package.files[&path].clone()).unwrap();
+                assert!(!body.contains("disable-model-invocation"), "{path}");
+                assert!(body.contains("changes code or files"), "{path}");
+                assert!(body.contains("[connecto from"), "{path}");
+            }
+            if let Some(policy) = package
+                .files
+                .get(".agents/skills/daily-team/agents/openai.yaml")
+            {
+                let policy = String::from_utf8(policy.clone()).unwrap();
+                assert!(
+                    policy.contains("allow_implicit_invocation: true"),
+                    "{variant:?}: {policy}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn game_dev_is_one_form_for_every_agent_and_needs_godot_blender_and_ffmpeg() {
+        assert_eq!(
+            connecto_hook::package::BUILTIN_IDS,
+            [BUILTIN_ID, GAME_DEV_ID],
+            "connecto-hook names the same built-in packages"
+        );
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("builtin")
+            .join(GAME_DEV_ID);
+        let (ok, report) = connecto_hook::package::check_dir(&dir);
+        assert!(ok, "{report}");
+        let game = game_dev().unwrap();
+        assert!(game.builtin && game.manifest.extends.is_none());
+        let skills = ["game-design", "game-playtest", "godot-game"];
+        for skill in skills {
+            let claude = &game.files[&format!(".claude/skills/{skill}/SKILL.md")];
+            let agents = &game.files[&format!(".agents/skills/{skill}/SKILL.md")];
+            assert_eq!(claude, agents, "{skill}: run tools/vendor_builtin.py");
+            assert!(
+                game.files
+                    .contains_key(&format!(".agents/skills/{skill}/agents/openai.yaml"))
+            );
+        }
+        // The reference files a SKILL.md points to, next to it on both sides.
+        let references = [
+            "game-design/team.md",
+            "game-playtest/bot.md",
+            "godot-game/art-pipeline.md",
+            "godot-game/gotchas.md",
+            "godot-game/test-runner.md",
+        ];
+        for reference in references {
+            let claude = &game.files[&format!(".claude/skills/{reference}")];
+            let agents = &game.files[&format!(".agents/skills/{reference}")];
+            assert_eq!(claude, agents, "{reference}: run tools/vendor_builtin.py");
+        }
+        assert_eq!(
+            game.files.len(),
+            skills.len() * 3 + references.len() * 2,
+            "nothing else is installed"
+        );
+        // Version 2 shipped in 0.3.10 with Godot only.
+        assert_eq!(game.manifest.version, 3);
+        let ids: Vec<&str> = game
+            .manifest
+            .requires
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["godot", "blender", "ffmpeg"],
+            "the art is made by Blender scripts and reviewed on frames FFmpeg pulls"
+        );
+        let godot = &game.manifest.requires[0];
+        assert_eq!(godot.min_version.as_deref(), Some("4.7"));
+        // Godot 4 only: the skills are written for it.
+        assert!(godot.version_fits("4.7") && godot.version_fits("4.9.1"));
+        assert!(!godot.version_fits("4.6.2") && !godot.version_fits("5.0"));
+        let blender = &game.manifest.requires[1];
+        assert!(blender.version_fits("4.2") && blender.version_fits("5.3.0"));
+        assert!(!blender.version_fits("4.1.1"));
+        let ffmpeg = &game.manifest.requires[2];
+        // The skills' frame commands were run on 4.4.2 (Ubuntu 22.04) and 9.0.2.
+        assert!(ffmpeg.version_fits("4.4.2") && ffmpeg.version_fits("9.0.2"));
+        assert!(!ffmpeg.version_fits("4.3.9"));
+        for tool in &game.manifest.requires {
+            assert!(
+                !tool.licence,
+                "{}: free software, no licence to accept",
+                tool.id
+            );
+            for os in connecto_hook::requires::Os::ALL {
+                assert!(tool.install_on(os).is_some(), "{} on {os:?}", tool.id);
+            }
+        }
+        // winget's Blender is a machine-wide MSI in a folder named after the
+        // version; its FFmpeg is a portable zip behind a Links shim.
+        let windows = |r: &connecto_hook::requires::Requirement| {
+            r.paths.get(connecto_hook::requires::Os::Windows).clone()
         };
-        let claude = builtin(Variant::Claude).unwrap();
-        for skill in ["dev-team", "brainstorm-team"] {
-            let body = text(&claude, &format!(".claude/skills/{skill}/SKILL.md"));
-            assert!(
-                body.contains("connecto add claude --model claude-opus-5-5"),
-                "{skill}"
-            );
-            assert!(!body.to_lowercase().contains("codex"), "{skill}");
-        }
-        let settings = text(&claude, ".claude/settings.json");
-        assert!(!settings.contains("codex"));
-        assert!(settings.contains("statusLine"));
-        let codex = builtin(Variant::Codex).unwrap();
-        for skill in ["dev-team", "brainstorm-team"] {
-            let body = text(&codex, &format!(".agents/skills/{skill}/SKILL.md"));
-            assert!(
-                body.contains("connecto add codex --model gpt-6.1-sol"),
-                "{skill}"
-            );
-            assert!(!body.contains("claude-opus"), "{skill}");
-            assert!(!body.contains("connecto add claude"), "{skill}");
-        }
-        let both = builtin(Variant::Both).unwrap();
-        let body = text(&both, ".claude/skills/dev-team/SKILL.md");
-        assert!(body.contains("connecto add codex --model gpt-6.1-sol"));
-        let body = text(&both, ".agents/skills/dev-team/SKILL.md");
-        assert!(body.contains("connecto add claude --model claude-opus-5-5"));
+        assert!(
+            windows(blender)
+                .iter()
+                .any(|p| p == "%ProgramFiles%\\Blender Foundation\\Blender 5.3\\blender.exe")
+        );
+        assert!(
+            windows(ffmpeg)
+                .iter()
+                .any(|p| p == "%ProgramFiles%\\WinGet\\Links\\ffmpeg.exe")
+        );
     }
 
     #[test]
@@ -491,14 +906,14 @@ mod tests {
     }
 
     /// What each platform installs of the built-in package. macOS (any Unix)
-    /// installs exactly what it did before the Windows twins were added: 83
-    /// embedded files (80 installable and 3 manifests), 4 of them executable,
-    /// and the hash of the same files. Windows installs those and the 4 twins,
-    /// under the same hash.
+    /// installs 83 embedded files (80 installable and 3 manifests), 4 of them
+    /// executable, under the hash of those files. Windows installs those and
+    /// the 4 twins, under the same hash.
     #[test]
     fn each_platform_installs_its_own_builtin_files_under_one_hash() {
         let table: Vec<String> = embedded::FILES
             .iter()
+            .filter(|(variant, _, _, _)| *variant != GAME_DEV_ID)
             .map(|(variant, path, _, _)| format!("{variant}/{path}"))
             .collect();
         assert_eq!(table.len(), 87, "every file is embedded on every platform");
@@ -532,7 +947,7 @@ mod tests {
         let digest = hash_bytes(unix.join("\n").as_bytes());
         assert_eq!(
             digest,
-            "1078ebbf0c80ac1842f68d221a1239be549a392da2f409a6d8f39f30ec08d78f",
+            "030bb444f47db19eeaa5564e074da0182a74303c86049b2866ce58dd1a550c5f",
             "the macOS file list changed:\n{}",
             unix.join("\n")
         );
@@ -593,7 +1008,45 @@ mod tests {
     fn variants_follow_the_tools_setting() {
         assert_eq!(Variant::for_tools(ProjectTools::Claude), Variant::Claude);
         assert_eq!(Variant::for_tools(ProjectTools::Codex), Variant::Codex);
-        assert_eq!(Variant::for_tools(ProjectTools::Both), Variant::Both);
+        assert_eq!(Variant::for_tools(ProjectTools::All), Variant::Both);
+        assert_eq!(Variant::for_tools(ProjectTools::OpenCode), Variant::Codex);
+        let pair = |a, b| ProjectTools::from_tools([a, b]).unwrap();
+        assert_eq!(
+            Variant::for_tools(pair(ToolKind::Codex, ToolKind::Pi)),
+            Variant::Both
+        );
+        assert_eq!(
+            Variant::for_tools(pair(ToolKind::Claude, ToolKind::OpenCode)),
+            Variant::Both
+        );
+    }
+
+    /// Codex and Pi chosen: the `.agents` and `.codex` folders, no `.claude`.
+    #[test]
+    fn a_codex_and_pi_project_takes_their_folders_only() {
+        let tools = ProjectTools::from_tools([ToolKind::Codex, ToolKind::Pi]).unwrap();
+        assert!(wanted(".agents/skills/daily-team/SKILL.md", tools));
+        assert!(wanted(".codex/config.toml", tools));
+        assert!(!wanted(".claude/skills/daily-team/SKILL.md", tools));
+        let pi_and_claude = ProjectTools::from_tools([ToolKind::Pi, ToolKind::Claude]).unwrap();
+        assert!(wanted(".agents/skills/x/SKILL.md", pi_and_claude));
+        assert!(wanted(".claude/settings.json", pi_and_claude));
+        assert!(!wanted(".codex/config.toml", pi_and_claude));
+    }
+
+    /// OpenCode reads its skills from `.agents/skills`: a project of OpenCode
+    /// alone gets that folder, and no `.claude` or `.codex` one.
+    #[test]
+    fn an_opencode_project_takes_the_agents_folder_only() {
+        assert!(wanted(
+            ".agents/skills/daily-team/SKILL.md",
+            ProjectTools::OpenCode
+        ));
+        assert!(!wanted(
+            ".claude/skills/daily-team/SKILL.md",
+            ProjectTools::OpenCode
+        ));
+        assert!(!wanted(".codex/config.toml", ProjectTools::OpenCode));
     }
 
     #[test]

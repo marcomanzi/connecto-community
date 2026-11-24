@@ -16,12 +16,27 @@ test-endpoints = ["connecto-session/test-endpoints", "connecto-ui/test-endpoints
 ui-test-driver = ["connecto-ui/ui-test-driver"]
 
 [dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "process", "io-util"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+postgres-native-tls = "0.5"
+native-tls = "0.2"
+jsonschema = { version = "0.60", default-features = false }
+rusqlite.workspace = true
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+connecto-adapter.workspace = true
 connecto-audit.workspace = true
 connecto-automation.workspace = true
 connecto-core.workspace = true
+connecto-memory.workspace = true
 connecto-net.workspace = true
+# Only what a host needs to sign its push requests (no server).
+connecto-push-gateway = { path = "../connecto-push-gateway", default-features = false }
+connecto-ops.workspace = true
 connecto-packages.workspace = true
+connecto-redact.workspace = true
 connecto-secrets.workspace = true
+connecto-vault.workspace = true
 connecto-update.workspace = true
 connecto-session.workspace = true
 connecto-store.workspace = true
@@ -29,6 +44,40 @@ connecto-ui.workspace = true
 connecto-workspace.workspace = true
 serde_json.workspace = true
 signal-hook = "0.4"
+# Agentic Works on Google Cloud SQL (agentic_works/cloudsql): the same
+# connection Google's Cloud SQL connectors make. All already in Cargo.lock
+# (ureq, rustls and ring through connecto-vault and iroh; rsa through
+# ssh-key; x509-parser through rcgen). rustls rather than native-tls:
+# macOS's TLS policy can reject Cloud SQL server certificates.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+ring = "0.17"
+# RSA-2048 key generation for the ephemeral client certificate (ring signs
+# with RSA keys but cannot make them).
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+x509-parser = "0.18"
+base64 = "0.22"
+# The private git folder memory runs git against (removed by the TempDir
+# itself).
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+# Reading project files for the initial build without following a link
+# (handle-relative opens), as the memory engine already does.
+nix = { workspace = true, features = ["fs", "dir", "user", "signal"] }
+
+[dev-dependencies]
+# The push gateway and a fake APNs, for the host sender's end-to-end test.
+connecto-push-gateway = { path = "../connecto-push-gateway", features = ["fake-apns"] }
+# Temporary folders removed by the library itself. Already in Cargo.lock.
+tempfile = "3"
+# Certificates for the Cloud SQL tests' mock Admin API and TLS server.
+# Already in Cargo.lock (through iroh).
+rcgen = { version = "0.14", features = ["x509-parser"] }
+# Certificate validity dates for rcgen. Already in Cargo.lock.
+time = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 # A release build has no console: a fatal error at startup is shown in a

@@ -3,7 +3,8 @@
 //! Windows has no `exec`, no SIGHUP and no `df`; a release build has no
 //! console (see `windows_subsystem` in `main.rs`), so a fatal error is also
 //! shown in a message box. The agents (Claude Code, Codex) are installed with
-//! their vendors' PowerShell installers (`install.ps1`).
+//! their vendors' PowerShell installers (`install.ps1`, milestone M3 of
+//! `docs/windows-port.md`).
 
 use std::io;
 use std::os::windows::process::CommandExt as _;
@@ -161,26 +162,152 @@ pub const fn free_bytes(_path: &Path) -> Option<u64> {
 pub const fn make_private(_path: &Path) {}
 
 /// The vendors' PowerShell installers, from the same hosts as on macOS
-/// as on macOS: Claude Code's puts `claude.exe`
+/// (decision D-2 in `docs/windows-port.md`): Claude Code's puts `claude.exe`
 /// in `~\.local\bin` (a real file; versions in `~\.local\share\claude`);
 /// Codex's puts its release under `~\.codex\packages\standalone`, makes
 /// `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin` a junction to it and adds that
-/// folder to the user's `PATH`.
+/// folder to the user's `PATH`. Pi's (a Node.js program, as on macOS)
+/// installs it with npm under `~\.pi\agent\install`, with a launcher
+/// `pi.cmd` in `~\.pi\agent\bin`; it needs Node.js already, and with no
+/// terminal it asks nothing and skips its optional Git Bash. Antigravity
+/// CLI's puts `agy.exe` in `%LOCALAPPDATA%\agy\bin`. OpenCode has no
+/// PowerShell installer: it comes from its own GitHub release, as its
+/// installer script fetches it ([`release_asset`]), into
+/// `~\.opencode\bin\opencode.exe`.
 pub const fn installer_url(tool: Tool) -> Option<&'static str> {
     match tool {
         Tool::Claude => Some("https://claude.ai/install.ps1"),
         Tool::Codex => Some("https://chatgpt.com/codex/install.ps1"),
+        Tool::Pi => Some("https://pi.dev/install.ps1"),
+        Tool::Antigravity => Some("https://antigravity.google/cli/install.ps1"),
+        Tool::OpenCode => Some("https://github.com/anomalyco/opencode/releases"),
         Tool::Shell => None,
     }
 }
 
 /// What else the setup says about an installer: Codex's adds its folder to
-/// the user's `PATH` (Claude Code's install is found where it is).
+/// the user's `PATH` (Claude Code's install is found where it is); Pi is a
+/// Node.js program, and its installer does not bring Node.js when nobody is
+/// there to say yes (as on macOS).
 pub const fn installer_note(tool: Tool) -> &'static str {
     match tool {
         Tool::Codex => " Its installer also adds its folder to your PATH.",
-        Tool::Claude | Tool::Shell => "",
+        Tool::Pi => " It needs Node.js 22.19 or newer, which must be installed already.",
+        Tool::Claude | Tool::Antigravity | Tool::OpenCode | Tool::Shell => "",
     }
+}
+
+/// Node.js's program.
+pub const NODE_PROGRAM: &str = "node.exe";
+
+/// Where Connecto installs Node.js for Pi: the folder Pi's own installer
+/// uses for it (`%LOCALAPPDATA%\pi-node\current`), which Pi's launcher
+/// prefers when the install was made with it.
+pub fn standalone_node_dir(home: &Path) -> PathBuf {
+    home.join("AppData")
+        .join("Local")
+        .join("pi-node")
+        .join("current")
+}
+
+/// The end of the name of the official Node.js build for this PC.
+pub const fn node_archive_suffix() -> Option<&'static str> {
+    if cfg!(target_arch = "x86_64") {
+        Some("-win-x64.zip")
+    } else if cfg!(target_arch = "aarch64") {
+        Some("-win-arm64.zip")
+    } else {
+        None
+    }
+}
+
+/// The release archive a tool is installed from when its vendor has no
+/// PowerShell installer: OpenCode's own `opencode-windows-<arch>.zip` (the
+/// `-baseline` x64 build on a processor without AVX2), which its installer
+/// script fetches on a Windows that has a shell.
+pub fn release_asset(tool: Tool) -> Option<&'static str> {
+    (tool == Tool::OpenCode).then(|| {
+        crate::agent_install::opencode_windows_asset(cfg!(target_arch = "aarch64"), has_avx2())
+    })
+}
+
+/// Whether this processor has AVX2, as `IsProcessorFeaturePresent` (40)
+/// tells OpenCode's installer: asked of the processor itself.
+fn has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Unpack the zip `archive` into the folder `into`, with the `tar.exe`
+/// Windows ships (by absolute path: another `tar` may not read zip files).
+pub fn unpack_zip(archive: &Path, into: &Path) -> Result<(), String> {
+    let output = Command::new(system_root().join("System32").join("tar.exe"))
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(into)
+        .stdin(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("tar.exe could not be started: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "tar.exe exit {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// Unpack the official Node.js zip `archive` (called `name`) with the
+/// `tar.exe` Windows ships (by absolute path: another `tar` may not read
+/// zip files), in `work`, and put its folder in place of
+/// [`standalone_node_dir`].
+pub fn unpack_node(archive: &Path, name: &str, work: &Path, home: &Path) -> Result<(), String> {
+    let unpacked = work.join("unpacked");
+    std::fs::create_dir_all(&unpacked).map_err(|e| e.to_string())?;
+    let output = Command::new(system_root().join("System32").join("tar.exe"))
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(&unpacked)
+        .stdin(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("tar.exe could not be started: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tar.exe exit {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let folder = unpacked.join(name.trim_end_matches(".zip"));
+    if !folder.join(NODE_PROGRAM).is_file() {
+        return Err(format!("{} has no {NODE_PROGRAM}", folder.display()));
+    }
+    let current = standalone_node_dir(home);
+    if let Some(base) = current.parent() {
+        std::fs::create_dir_all(base).map_err(|e| e.to_string())?;
+    }
+    match std::fs::remove_dir_all(&current) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => {
+            return Err(format!(
+                "{} could not be replaced: {err}",
+                current.display()
+            ));
+        }
+        _ => {}
+    }
+    std::fs::rename(&folder, &current).map_err(|e| e.to_string())
 }
 
 /// The extension a downloaded installer script is saved with: `-File` runs
@@ -225,9 +352,12 @@ fn windows_powershell() -> PathBuf {
 /// looks for them (`USERPROFILE`, `APPDATA`, `LOCALAPPDATA`), `TEMP` and
 /// `TMP` in the install's own work folder (Codex's installer compiles C#
 /// there), Windows PowerShell's own modules, a `PATH` of the system folders
-/// plus where the two installers put the programs, and no questions
-/// (`CODEX_NON_INTERACTIVE`).
-pub fn installer_command(_tool: Tool, script: &Path, home: &Path) -> Command {
+/// plus where the installers put the programs, and no questions
+/// (`CODEX_NON_INTERACTIVE`). Pi's also gets the folders where the user's
+/// `node` and `npm` are (as on macOS), after `~\.pi\agent\bin`: with that
+/// folder first, its installer finds the `pi` it installed and does not stop
+/// to ask whether to add it to the user's `PATH` (Connecto finds it there).
+pub fn installer_command(tool: Tool, script: &Path, home: &Path) -> Command {
     // PowerShell's `Join-Path` refuses a verbatim (`\\?\C:\…`) path, as a
     // canonical one is: the scripts get the plain drive form.
     let script = &plain(script);
@@ -240,7 +370,7 @@ pub fn installer_command(_tool: Tool, script: &Path, home: &Path) -> Command {
         .parent()
         .map_or_else(|| home.to_owned(), |work| work.join("tmp"));
     let _ = std::fs::create_dir_all(&tmp);
-    let path = std::env::join_paths([
+    let mut dirs = vec![
         system32.clone(),
         root.clone(),
         system32.join("Wbem"),
@@ -251,8 +381,21 @@ pub fn installer_command(_tool: Tool, script: &Path, home: &Path) -> Command {
             .join("OpenAI")
             .join("Codex")
             .join("bin"),
-    ])
-    .unwrap_or_default();
+        local.join("agy").join("bin"),
+        home.join(".opencode").join("bin"),
+    ];
+    if tool == Tool::Pi {
+        // Pi's own folder, then the Node.js Connecto installs for it, before
+        // the user's own (an older one there must not be the one used).
+        dirs.insert(0, standalone_node_dir(home));
+        dirs.insert(0, home.join(".pi").join("agent").join("bin"));
+        for dir in std::env::split_paths(&connecto_store::run_path(script, home)) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    let path = std::env::join_paths(dirs).unwrap_or_default();
     let mut command = Command::new(windows_powershell());
     command
         .args([
@@ -326,9 +469,10 @@ fn plain(path: &Path) -> PathBuf {
 
 /// `<program> --version`, with no console window and an environment of
 /// `SystemRoot` and the home folder only (checked on Claude Code 2.1.322
-/// and Codex 0.167.2: both answer with it). No `PATH`, unlike macOS's
-/// `run_path`: the program asked is never a launcher script here (an npm
-/// Codex's `codex.cmd` is replaced by its `codex.exe`, see [`runnable`]).
+/// and Codex 0.167.2: both answer with it). No `PATH` for a program (an npm
+/// Codex's `codex.cmd` is replaced by its `codex.exe`, see [`runnable`]);
+/// Pi's launcher `pi.cmd` gets one from `run_path`, as on macOS, so that its
+/// `node` is found.
 pub fn version_command(program: &Path, home: &Path) -> Command {
     let mut command = Command::new(program);
     command
@@ -338,6 +482,12 @@ pub fn version_command(program: &Path, home: &Path) -> Command {
         .env("HOME", home)
         .env("USERPROFILE", home)
         .creation_flags(CREATE_NO_WINDOW);
+    if connecto_store::is_launcher(program) {
+        // Pi's `pi.cmd` finds the Node.js installed for it by `LOCALAPPDATA`.
+        command
+            .env("PATH", connecto_store::run_path(program, home))
+            .envs(connecto_store::launcher_env(home));
+    }
     command
 }
 
@@ -351,15 +501,17 @@ pub fn runnable(tool: Tool, found: &Path) -> Option<PathBuf> {
 /// Where the installers put the programs, for "looked for it in".
 pub fn install_places(home: &Path) -> String {
     format!(
-        "{} and {}",
+        "{}, {}, {} and {}",
         home.join(".local").join("bin").display(),
+        home.join(".pi").join("agent").join("bin").display(),
         home.join("AppData")
             .join("Local")
             .join("Programs")
             .join("OpenAI")
             .join("Codex")
             .join("bin")
-            .display()
+            .display(),
+        home.join(".opencode").join("bin").display()
     )
 }
 
@@ -396,6 +548,7 @@ mod tests {
             installer_url(Tool::Codex),
             Some("https://chatgpt.com/codex/install.ps1")
         );
+        assert_eq!(installer_url(Tool::Pi), Some("https://pi.dev/install.ps1"));
         assert_eq!(installer_url(Tool::Shell), None);
         assert_eq!(INSTALLER_EXTENSION, "ps1");
     }

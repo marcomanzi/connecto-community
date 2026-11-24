@@ -5,7 +5,7 @@ use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
-use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
+use nix::sys::socket::{getsockopt, sockopt};
 
 pub(crate) type Listener = UnixListener;
 pub(crate) type Stream = UnixStream;
@@ -21,7 +21,11 @@ pub(crate) fn bind(path: &Path) -> io::Result<Listener> {
 
 /// The pid of the process on the other end.
 pub(crate) fn peer_pid(stream: &Stream) -> io::Result<i32> {
-    getsockopt(stream, LocalPeerPid).map_err(io::Error::from)
+    #[cfg(target_os = "linux")]
+    let pid = getsockopt(stream, sockopt::PeerCredentials).map(|peer| peer.pid());
+    #[cfg(not(target_os = "linux"))]
+    let pid = getsockopt(stream, sockopt::LocalPeerPid);
+    pid.map_err(io::Error::from)
 }
 
 /// Wake a blocking accept on `path`, which then sees its stop flag.

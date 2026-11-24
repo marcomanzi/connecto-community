@@ -382,6 +382,8 @@ mod tests {
             background: Vec::new(),
             thread: None,
             turn: None,
+            failure: None,
+            continued: false,
         }
     }
 

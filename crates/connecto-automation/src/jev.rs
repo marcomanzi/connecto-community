@@ -81,6 +81,8 @@ pub struct Client {
     url: String,
     agent: ureq::Agent,
     retry_wait: Duration,
+    /// Whether a 429 or 529 is tried once more.
+    retries: bool,
 }
 
 impl Client {
@@ -91,8 +93,15 @@ impl Client {
 
     #[must_use]
     pub fn with_retry_wait(url: &str, retry_wait: Duration) -> Self {
+        Self::with_limits(url, TIMEOUT, retry_wait)
+    }
+
+    /// A client whose every request gives up after `timeout`, for a caller
+    /// that cannot wait long (the prompt hook).
+    #[must_use]
+    pub fn with_limits(url: &str, timeout: Duration, retry_wait: Duration) -> Self {
         let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(TIMEOUT))
+            .timeout_global(Some(timeout))
             .http_status_as_error(false)
             .build()
             .into();
@@ -100,6 +109,17 @@ impl Client {
             url: url.to_owned(),
             agent,
             retry_wait,
+            retries: true,
+        }
+    }
+
+    /// A client that sends each request once, never again on 429 or 529,
+    /// for a caller with a deadline of its own ([`Client::exchange_within`]).
+    #[must_use]
+    pub fn single_attempt(url: &str) -> Self {
+        Self {
+            retries: false,
+            ..Self::with_limits(url, TIMEOUT, Duration::ZERO)
         }
     }
 
@@ -123,11 +143,35 @@ impl Client {
         state: &str,
         questions: &[(String, Value)],
     ) -> Exchange {
+        self.exchange_timed(api_key, model, state, questions, None)
+    }
+
+    /// As [`Client::exchange`], with the whole request (connecting, sending,
+    /// the answer) given up after `within`, whatever the client's own limit.
+    pub fn exchange_within(
+        &self,
+        api_key: &str,
+        model: &str,
+        state: &str,
+        questions: &[(String, Value)],
+        within: Duration,
+    ) -> Exchange {
+        self.exchange_timed(api_key, model, state, questions, Some(within))
+    }
+
+    fn exchange_timed(
+        &self,
+        api_key: &str,
+        model: &str,
+        state: &str,
+        questions: &[(String, Value)],
+        within: Option<Duration>,
+    ) -> Exchange {
         let map: Map<String, Value> = questions.iter().cloned().collect();
         let body = json!({"model": model, "state": state, "questions": map}).to_string();
         let mut retried = false;
         loop {
-            let (status, text) = match self.post(api_key, &body) {
+            let (status, text) = match self.post(api_key, &body, within) {
                 Ok(done) => done,
                 Err(err) => {
                     return Exchange {
@@ -146,7 +190,7 @@ impl Client {
             };
             let result = match status {
                 200..=299 => parse(&text),
-                429 | 529 if !retried => {
+                429 | 529 if self.retries && !retried => {
                     retried = true;
                     std::thread::sleep(self.retry_wait);
                     continue;
@@ -169,10 +213,17 @@ impl Client {
         }
     }
 
-    fn post(&self, api_key: &str, body: &str) -> Result<(u16, String), JevError> {
-        let mut response = self
-            .agent
-            .post(&self.url)
+    fn post(
+        &self,
+        api_key: &str,
+        body: &str,
+        within: Option<Duration>,
+    ) -> Result<(u16, String), JevError> {
+        let mut request = self.agent.post(&self.url);
+        if let Some(within) = within {
+            request = request.config().timeout_global(Some(within)).build();
+        }
+        let mut response = request
             .header("Authorization", &format!("Bearer {api_key}"))
             .content_type("application/json")
             .send(body)
@@ -420,6 +471,41 @@ mod tests {
         let ex = client("http://127.0.0.1:1/x").exchange("sekret", "m", "s", &q());
         assert!(matches!(ex.result, Err(JevError::Network(_))));
         assert!(!ex.response.is_empty() && !ex.response.contains("sekret"));
+    }
+
+    #[test]
+    fn a_single_attempt_client_never_retries_and_keeps_its_deadline() {
+        let server = fake::serve(vec![(429, "{}".into()), (200, ok_body())]);
+        let once = Client::single_attempt(&server.url);
+        assert_eq!(
+            once.exchange_within("k", "m", "s", &q(), Duration::from_secs(5))
+                .result,
+            Err(JevError::Busy(429))
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        // A server that never answers: given up at the deadline, not the
+        // client's 30 s.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/systemone", silent.local_addr().unwrap());
+        let started = std::time::Instant::now();
+        let ex = Client::single_attempt(&url).exchange_within(
+            "sekret",
+            "m",
+            "s",
+            &q(),
+            Duration::from_millis(300),
+        );
+        assert!(
+            matches!(ex.result, Err(JevError::Network(_))),
+            "{:?}",
+            ex.result
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(silent);
     }
 
     #[test]

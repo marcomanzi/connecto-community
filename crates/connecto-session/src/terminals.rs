@@ -23,13 +23,15 @@ use connecto_pty::Wake;
 use connecto_store::Tool;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 
+use crate::bridge::state::OpenAsk;
 use crate::bridge::{AgentCommand, WriteOutcome};
 use crate::history::{self, History, Record};
 use crate::launch::{LaunchExtras, Layout, project_id, validated};
 use crate::pane::{Begin, StartRefusal};
 use crate::relay::{Shared, Slot};
 use crate::terminal_list::{
-    Entry, FILE, FsIo, List, ListIo, Loaded, clean_name, load, valid_model, valid_session,
+    Entry, FILE, FsIo, List, ListIo, Loaded, OwedReply, clean_name, load, valid_effort,
+    valid_model, valid_session,
 };
 use crate::turn::Phase;
 use crate::utility::{self, Utility};
@@ -48,8 +50,13 @@ const STOPPED_TICKS: u8 = 2;
 /// given this long before `desired` follows it.
 const START_GRACE: Duration = Duration::from_secs(3);
 const QUEUE: usize = 64;
+/// How long an update's quit waits for the bridge to list the open asks.
+const OPEN_ASKS_WAIT: Duration = Duration::from_millis(500);
 /// The most characters an automatic name takes from a first `--ask`.
 const AUTO_NAME_CHARS: usize = 40;
+/// The first message of a conversation resumed after an update cut its turn
+/// (ADR 0030): "carry on", in the words the person uses.
+pub const CONTINUE_AFTER_UPDATE: &str = "continua";
 
 /// A terminal changed by an agent, as the reply reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +120,9 @@ pub enum TermError {
     Restarted,
     #[error("{0}")]
     Name(String),
+    /// The project's Tools setting leaves the CLI out.
+    #[error("{0}")]
+    NotAllowed(String),
 }
 
 /// What a close was admitted under, checked again by the registry right before it
@@ -137,6 +147,15 @@ struct Opening {
     note: Option<String>,
     /// The model to launch with, or the tool's default.
     model: Option<String>,
+    effort: Option<String>,
+}
+
+/// The model and effort an agent's `connecto add` asks for, each the tool's
+/// default when not given.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AgentLaunch {
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
 }
 
 /// A terminal to create.
@@ -154,12 +173,22 @@ struct New {
     note: Option<String>,
     /// The model to launch with, or the tool's default.
     model: Option<String>,
+    effort: Option<String>,
+    /// An Agentic Works job's terminal, or one a job's terminal started.
+    job: bool,
 }
 
 enum Cmd {
+    /// The app quits for an update: mark the turns it cuts, save, and stop
+    /// following the panes, as a closing app does.
+    MarkCutByUpdate {
+        reply: Sender<bool>,
+    },
     UserAdd {
         tool: Tool,
         name: Option<String>,
+        /// The model the person chose, already checked.
+        model: Option<String>,
     },
     /// A terminal that opens with a prompt, or picks a session up again.
     UserAddWith {
@@ -168,10 +197,19 @@ enum Cmd {
         prompt: Option<String>,
         session: Option<String>,
         note: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        work_epoch: Option<u64>,
         /// The new terminal's id, or why there is none.
         reply: Sender<Result<String, String>>,
     },
     UserClose(String),
+    /// A stop of background shells, done on a thread, refused: why, for the
+    /// tab strip.
+    BackgroundStopRefused {
+        id: String,
+        why: String,
+    },
     Rename {
         id: String,
         name: Option<String>,
@@ -179,11 +217,16 @@ enum Cmd {
     Restart(String),
     Continue(String),
     Transcript(String),
+    /// A transcript read for a peer, answered without changing the view.
+    ReadTranscript {
+        history_id: String,
+        reply: Sender<Result<String, String>>,
+    },
     Add {
         tool: Tool,
         name: Option<String>,
-        /// The model the agent asked for, already checked.
-        model: Option<String>,
+        /// The model and effort the agent asked for, already checked.
+        launch: AgentLaunch,
         /// The terminal whose agent asked, for the tree.
         caller: Option<String>,
         epoch: u64,
@@ -206,6 +249,13 @@ enum Cmd {
         text: String,
     },
     Choose(PathBuf),
+    /// A peer's close: every terminal under `id` must be in `allowed`, checked
+    /// here where the close runs; otherwise nothing is closed.
+    CloseWithin {
+        id: String,
+        allowed: Vec<String>,
+        reply: Sender<Result<(), String>>,
+    },
 }
 
 pub(crate) struct RegistryConfig {
@@ -223,6 +273,8 @@ pub(crate) struct RegistryConfig {
     pub utility: Option<Arc<Utility>>,
     /// Title an unnamed terminal on its first prompt.
     pub auto_title: bool,
+    /// The first restore follows an update: see [`crate::relay::RelayConfig::after_update`].
+    pub after_update: bool,
 }
 
 /// The handle other threads use.
@@ -234,6 +286,9 @@ pub(crate) struct Registry {
     closed: Arc<AtomicBool>,
     shared: Arc<Shared>,
     utility: Option<Arc<Utility>>,
+    /// The layout and the project as launches resolve it, for what a tool
+    /// keeps in its configuration folder there.
+    configs: Option<(Layout, PathBuf)>,
 }
 
 /// What the UI holds.
@@ -242,12 +297,16 @@ pub struct TerminalsHandle {
     tx: Sender<Cmd>,
     view: Arc<ArcSwap<TerminalsView>>,
     utility: Option<(Arc<Utility>, Arc<Shared>)>,
+    configs: Option<(Layout, PathBuf)>,
 }
 
 pub(crate) fn kind(tool: Tool) -> ToolKind {
     match tool {
         Tool::Claude => ToolKind::Claude,
         Tool::Codex => ToolKind::Codex,
+        Tool::Pi => ToolKind::Pi,
+        Tool::Antigravity => ToolKind::Antigravity,
+        Tool::OpenCode => ToolKind::OpenCode,
         Tool::Shell => ToolKind::Shell,
     }
 }
@@ -256,6 +315,9 @@ pub(crate) fn tool_of(kind: ToolKind) -> Tool {
     match kind {
         ToolKind::Claude => Tool::Claude,
         ToolKind::Codex => Tool::Codex,
+        ToolKind::Pi => Tool::Pi,
+        ToolKind::Antigravity => Tool::Antigravity,
+        ToolKind::OpenCode => Tool::OpenCode,
         ToolKind::Shell => Tool::Shell,
     }
 }
@@ -285,7 +347,22 @@ impl TerminalsControl for TerminalsHandle {
     }
 
     fn add(&self, tool: ToolKind, name: Option<String>) -> Result<(), String> {
+        self.add_on_model(tool, name, None)
+    }
+
+    fn add_on_model(
+        &self,
+        tool: ToolKind,
+        name: Option<String>,
+        model: Option<String>,
+    ) -> Result<(), String> {
         let name = name.map_or(Ok(None), |name| clean_name(&name))?;
+        // A model goes on the tool's command line: refused, never guessed at.
+        if let Some(model) = &model
+            && (tool == ToolKind::Shell || !valid_model(model))
+        {
+            return Err("that is not a model name".to_owned());
+        }
         let view = self.view.load();
         if view.terminals.len() >= MAX_TERMINALS {
             return Err(TermError::CapReached.to_string());
@@ -296,6 +373,7 @@ impl TerminalsControl for TerminalsHandle {
         self.send(Cmd::UserAdd {
             tool: tool_of(tool),
             name,
+            model,
         })
     }
 
@@ -327,11 +405,115 @@ impl TerminalsControl for TerminalsHandle {
             prompt,
             session: resume,
             note: resume_note,
+            work_epoch: None,
+            model: None,
+            effort: None,
             reply,
         })?;
         answer
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "the terminal list did not answer in time".to_owned())?
+    }
+
+    fn add_prompted(
+        &self,
+        tool: ToolKind,
+        name: String,
+        prompt: String,
+        model: Option<String>,
+    ) -> Result<String, String> {
+        let name = clean_name(&name)?;
+        // A model goes on the tool's command line: refused, never guessed at.
+        if let Some(model) = &model
+            && (!tool.is_agent() || !valid_model(model))
+        {
+            return Err("that is not a model name".to_owned());
+        }
+        let view = self.view.load();
+        if view.terminals.len() >= MAX_TERMINALS {
+            return Err(TermError::CapReached.to_string());
+        }
+        if view.save == SaveState::ReadOnly {
+            return Err("the terminal list is read-only this run".to_owned());
+        }
+        let (reply, answer) = bounded(1);
+        self.send(Cmd::UserAddWith {
+            tool: tool_of(tool),
+            name,
+            prompt: Some(prompt),
+            session: None,
+            note: None,
+            work_epoch: None,
+            model,
+            effort: None,
+            reply,
+        })?;
+        answer
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "the terminal list did not answer in time".to_owned())?
+    }
+
+    fn add_work(
+        &self,
+        tool: ToolKind,
+        name: String,
+        prompt: String,
+        model: Option<String>,
+        effort: Option<String>,
+        epoch: u64,
+    ) -> Result<String, String> {
+        let name = clean_name(&name)?;
+        if model.as_ref().is_some_and(|s| !valid_model(s)) {
+            return Err("Invalid model name".into());
+        }
+        if !tool.is_agent() {
+            return Err("Select an agent CLI.".into());
+        }
+        if let Some(s) = effort.as_deref()
+            && !valid_effort(tool, s)
+        {
+            return Err(format!(
+                "{} does not support explicit effort {s}.",
+                tool.label()
+            ));
+        }
+        let (reply, answer) = bounded(1);
+        self.send(Cmd::UserAddWith {
+            tool: tool_of(tool),
+            name,
+            prompt: Some(prompt),
+            session: None,
+            note: None,
+            work_epoch: Some(epoch),
+            model,
+            effort,
+            reply,
+        })?;
+        answer
+            .recv()
+            .map_err(|_| "Terminal registry closed".to_owned())?
+    }
+
+    /// Codex's own list of its models, from the home a new Codex terminal of
+    /// this project would use.
+    fn offered_models(&self, tool: ToolKind) -> Option<Vec<String>> {
+        let (layout, project) = self.configs.as_ref()?;
+        match tool {
+            ToolKind::Codex => crate::codex_models::listed(&crate::launch::config_dir(
+                layout,
+                project,
+                Tool::Codex,
+            )?),
+            // The models the user marked or used in OpenCode. A file that
+            // names none leaves the default alone on offer.
+            ToolKind::OpenCode => {
+                let state = crate::launch::opencode_state_dir(layout, project)?;
+                let text = std::fs::read_to_string(state.join("model.json")).ok()?;
+                let models = connecto_adapter::opencode_models(&text);
+                (!models.is_empty()).then_some(models)
+            }
+            _ => None,
+        }
     }
 
     fn session_of(&self, id: &str) -> Option<String> {
@@ -342,6 +524,19 @@ impl TerminalsControl for TerminalsHandle {
     fn close(&self, id: &str) -> Result<(), String> {
         self.known(id)?;
         self.send(Cmd::UserClose(id.to_owned()))
+    }
+
+    fn close_within(&self, id: &str, allowed: &[String]) -> Result<(), String> {
+        self.known(id)?;
+        let (reply, answer) = bounded(1);
+        self.send(Cmd::CloseWithin {
+            id: id.to_owned(),
+            allowed: allowed.to_vec(),
+            reply,
+        })?;
+        answer
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "the terminal list did not answer in time".to_owned())?
     }
 
     fn rename(&self, id: &str, name: Option<String>) -> Result<(), String> {
@@ -356,6 +551,30 @@ impl TerminalsControl for TerminalsHandle {
     fn restart(&self, id: &str) -> Result<(), String> {
         self.known(id)?;
         self.send(Cmd::Restart(id.to_owned()))
+    }
+
+    fn stop_background_now(&self, id: &str, task: Option<&str>) -> Result<String, String> {
+        self.known(id)?;
+        let slot = self
+            .utility
+            .as_ref()
+            .and_then(|(_, shared)| shared.slot_by_id(id))
+            .ok_or_else(|| "That terminal is not running.".to_owned())?;
+        crate::background::stop(&slot, task, true, |_| {})
+    }
+
+    fn stop_background(&self, id: &str, task: Option<&str>) -> Result<String, String> {
+        self.known(id)?;
+        let slot = self
+            .utility
+            .as_ref()
+            .and_then(|(_, shared)| shared.slot_by_id(id))
+            .ok_or_else(|| "That terminal is not running.".to_owned())?;
+        let tx = self.tx.clone();
+        let id = id.to_owned();
+        crate::background::stop(&slot, task, false, move |why| {
+            let _ = tx.try_send(Cmd::BackgroundStopRefused { id, why });
+        })
     }
 
     fn continue_from(&self, history_id: &str) -> Result<(), String> {
@@ -385,6 +604,21 @@ impl TerminalsControl for TerminalsHandle {
         self.send(Cmd::Transcript(history_id.to_owned()))
     }
 
+    fn read_transcript(&self, history_id: &str) -> Result<String, String> {
+        let view = self.view.load();
+        if !view.history.iter().any(|entry| entry.id == history_id) {
+            return Err("no such history entry".to_owned());
+        }
+        let (reply, answer) = bounded(1);
+        self.send(Cmd::ReadTranscript {
+            history_id: history_id.to_owned(),
+            reply,
+        })?;
+        answer
+            .recv_timeout(Duration::from_secs(6))
+            .map_err(|_| "the transcript could not be read in time".to_owned())?
+    }
+
     fn start_titling(&self, id: &str) -> Result<(), String> {
         let (utility, shared) = self
             .utility
@@ -398,6 +632,7 @@ impl TerminalsControl for TerminalsHandle {
             &self.view.load(),
             id,
             Box::new(move |title| handle.rename(&terminal, Some(title))),
+            None,
         )
     }
 
@@ -415,12 +650,14 @@ impl TerminalsControl for TerminalsHandle {
 /// Start a hidden titling run for terminal `id`, the one the title button
 /// starts: read what the terminal is about off the caller's thread, ask the
 /// model, and give the title to `rename`. `Err` means it was refused at once.
+/// When the run fails, `fallback`, if any, is given to `rename` instead.
 fn begin_titling(
     utility: &Arc<Utility>,
     shared: &Arc<Shared>,
     view: &TerminalsView,
     id: &str,
     rename: Box<dyn Fn(String) -> Result<(), String> + Send>,
+    fallback: Option<String>,
 ) -> Result<(), String> {
     let label = {
         let entry = view
@@ -439,14 +676,20 @@ fn begin_titling(
             .name("utility-run".into())
             .spawn(move || {
                 // Reading the screen waits on its lock: off the caller's thread.
-                match utility::context(&shared, utility.project(), &terminal) {
-                    None => utility.finish(
-                        run,
-                        connecto_core::UtilityStatus::Failed {
-                            reason: "no activity in this terminal yet, so there is nothing to title it from".to_owned(),
-                        },
-                    ),
+                let titled = match utility::context(&shared, utility.project(), &terminal) {
+                    None => {
+                        utility.finish(
+                            run,
+                            connecto_core::UtilityStatus::Failed {
+                                reason: "no activity in this terminal yet, so there is nothing to title it from".to_owned(),
+                            },
+                        );
+                        false
+                    }
                     Some(prompt) => utility.execute(run, prompt, &*rename),
+                };
+                if !titled && let Some(fallback) = fallback {
+                    let _ = rename(fallback);
                 }
             })
     };
@@ -474,6 +717,13 @@ impl Registry {
             last_error: None,
             warning: None,
         }));
+        // As `Core::init` resolves it, so the folder is the one launches use.
+        let configs = config.project.as_deref().map(|path| {
+            (
+                config.layout.clone(),
+                fs::canonicalize(path).unwrap_or_else(|_| path.to_owned()),
+            )
+        });
         let mut core = Core {
             shared: Arc::clone(&shared),
             layout: config.layout,
@@ -486,6 +736,7 @@ impl Registry {
             io: None,
             list: List::defaults(&[]),
             fresh: true,
+            after_update: config.after_update,
             save: SaveState::Saved,
             warning: None,
             last_error: None,
@@ -515,6 +766,7 @@ impl Registry {
             closed: Arc::clone(&closed),
             shared,
             utility: config.utility,
+            configs,
         };
         thread::Builder::new()
             .name("terminal-registry".into())
@@ -534,6 +786,7 @@ impl Registry {
                 .utility
                 .clone()
                 .map(|utility| (utility, Arc::clone(&self.shared))),
+            configs: self.configs.clone(),
         }
     }
 
@@ -549,6 +802,20 @@ impl Registry {
         if let Some(utility) = &self.utility {
             utility.cancel_all();
         }
+    }
+
+    /// The app quits for an update: mark the terminals in a turn as cut by it,
+    /// and save. False when it could not be saved in `wait`.
+    pub(crate) fn mark_cut_by_update(&self, wait: Duration) -> bool {
+        let (reply, answer) = bounded(1);
+        if self
+            .tx
+            .send_timeout(Cmd::MarkCutByUpdate { reply }, wait)
+            .is_err()
+        {
+            return false;
+        }
+        answer.recv_timeout(wait).unwrap_or(false)
     }
 
     /// Refuses at once, with nothing live and nothing in preflight. The
@@ -583,7 +850,7 @@ impl Registry {
         &self,
         tool: Tool,
         name: Option<String>,
-        model: Option<String>,
+        launch: AgentLaunch,
         caller: Option<String>,
         epoch: u64,
         wait: Duration,
@@ -592,7 +859,7 @@ impl Registry {
             |reply| Cmd::Add {
                 tool,
                 name,
-                model,
+                launch,
                 caller,
                 epoch,
                 reply,
@@ -645,6 +912,145 @@ impl Registry {
     }
 }
 
+/// What a launch does with a saved list: which terminals resume with
+/// "continua", and which cut asks are opened again.
+#[derive(Debug, Default)]
+struct Restore {
+    /// The list changed and must be saved before anything starts.
+    marked: bool,
+    /// Resumed with "continua": an update cut their turn (ADR 0030).
+    carry_on: BTreeSet<String>,
+    /// Asks an update cut, opened again for their askers.
+    asks: Vec<OpenAsk>,
+}
+
+/// Which saved terminals start at this launch, and which of them resume with
+/// "continua" because an update cut their turn (ADR 0030). Marks a turn cut
+/// by the last close as interrupted and drops the update's mark, saying
+/// whether the list changed so. A list made this launch (`fresh`) starts
+/// whole and carries nothing on.
+///
+/// A terminal waiting on an `--ask` to one the update cut starts too, and its
+/// ask is opened again. It is not told "continua", even when its own turn was
+/// cut: the reply wakes it, as it would have without the update.
+///
+/// The first restore after an update's quit (`after_update`) also starts
+/// every terminal saved running, idle ones and the app session included,
+/// resumed with no note: an update is not the person quitting. Otherwise an
+/// idle terminal stays stopped, as after any quit, and that is saved, so a
+/// later update does not bring back one this launch left stopped.
+fn plan_restore(entries: &mut [Entry], fresh: bool, after_update: bool) -> Restore {
+    let mut restore = Restore::default();
+    // Who starts because an update cut it, then, until nothing changes, who
+    // waits on one that starts.
+    let mut starts: BTreeSet<String> = if fresh {
+        BTreeSet::new()
+    } else {
+        entries
+            .iter()
+            .filter(|entry| entry.cut_by_update)
+            .map(|entry| entry.id.clone())
+            .collect()
+    };
+    let ids: BTreeSet<String> = entries.iter().map(|entry| entry.id.clone()).collect();
+    loop {
+        let waiting: Vec<String> = entries
+            .iter()
+            .filter(|entry| starts.contains(&entry.id))
+            .flat_map(|entry| entry.owes.iter().map(|owed| owed.to.clone()))
+            .filter(|to| ids.contains(to) && !starts.contains(to))
+            .collect();
+        if waiting.is_empty() {
+            break;
+        }
+        starts.extend(waiting);
+    }
+    let mut waits: BTreeSet<String> = BTreeSet::new();
+    for entry in entries.iter() {
+        if !starts.contains(&entry.id) {
+            continue;
+        }
+        for owed in &entry.owes {
+            if starts.contains(&owed.to) {
+                waits.insert(owed.to.clone());
+                restore.asks.push(OpenAsk {
+                    request: owed.request.clone(),
+                    from: owed.to.clone(),
+                    target: entry.id.clone(),
+                });
+            }
+        }
+    }
+    for entry in entries {
+        if fresh {
+            entry.interrupted = false;
+        } else if (entry.working || entry.cut_by_update) && !entry.interrupted {
+            entry.interrupted = true;
+            restore.marked = true;
+        }
+        let cut = !fresh && entry.cut_by_update;
+        if entry.cut_by_update {
+            entry.cut_by_update = false;
+            restore.marked = true;
+        }
+        if !entry.owes.is_empty() {
+            entry.owes.clear();
+            restore.marked = true;
+        }
+        let waiting = waits.contains(&entry.id);
+        // Only a conversation that is resumed can be told to carry on, and
+        // one waiting on an ask is woken by its reply instead.
+        if cut && !waiting && entry.interrupted && entry.session.is_some() {
+            restore.carry_on.insert(entry.id.clone());
+        }
+        let kept = after_update && !fresh && entry.running;
+        let running = waiting
+            || kept
+            || ((fresh || entry.interrupted)
+                && (cut || entry.name.as_deref() != Some(connecto_core::session::APP_SESSION)));
+        // What is saved is what runs: `desired` is what the next update
+        // brings back. A list made this launch is not written for it.
+        if running != entry.running && !fresh {
+            restore.marked = true;
+        }
+        entry.running = running;
+    }
+    restore
+}
+
+/// Who an update restarts: the terminals in a turn (`cut`), then, until
+/// nothing changes, the askers of an open ask to one that restarts. Gives
+/// the asks to save, as each target's `owes` (ADR 0030).
+fn owed_replies(
+    cut: &BTreeSet<String>,
+    asks: &[OpenAsk],
+    listed: &BTreeSet<String>,
+) -> BTreeMap<String, Vec<OwedReply>> {
+    let mut starts = cut.clone();
+    loop {
+        let waiting: Vec<String> = asks
+            .iter()
+            .filter(|ask| starts.contains(&ask.target) && !starts.contains(&ask.from))
+            .filter(|ask| listed.contains(&ask.from))
+            .map(|ask| ask.from.clone())
+            .collect();
+        if waiting.is_empty() {
+            break;
+        }
+        starts.extend(waiting);
+    }
+    let mut owes: BTreeMap<String, Vec<OwedReply>> = BTreeMap::new();
+    for ask in asks {
+        if starts.contains(&ask.target) && starts.contains(&ask.from) && ask.from != ask.target {
+            owes.entry(ask.target.clone()).or_default().push(OwedReply {
+                request: ask.request.clone(),
+                to: ask.from.clone(),
+            });
+        }
+    }
+    owes
+}
+
 /// Whether any pane runs a process or a preflight.
 fn busy(shared: &Shared) -> bool {
     shared
@@ -660,6 +1066,8 @@ fn busy(shared: &Shared) -> bool {
 enum Look {
     Active,
     Stopped,
+    /// Refused by the project's Tools setting: not to be brought back.
+    Refused,
     Other,
 }
 
@@ -668,6 +1076,7 @@ fn look(pane: &ManagedPane) -> Look {
         PaneStage::Preparing { .. } => Look::Active,
         PaneStage::Running if pane.is_live() => Look::Active,
         PaneStage::Running | PaneStage::Stopped => Look::Stopped,
+        PaneStage::Failed { .. } if pane.tools_refused() => Look::Refused,
         _ => Look::Other,
     }
 }
@@ -717,6 +1126,10 @@ struct Core {
     list: List,
     /// The list was made this launch, not read: all of it starts.
     fresh: bool,
+    /// The first restore follows an update's quit: every terminal saved
+    /// running starts (ADR 0030). Taken by that restore, so a project chosen
+    /// later restores as usual.
+    after_update: bool,
     save: SaveState,
     warning: Option<String>,
     last_error: Option<String>,
@@ -813,6 +1226,7 @@ impl Core {
         extras.initial_prompt = opening.prompt;
         extras.resume_note = opening.note;
         extras.model = opening.model;
+        extras.effort = opening.effort;
         let pane = ManagedPane::spawn(PaneSetup {
             layout: self.layout.clone(),
             project: None,
@@ -925,17 +1339,30 @@ impl Core {
     /// for. A started one is not told to carry on: its conversation comes
     /// back at its prompt, marked interrupted until its next turn. Either way
     /// a saved tool session is picked up again by the first start (R11).
+    ///
+    /// A terminal whose turn an update cut (ADR 0030) starts too, the app
+    /// session included, and its resumed conversation is told "continua" as
+    /// its first message: once, as the mark is dropped and saved here. A turn
+    /// cut by a crash or a quit is not carried on.
     fn fill_slots(&mut self) {
-        let fresh = self.fresh;
-        let mut marked = false;
-        for entry in &mut self.list.terminals {
-            if fresh {
-                entry.interrupted = false;
-            } else if entry.working && !entry.interrupted {
-                entry.interrupted = true;
-                marked = true;
-            }
+        let Restore {
+            marked,
+            mut carry_on,
+            mut asks,
+        } = plan_restore(
+            &mut self.list.terminals,
+            self.fresh,
+            std::mem::take(&mut self.after_update),
+        );
+        // Kept at once, before anything starts: a second quit before its next
+        // turn must not lose it, and an update's mark is gone from the disk
+        // before "continua" is said, so it is said at most once. Unsaved,
+        // nothing is carried on.
+        if marked && !self.save_now() {
+            carry_on.clear();
+            asks.clear();
         }
+        self.shared.restore_asks(asks);
         let entries = self.list.terminals.clone();
         // Free slots that no longer match.
         let current: Vec<Arc<Slot>> = self.shared.slots.load().iter().flatten().cloned().collect();
@@ -953,11 +1380,15 @@ impl Core {
         for entry in entries {
             if let Some(slot) = self.shared.slot_by_id(&entry.id) {
                 slot.pane.release();
+                slot.pane.set_session_name(entry.name.clone());
                 slot.pane
                     .set_resume(entry.session.clone().filter(|id| valid_session(id)));
+                slot.pane
+                    .set_launch(entry.model.clone(), entry.launch_effort());
                 slot.interrupted.store(entry.interrupted, Ordering::SeqCst);
+                slot.job.store(entry.job, Ordering::SeqCst);
                 if let Some(project) = &self.project {
-                    let how = if fresh || entry.interrupted {
+                    let how = if entry.running {
                         Begin::Start
                     } else {
                         Begin::Stopped
@@ -973,7 +1404,7 @@ impl Core {
             let Some(pane) = self.make_pane(
                 entry.tool,
                 &entry.id,
-                if fresh || entry.interrupted {
+                if entry.running {
                     Begin::Start
                 } else {
                     Begin::Stopped
@@ -981,6 +1412,10 @@ impl Core {
                 entry.session.as_deref(),
                 Opening {
                     model: entry.model.clone(),
+                    effort: entry.launch_effort(),
+                    note: carry_on
+                        .contains(&entry.id)
+                        .then(|| CONTINUE_AFTER_UPDATE.to_owned()),
                     ..Opening::default()
                 },
             ) else {
@@ -988,18 +1423,78 @@ impl Core {
             };
             if let Ok(slot) = self.shared.install(index, &entry.id, entry.tool, pane) {
                 slot.interrupted.store(entry.interrupted, Ordering::SeqCst);
+                slot.job.store(entry.job, Ordering::SeqCst);
                 self.begin_watch(&slot, true);
             }
         }
-        // What was started is wanted running, whatever an earlier run left
-        // saved, and what waits is not.
+    }
+
+    /// Mark each terminal in a turn now as cut by an update, and save. Then
+    /// nothing the panes do is followed any more: the app is quitting, and
+    /// what is saved is what the update cut. True when it is saved.
+    fn mark_cut_by_update(&mut self) -> bool {
+        if self.shutdown.load(Ordering::SeqCst) {
+            // Already closing (a second shutdown path, say): what it saw last
+            // is saved, and no longer looked at.
+            return true;
+        }
+        // What the panes say right now, not at the last tick.
+        self.observe();
+        // Only a turn a live agent is in now: a saved `working` that a pane
+        // still starting has not confirmed is an older cut, not this one.
+        // With the conversation it is in, read after the turn: a pane that
+        // restarted since `observe` is in a new one.
+        let in_turn: BTreeMap<String, Option<String>> = self
+            .shared
+            .slots
+            .load()
+            .iter()
+            .flatten()
+            .filter(|slot| {
+                slot.tool != Tool::Shell
+                    && slot.pane.stage() == PaneStage::Running
+                    && slot.pane.is_live()
+                    // A turn, not background work after one: that one is done.
+                    && slot.published().0 == Phase::Working
+            })
+            .map(|slot| {
+                let session = slot.tool_session().filter(|id| valid_session(id));
+                (slot.id.clone(), session)
+            })
+            .collect();
+        // The asks open now, so an asker waiting on a cut turn restarts too
+        // and gets its reply (ADR 0030). The state never waits on the
+        // registry, so this cannot stall the quit for long.
+        let cut: BTreeSet<String> = in_turn.keys().cloned().collect();
+        let listed: BTreeSet<String> = self.list.terminals.iter().map(|e| e.id.clone()).collect();
+        let mut owes = owed_replies(&cut, &self.shared.open_asks(OPEN_ASKS_WAIT), &listed);
+        let mut any = false;
         for entry in &mut self.list.terminals {
-            entry.running = fresh || entry.interrupted;
+            entry.owes = owes.remove(&entry.id).unwrap_or_default();
+            any |= !entry.owes.is_empty();
+            entry.cut_by_update = in_turn.contains_key(&entry.id);
+            // One look for both: a turn that began after `observe` is a turn.
+            entry.working |= entry.cut_by_update;
+            if let Some(Some(session)) = in_turn.get(&entry.id) {
+                entry.session = Some(session.clone());
+            }
+            any |= entry.cut_by_update;
         }
-        // Kept at once: a second quit before its next turn must not lose it.
-        if marked {
-            self.save_now();
+        self.shutdown.store(true, Ordering::SeqCst);
+        // The cut is now, right after the look and before the disk write: a
+        // turn must not end after it was seen, so the panes stop here rather
+        // than when the rest of the app has shut down.
+        for slot in self.shared.slots.load().iter().flatten() {
+            slot.pane.request_stop();
         }
+        // Written even when nothing was cut: the next launch brings back what
+        // the list says was running, so it must be what ran now (ADR 0030).
+        // A list that is read-only this run is never written, and fails only
+        // what it had to keep.
+        if self.save == SaveState::ReadOnly {
+            return !any;
+        }
+        self.save_now()
     }
 
     fn begin_watch(&mut self, slot: &Slot, starting: bool) {
@@ -1082,8 +1577,34 @@ impl Core {
         })
     }
 
+    /// Why a terminal of `tool` may not be added or started in this
+    /// project: its saved Tools setting leaves the CLI out.
+    fn tool_refusal(&self, tool: Tool) -> Option<TermError> {
+        let project = self.project.as_deref()?;
+        crate::project_settings::tool_refusal_in(&self.layout.data_root, project, kind(tool))
+            .map(TermError::NotAllowed)
+    }
+
     fn add(&mut self, new: New, how: Begin) -> Result<Changed, TermError> {
         let tool = new.tool.ok_or(TermError::Unknown)?;
+        if let Some(refused) = self.tool_refusal(tool) {
+            return Err(refused);
+        }
+        if new.name.as_deref() == Some(connecto_core::session::APP_SESSION) {
+            if tool == Tool::Shell || new.parent.is_some() {
+                return Err(TermError::Name(
+                    "app-session requires a top-level agent".into(),
+                ));
+            }
+            if let Some(entry) = self.list.terminals.iter().find(|e| e.name == new.name) {
+                return Ok(Changed {
+                    id: entry.id.clone(),
+                    state: "existing",
+                    saved: true,
+                    removal: Removal::NotAsked,
+                });
+            }
+        }
         if self.save == SaveState::ReadOnly {
             return Err(TermError::SaveFailed(
                 "the terminal list is read-only this run".to_owned(),
@@ -1110,11 +1631,14 @@ impl Core {
         entry.asked_by = new.asked_by;
         entry.session = new.session.filter(|session| valid_session(session));
         entry.model = new.model.filter(|model| valid_model(model));
+        entry.effort = new.effort;
+        entry.job = new.job;
         let model = entry.model.clone();
         let resume = entry.session.clone();
         let opening = Opening {
             prompt: new.prompt,
             note: new.note,
+            effort: entry.launch_effort(),
             model,
         };
         next.terminals.push(entry);
@@ -1143,6 +1667,7 @@ impl Core {
                 return Err(TermError::SaveFailed(why));
             }
         };
+        slot.job.store(new.job, Ordering::SeqCst);
         self.begin_watch(&slot, true);
         Ok(Changed {
             id,
@@ -1170,6 +1695,9 @@ impl Core {
         if slot.pane.attempt() != attempt {
             return Err(TermError::Restarted);
         }
+        if let Some(refused) = self.tool_refusal(slot.tool) {
+            return Err(refused);
+        }
         slot.pane
             .request_start_agent(pause, epoch)
             .map_err(|refusal| match refusal {
@@ -1192,6 +1720,20 @@ impl Core {
     /// children are found before the close, which would otherwise move them
     /// up. A child that cannot be removed stays, stopped, at top level, and
     /// says why in `last_error`; the parent's result is not changed by it.
+    /// The close a peer asked for. The set the close would affect is worked out
+    /// now, in the worker, which also runs every add: a child created after the
+    /// peer looked is in the set, and is refused unless it is allowed.
+    fn close_within(&mut self, id: &str, allowed: &[String]) -> Result<(), String> {
+        let mut affected = self.descendants(id);
+        affected.push(id.to_owned());
+        if affected.iter().any(|entry| !allowed.contains(entry)) {
+            return Err(connecto_core::CLOSE_NOT_ALL_LISTED.to_owned());
+        }
+        self.close(id, None)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
     fn close(&mut self, id: &str, admit: Option<Admit>) -> Result<Changed, TermError> {
         let descendants = self.descendants(id);
         let changed = self.close_one(id, admit)?;
@@ -1365,6 +1907,12 @@ impl Core {
         if entry.name == name {
             return;
         }
+        if entry.name.as_deref() == Some(connecto_core::session::APP_SESSION)
+            || name.as_deref() == Some(connecto_core::session::APP_SESSION)
+        {
+            self.last_error = Some("The app-session name is reserved for project chat.".into());
+            return;
+        }
         entry.name = name.clone();
         let tool = entry.tool;
         self.save_now();
@@ -1516,9 +2064,28 @@ impl Core {
                     .send((terminal.clone(), title))
                     .map_err(|_| "the terminal list is closed".to_owned())
             });
-            // Refused (already titling, too many runs): the first prompt
-            // has had its chance, and the title button is still there.
-            let _ = begin_titling(&utility, &self.shared, &self.view.load(), &id, rename);
+            // A run that fails (the model did the task instead of titling
+            // it, or timed out) leaves the start of the first prompt as the
+            // name, as a child terminal gets: it is titled only once.
+            let fallback = self
+                .shared
+                .slot_by_id(&id)
+                .and_then(|slot| slot.task())
+                .and_then(|task| name_from(&task));
+            // Refused (already titling, too many runs): the fallback now, and
+            // the title button is still there.
+            let refused = begin_titling(
+                &utility,
+                &self.shared,
+                &self.view.load(),
+                &id,
+                rename,
+                fallback.clone(),
+            )
+            .is_err();
+            if refused && let Some(name) = fallback {
+                self.rename(&id, Some(name));
+            }
         }
     }
 
@@ -1620,11 +2187,16 @@ impl Core {
     fn handle(&mut self, command: Cmd) {
         let closing = self.shutdown.load(Ordering::SeqCst);
         match command {
-            Cmd::UserAdd { tool, name } => {
+            Cmd::MarkCutByUpdate { reply } => {
+                let saved = self.mark_cut_by_update();
+                let _ = reply.send(saved);
+            }
+            Cmd::UserAdd { tool, name, model } => {
                 self.last_error = None;
                 let new = New {
                     tool: Some(tool),
                     name,
+                    model,
                     ..New::default()
                 };
                 if let Err(err) = self.add(new, Begin::Start) {
@@ -1637,6 +2209,9 @@ impl Core {
                 prompt,
                 session,
                 note,
+                model,
+                effort,
+                work_epoch,
                 reply,
             } => {
                 self.last_error = None;
@@ -1646,18 +2221,32 @@ impl Core {
                     prompt,
                     session,
                     note,
+                    model,
+                    effort,
+                    // Only Agentic Works dispatches work with an epoch.
+                    job: work_epoch.is_some(),
                     ..New::default()
                 };
-                let result = match self.add(new, Begin::Start) {
-                    Ok(changed) => Ok(changed.id),
-                    Err(err) => {
-                        self.last_error = Some(err.to_string());
-                        Err(err.to_string())
+                let pause = self.shared.pause();
+                let result = if work_epoch
+                    .is_some_and(|epoch| closing || pause.is_paused() || pause.epoch() != epoch)
+                {
+                    Err("Work dispatch cancelled by Stop, Pause or shutdown.".into())
+                } else {
+                    match self.add(new, Begin::Start) {
+                        Ok(changed) => Ok(changed.id),
+                        Err(err) => {
+                            self.last_error = Some(err.to_string());
+                            Err(err.to_string())
+                        }
                     }
                 };
                 // The view first, so the id is already in it when it is known.
                 self.publish();
                 let _ = reply.send(result);
+            }
+            Cmd::BackgroundStopRefused { id, why } => {
+                self.last_error = Some(format!("{id}: background shell not stopped. {why}"));
             }
             Cmd::UserClose(id) => {
                 self.last_error = None;
@@ -1681,11 +2270,23 @@ impl Core {
                 self.last_error = None;
                 self.load_transcript(&history_id);
             }
+            Cmd::ReadTranscript { history_id, reply } => {
+                let text = self
+                    .history_store
+                    .as_ref()
+                    .ok_or_else(|| "this project keeps no history".to_owned())
+                    .and_then(|store| {
+                        store
+                            .transcript(&history_id)
+                            .map_err(|err| format!("The transcript could not be read ({err})."))
+                    });
+                let _ = reply.send(text);
+            }
             Cmd::AutoName { id, text } => self.auto_name(&id, &text),
             Cmd::Add {
                 tool,
                 name,
-                model,
+                launch: AgentLaunch { model, effort },
                 caller,
                 epoch,
                 reply,
@@ -1704,7 +2305,17 @@ impl Core {
                         // The caller was closed while this waited.
                         None => Err(TermError::Unknown),
                         Some((parent, asked_by)) => {
+                            // What a job's terminal starts is a job's too,
+                            // from the caller's own entry, whatever its parent.
+                            let job = caller.as_deref().is_some_and(|caller| {
+                                self.list
+                                    .terminals
+                                    .iter()
+                                    .any(|entry| entry.id == caller && entry.job)
+                            });
                             let new = New {
+                                job,
+                                effort,
                                 tool: Some(tool),
                                 name,
                                 parent,
@@ -1743,6 +2354,11 @@ impl Core {
                 let _ = reply.send(result);
             }
             Cmd::Choose(project) => self.choose(project),
+            Cmd::CloseWithin { id, allowed, reply } => {
+                self.last_error = None;
+                let result = self.close_within(&id, &allowed);
+                let _ = reply.send(result);
+            }
         }
         self.publish();
     }
@@ -1835,6 +2451,25 @@ impl Core {
                     watch.stopped_ticks = watch.stopped_ticks.saturating_add(1);
                     if running && !in_grace && watch.stopped_ticks >= STOPPED_TICKS {
                         self.set_desired(&slot.id, false);
+                    }
+                }
+                // A CLI the project leaves out is not started again by itself
+                // (a relaunch, an update): its conversation and the refusal
+                // shown stay, a start by hand is checked again.
+                Look::Refused => {
+                    watch.stopped_ticks = 0;
+                    watch.grace_until = None;
+                    if let Some(entry) = self
+                        .list
+                        .terminals
+                        .iter_mut()
+                        .find(|entry| entry.id == slot.id)
+                        && (entry.running || entry.interrupted || entry.working)
+                    {
+                        entry.running = false;
+                        entry.interrupted = false;
+                        entry.working = false;
+                        session_changed = true;
                     }
                 }
                 Look::Other => {
@@ -1935,17 +2570,28 @@ impl Core {
                 let slot = self.shared.slot_by_id(&entry.id)?;
                 let session: Arc<dyn TerminalSession> = Arc::clone(&slot.pane) as _;
                 let control: Arc<dyn PaneControl> = Arc::clone(&slot.pane) as _;
+                let state = self.activity(entry, &slot);
                 Some(TerminalEntry {
                     id: entry.id.clone(),
                     name: entry.name.clone(),
                     parent: entry.parent.clone(),
                     asked_by: entry.asked_by.clone(),
                     tool: kind(entry.tool),
-                    state: self.activity(entry, &slot),
+                    state,
+                    in_turn: state == TermActivity::Working && slot.published().0 == Phase::Working,
+                    background: if state == TermActivity::Working {
+                        slot.background_shown()
+                            .iter()
+                            .map(|task| task.work.clone())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                     finished_turns: slot.finished.load(Ordering::Relaxed),
                     session,
                     control: Some(control),
                     desired_running: entry.running,
+                    shown_id: None,
                     activity: slot.activity.load(Ordering::Relaxed),
                 })
             })
@@ -1962,7 +2608,12 @@ impl Core {
                     entry.state,
                     entry.finished_turns,
                     entry.desired_running,
-                    entry.activity
+                    entry.activity,
+                    entry
+                        .background
+                        .iter()
+                        .map(|work| (&work.id, &work.label))
+                        .collect::<Vec<_>>()
                 ))
                 .collect::<Vec<_>>(),
             self.save,
@@ -2083,6 +2734,16 @@ mod tests {
         retry: Duration,
         titler: Option<Arc<dyn utility::Titler>>,
     ) -> Scene {
+        scene_launch(name, disk, retry, titler, false)
+    }
+
+    fn scene_launch(
+        name: &str,
+        disk: &FakeIo,
+        retry: Duration,
+        titler: Option<Arc<dyn utility::Titler>>,
+        after_update: bool,
+    ) -> Scene {
         let root = std::env::temp_dir().join(format!("mg-reg-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for dir in ["home/project", "data"] {
@@ -2105,6 +2766,7 @@ mod tests {
                 pause: None,
                 utility_settings: None,
                 auto_title: true,
+                after_update,
             },
             Some(Box::new(move |_| Box::new(factory_disk.clone()))),
             retry,
@@ -2151,7 +2813,7 @@ mod tests {
         scene.relay.registry.agent_add(
             tool,
             None,
-            None,
+            AgentLaunch::default(),
             None,
             scene.relay.shared.pause().epoch(),
             Duration::from_secs(5),
@@ -2316,7 +2978,7 @@ mod tests {
         scene.relay.registry.agent_add(
             Tool::Claude,
             None,
-            None,
+            AgentLaunch::default(),
             Some(caller.to_owned()),
             scene.relay.shared.pause().epoch(),
             Duration::from_secs(5),
@@ -2413,6 +3075,436 @@ mod tests {
         assert_eq!(ids(&again), listed);
     }
 
+    /// ADR 0030: a terminal waiting on an `--ask` to one an update cut starts
+    /// too, its ask is opened again, and it is not told "continua", even when
+    /// its own turn was cut: the reply wakes it. Through a lead whose child
+    /// waits on a grandchild, too.
+    #[test]
+    fn askers_of_a_cut_turn_start_without_continua_and_get_their_asks_back() {
+        let entry = |id: &str, cut: bool, owes: &[(&str, &str)]| {
+            let mut entry = Entry::new(id.to_owned(), Tool::Claude, true);
+            entry.working = cut;
+            entry.cut_by_update = cut;
+            entry.session = Some(format!("{id}-session"));
+            entry.owes = owes
+                .iter()
+                .map(|(request, to)| OwedReply {
+                    request: (*request).to_owned(),
+                    to: (*to).to_owned(),
+                })
+                .collect();
+            entry
+        };
+        let mut list = vec![
+            entry("lead", false, &[]),
+            entry("mid", false, &[("r1", "lead")]),
+            entry("coder", true, &[("r2", "mid")]),
+            entry("cut-lead", true, &[]),
+            entry("child", true, &[("r3", "cut-lead")]),
+            entry("idle", false, &[("r4", "other")]),
+            entry("other", false, &[]),
+        ];
+        let restore = plan_restore(&mut list, false, false);
+        assert!(restore.marked);
+        assert_eq!(
+            restore.carry_on,
+            BTreeSet::from(["coder".to_owned(), "child".to_owned()]),
+            "the cut turns carry on, their askers do not"
+        );
+        let by = |id: &str| list.iter().find(|e| e.id == id).unwrap();
+        for id in ["lead", "mid", "coder", "cut-lead", "child"] {
+            assert!(by(id).running, "{id} starts");
+        }
+        assert!(!by("idle").running && !by("other").running);
+        assert!(!by("lead").interrupted && !by("mid").interrupted);
+        assert!(by("cut-lead").interrupted, "its turn was cut all the same");
+        let mut asks: Vec<(String, String, String)> = restore
+            .asks
+            .into_iter()
+            .map(|a| (a.request, a.from, a.target))
+            .collect();
+        asks.sort();
+        assert_eq!(
+            asks,
+            vec![
+                ("r1".into(), "lead".into(), "mid".into()),
+                ("r2".into(), "mid".into(), "coder".into()),
+                ("r3".into(), "cut-lead".into(), "child".into()),
+            ],
+            "an ask to a terminal that does not start is not opened again"
+        );
+        assert!(list.iter().all(|e| e.owes.is_empty()), "taken once");
+        let again = plan_restore(&mut list, false, false);
+        assert!(again.asks.is_empty() && again.carry_on.is_empty());
+    }
+
+    /// ADR 0030: at an update, the asks to a cut turn are saved on its
+    /// target, and so on up the chain of askers; an ask to an idle terminal
+    /// or from one that is not listed is not.
+    #[test]
+    fn an_update_saves_the_asks_to_the_turns_it_cuts_up_the_chain() {
+        let ask = |request: &str, from: &str, target: &str| OpenAsk {
+            request: request.to_owned(),
+            from: from.to_owned(),
+            target: target.to_owned(),
+        };
+        let set = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| (*id).to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        let owes = owed_replies(
+            &set(&["coder"]),
+            &[
+                ask("r1", "lead", "mid"),
+                ask("r2", "mid", "coder"),
+                ask("r3", "x", "idle"),
+                ask("r4", "gone", "coder"),
+            ],
+            &set(&["lead", "mid", "coder", "x", "idle"]),
+        );
+        let to = |id: &str| {
+            owes.get(id)
+                .map(|o| {
+                    o.iter()
+                        .map(|o| (o.request.clone(), o.to.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(to("coder"), vec![("r2".to_owned(), "mid".to_owned())]);
+        assert_eq!(to("mid"), vec![("r1".to_owned(), "lead".to_owned())]);
+        assert!(to("idle").is_empty());
+    }
+
+    #[test]
+    fn only_turns_cut_by_an_update_are_carried_on_once_the_app_session_too() {
+        let entry = |id: &str, working: bool, cut: bool| {
+            let mut entry = Entry::new(id.to_owned(), Tool::Claude, true);
+            entry.working = working;
+            entry.cut_by_update = cut;
+            entry.session = Some(format!("{id}-session"));
+            entry
+        };
+        let mut app = entry("claude-1", true, true);
+        app.name = Some(connecto_core::session::APP_SESSION.to_owned());
+        let mut no_session = entry("claude-4", true, true);
+        no_session.session = None;
+        let mut list = vec![
+            app,
+            entry("claude-2", true, false),  // a crash or a quit
+            entry("claude-3", false, false), // idle
+            no_session,
+        ];
+        // Marked by an update whose turn began after `working` was last saved.
+        list.push(entry("claude-6", false, true));
+        let Restore {
+            marked, carry_on, ..
+        } = plan_restore(&mut list, false, false);
+        assert!(marked);
+        assert_eq!(
+            carry_on,
+            BTreeSet::from(["claude-1".to_owned(), "claude-6".to_owned()])
+        );
+        assert!(list[4].running && list[4].interrupted);
+        assert!(
+            list[0].running,
+            "the app session starts when an update cut it"
+        );
+        assert!(
+            list[1].running && list[1].interrupted,
+            "started, not carried on"
+        );
+        assert!(!list[2].running);
+        assert!(
+            list[3].running,
+            "starts, but has no conversation to carry on"
+        );
+        assert!(list.iter().all(|e| !e.cut_by_update), "the mark is taken");
+        // The next launch, before any new turn: nothing is carried on again.
+        let again = plan_restore(&mut list, false, false).carry_on;
+        assert!(again.is_empty());
+        assert!(!list[0].running, "back to waiting for an explicit start");
+        // A list made this launch carries nothing on.
+        let mut fresh = vec![entry("claude-5", true, true)];
+        assert!(plan_restore(&mut fresh, true, false).carry_on.is_empty());
+    }
+
+    #[test]
+    fn an_update_quit_saves_the_turns_it_cuts() {
+        let disk = FakeIo::default();
+        let mut list = List::defaults(&[Tool::Claude, Tool::Codex]);
+        list.terminals[0].working = true;
+        disk.0.lock().unwrap().content = Some(list.to_json());
+        let scene = scene_with("update-cut", &disk, RETRY);
+        // The saved turn is an older one, cut by a crash: no agent is live in
+        // a turn now, so the update cuts nothing, and the quit is saved.
+        assert!(scene.relay.mark_cut_by_update(Duration::from_secs(5)));
+        let saved = List::parse(disk.0.lock().unwrap().content.as_deref().unwrap()).unwrap();
+        assert!(saved.terminals.iter().all(|e| !e.cut_by_update));
+        assert!(
+            saved.terminals[0].interrupted,
+            "still interrupted, as before"
+        );
+        // Closing now: a second mark changes nothing.
+        let writes = disk.0.lock().unwrap().writes;
+        assert!(scene.relay.mark_cut_by_update(Duration::from_secs(5)));
+        assert_eq!(disk.0.lock().unwrap().writes, writes);
+    }
+
+    /// A saved entry as a restore sees it: `running` is the saved `desired`.
+    fn saved(id: &str, running: bool, working: bool, cut: bool) -> Entry {
+        let mut entry = Entry::new(id.to_owned(), Tool::Claude, running);
+        entry.working = working;
+        entry.cut_by_update = cut;
+        entry.session = Some(format!("{id}-session"));
+        entry
+    }
+
+    fn by<'a>(list: &'a [Entry], id: &str) -> &'a Entry {
+        list.iter().find(|e| e.id == id).unwrap()
+    }
+
+    /// ADR 0030 (t1): after an update every terminal saved running starts,
+    /// idle ones and the app session included, with no note; one saved
+    /// stopped stays stopped.
+    #[test]
+    fn after_an_update_every_running_terminal_starts_idle_ones_with_no_note() {
+        let mut app = saved("claude-1", true, false, false);
+        app.name = Some(connecto_core::session::APP_SESSION.to_owned());
+        let mut list = vec![
+            app,
+            saved("claude-2", true, false, false),
+            saved("claude-3", false, false, false),
+            saved("claude-4", true, true, true),
+        ];
+        let restore = plan_restore(&mut list, false, true);
+        assert!(by(&list, "claude-1").running, "the app session comes back");
+        assert!(by(&list, "claude-2").running, "an idle one comes back");
+        assert!(
+            !by(&list, "claude-3").running,
+            "a stopped one stays stopped"
+        );
+        assert!(by(&list, "claude-4").running);
+        assert_eq!(
+            restore.carry_on,
+            BTreeSet::from(["claude-4".to_owned()]),
+            "only the cut turn is told to carry on"
+        );
+        assert!(!by(&list, "claude-2").interrupted && !by(&list, "claude-1").interrupted);
+    }
+
+    /// ADR 0030 (t2): a plain launch leaves an idle terminal stopped, as
+    /// before, and saves that, so `desired` is what runs.
+    #[test]
+    fn a_plain_launch_leaves_idle_terminals_stopped_and_saves_it() {
+        let mut list = vec![saved("claude-1", true, false, false)];
+        let restore = plan_restore(&mut list, false, false);
+        assert!(!list[0].running);
+        assert!(restore.marked, "the change of desired is saved");
+        assert!(restore.carry_on.is_empty());
+        // Nothing changes the next time: nothing to save.
+        assert!(!plan_restore(&mut list, false, false).marked);
+    }
+
+    /// ADR 0030 (t3): the list an older version (0.2.18) saves at an update's
+    /// quit, with no `owes` and nothing cut, brings back every terminal it
+    /// says was running.
+    #[test]
+    fn a_list_saved_by_an_older_version_at_an_update_brings_back_what_ran() {
+        let text = r#"{"version":1,"next":{"claude":5,"codex":3},"terminals":[
+            {"id":"claude-1","tool":"claude","desired":"running","session":"s-1"},
+            {"id":"claude-2","tool":"claude","desired":"running","session":"s-2","working":true},
+            {"id":"codex-1","tool":"codex","desired":"running","parent":"claude-1"},
+            {"id":"claude-3","tool":"claude","desired":"stopped","session":"s-3"},
+            {"id":"claude-4","tool":"claude","desired":"running","name":"app-session"}]}"#;
+        let mut list = List::parse(text).unwrap();
+        let restore = plan_restore(&mut list.terminals, false, true);
+        let running: Vec<&str> = list
+            .terminals
+            .iter()
+            .filter(|e| e.running)
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(running, ["claude-1", "claude-2", "codex-1", "claude-4"]);
+        assert!(restore.carry_on.is_empty() && restore.asks.is_empty());
+        assert!(by(&list.terminals, "claude-2").interrupted);
+    }
+
+    /// ADR 0030 (t4): an idle parent whose child was cut, with no `--ask`
+    /// between them, comes back too; only the child carries on.
+    #[test]
+    fn after_an_update_an_idle_parent_of_a_cut_child_starts_too() {
+        let mut child = saved("codex-1", true, true, true);
+        child.parent = Some("claude-1".to_owned());
+        let mut list = vec![saved("claude-1", true, false, false), child];
+        let restore = plan_restore(&mut list, false, true);
+        assert!(list.iter().all(|e| e.running));
+        assert_eq!(restore.carry_on, BTreeSet::from(["codex-1".to_owned()]));
+    }
+
+    /// ADR 0030 (t5): a parent cut mid-turn and its idle child both come
+    /// back; only the parent carries on.
+    #[test]
+    fn after_an_update_the_idle_child_of_a_cut_parent_starts_too() {
+        let mut child = saved("codex-1", true, false, false);
+        child.parent = Some("claude-1".to_owned());
+        let mut list = vec![saved("claude-1", true, true, true), child];
+        let restore = plan_restore(&mut list, false, true);
+        assert!(list.iter().all(|e| e.running));
+        assert_eq!(restore.carry_on, BTreeSet::from(["claude-1".to_owned()]));
+        assert!(!by(&list, "codex-1").interrupted);
+    }
+
+    /// ADR 0030 (t6): one at its prompt with background work (saved working,
+    /// not cut) starts, interrupted, and is not told to carry on.
+    #[test]
+    fn after_an_update_background_work_starts_with_no_note() {
+        let mut list = vec![saved("claude-1", true, true, false)];
+        let restore = plan_restore(&mut list, false, true);
+        assert!(list[0].running && list[0].interrupted);
+        assert!(restore.carry_on.is_empty());
+    }
+
+    /// ADR 0030 (t7): a plain launch that leaves an idle terminal stopped
+    /// writes that, and an update's quit writes its list even with nothing
+    /// cut, so the update after does not bring that terminal back.
+    #[test]
+    fn a_terminal_a_plain_launch_left_stopped_stays_stopped_after_an_update() {
+        let disk = FakeIo::default();
+        let mut list = List::defaults(&[Tool::Claude]);
+        list.terminals[0].session = Some("0b1c2d3e-0000-4000-8000-000000000001".to_owned());
+        disk.0.lock().unwrap().content = Some(list.to_json());
+        {
+            let scene = scene_with("plain-then-update", &disk, RETRY);
+            let view = scene.relay.terminals().view();
+            assert!(!view.terminals[0].desired_running);
+            let saved = List::parse(disk.0.lock().unwrap().content.as_deref().unwrap()).unwrap();
+            assert!(!saved.terminals[0].running, "written at launch");
+            let writes = disk.0.lock().unwrap().writes;
+            assert!(scene.relay.mark_cut_by_update(Duration::from_secs(5)));
+            assert!(
+                disk.0.lock().unwrap().writes > writes,
+                "an update's quit writes even with nothing cut"
+            );
+        }
+        let saved = List::parse(disk.0.lock().unwrap().content.as_deref().unwrap()).unwrap();
+        assert!(!saved.terminals[0].running);
+        let scene = scene_launch("plain-then-update-2", &disk, RETRY, None, true);
+        assert!(!scene.relay.terminals().view().terminals[0].desired_running);
+    }
+
+    /// ADR 0030: an update's quit that cuts nothing still says when its list
+    /// could not be written, since the next launch restores from it.
+    #[test]
+    fn an_update_quit_with_nothing_cut_reports_a_failed_write() {
+        let disk = FakeIo::default();
+        disk.0.lock().unwrap().content = Some(List::defaults(&[Tool::Claude]).to_json());
+        let scene = scene_with("update-write-fails", &disk, RETRY);
+        disk.0.lock().unwrap().fail_write = true;
+        assert!(!scene.relay.mark_cut_by_update(Duration::from_secs(5)));
+    }
+
+    /// ADR 0030 (t8): the update's restore is the first one only: a project
+    /// chosen later restores as after a quit.
+    #[test]
+    fn only_the_first_restore_after_an_update_brings_back_idle_terminals() {
+        let disk = FakeIo::default();
+        let list = List::defaults(&[Tool::Claude]);
+        let idle = list.to_json();
+        disk.0.lock().unwrap().content = Some(idle.clone());
+        let scene = scene_launch("first-restore", &disk, RETRY, None, true);
+        assert!(scene.relay.terminals().view().terminals[0].desired_running);
+        wait_for("settled", || settled(&scene));
+        disk.0.lock().unwrap().content = Some(idle);
+        let other = scene.root.join("home/other");
+        fs::create_dir_all(&other).unwrap();
+        scene.relay.registry.choose_project(&other).unwrap();
+        // Waited for, not looked at once: the view is published after the
+        // choice. Restored as after the update, it would never show stopped.
+        wait_for("the chosen project restored as after a quit", || {
+            scene
+                .relay
+                .terminals()
+                .view()
+                .terminals
+                .first()
+                .is_some_and(|e| !e.desired_running)
+        });
+    }
+
+    #[test]
+    fn restoring_an_interrupted_app_session_waits_for_an_explicit_start() {
+        let disk = FakeIo::default();
+        let mut list = List::defaults(&[Tool::Claude]);
+        let app = &mut list.terminals[0];
+        app.name = Some(connecto_core::session::APP_SESSION.to_owned());
+        app.working = true;
+        disk.0.lock().unwrap().content = Some(list.to_json());
+        let scene = scene_with("app-session-restore", &disk, RETRY);
+        let view = scene.relay.terminals().view();
+        assert_eq!(view.terminals[0].state, TermActivity::NotStarted);
+        assert!(!view.terminals[0].desired_running);
+    }
+
+    /// The phone starts the app session with no effort: it launches on
+    /// high, its analyses being the point of it, while any other terminal
+    /// added without one keeps the tool's own.
+    #[test]
+    fn the_app_session_launches_on_high_effort() {
+        let scene = scene("app-session-effort");
+        let control = scene.relay.terminals();
+        let app = control
+            .add_with(
+                ToolKind::Claude,
+                Some(connecto_core::session::APP_SESSION.into()),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let other = control
+            .add_with(ToolKind::Claude, Some("plain".into()), None, None, None)
+            .unwrap();
+        let effort = |id: &str| {
+            scene
+                .relay
+                .shared
+                .slot_by_id(id)
+                .unwrap()
+                .pane
+                .launch_effort()
+        };
+        assert_eq!(effort(&app).as_deref(), Some("high"));
+        assert_eq!(effort(&other), None);
+    }
+
+    #[test]
+    fn repeated_app_creations_reuse_the_first_provider_and_entry() {
+        let scene = scene("app-session");
+        let control = scene.relay.terminals();
+        let add = |tool| {
+            control
+                .add_with(
+                    tool,
+                    Some(connecto_core::session::APP_SESSION.into()),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+        assert_eq!(add(ToolKind::Pi), add(ToolKind::Claude));
+        let view = control.view();
+        let chats: Vec<_> = view
+            .terminals
+            .iter()
+            .filter(|e| e.name.as_deref() == Some(connecto_core::session::APP_SESSION))
+            .collect();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].tool, ToolKind::Pi);
+    }
+
     /// `add_with` answers with the id of the terminal it made, and that
     /// terminal is already in the view when the id is known. A refused add
     /// answers with the reason instead.
@@ -2449,6 +3541,49 @@ mod tests {
         let bad = control.add_with(ToolKind::Claude, None, None, Some("--last".into()), None);
         assert!(bad.is_err());
         assert_eq!(view.terminals.len(), control.view().terminals.len());
+    }
+
+    /// A terminal that opens with a prompt on a model (Settings > CLI
+    /// improvements): named, on that model from its first start, and its id
+    /// given back. A model that is not one, or a shell with one, is refused.
+    #[test]
+    fn add_prompted_starts_a_named_terminal_on_its_model() {
+        use connecto_core::cli_improvements::{INSIGHTS_MODEL, INSIGHTS_TERMINAL, insights_prompt};
+        let disk = FakeIo::default();
+        let scene = scene_with("addprompted", &disk, RETRY);
+        let control = scene.relay.terminals();
+        let id = control
+            .add_prompted(
+                ToolKind::Claude,
+                INSIGHTS_TERMINAL.into(),
+                insights_prompt(),
+                Some(INSIGHTS_MODEL.into()),
+            )
+            .unwrap();
+        let view = control.view();
+        let entry = view.terminals.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(entry.name.as_deref(), Some(INSIGHTS_TERMINAL));
+        assert_eq!(entry.tool, ToolKind::Claude);
+        let saved: serde_json::Value =
+            serde_json::from_str(disk.0.lock().unwrap().content.as_deref().unwrap()).unwrap();
+        let text = saved.to_string();
+        assert!(
+            text.contains(&format!("\"{INSIGHTS_MODEL}\"")),
+            "kept on its model: {text}"
+        );
+        let count = view.terminals.len();
+        for (tool, model) in [
+            (ToolKind::Claude, "--dangerously-skip-permissions"),
+            (ToolKind::Shell, "opus"),
+        ] {
+            assert!(
+                control
+                    .add_prompted(tool, "x".into(), "hi".into(), Some(model.into()))
+                    .is_err(),
+                "{tool:?} {model}"
+            );
+        }
+        assert_eq!(control.view().terminals.len(), count, "nothing made");
     }
 
     /// T54: an add whose write fails leaves no slot, no process, and `next`.
@@ -2718,7 +3853,7 @@ mod tests {
         let refused = scene.relay.registry.agent_add(
             Tool::Claude,
             None,
-            None,
+            AgentLaunch::default(),
             None,
             epoch,
             Duration::from_secs(5),
@@ -2729,7 +3864,7 @@ mod tests {
         let stale = scene.relay.registry.agent_add(
             Tool::Claude,
             None,
-            None,
+            AgentLaunch::default(),
             None,
             epoch,
             Duration::from_secs(5),
@@ -2861,6 +3996,27 @@ mod tests {
         assert_eq!(name_of(&scene, &id), None);
     }
 
+    /// A first prompt the model does instead of titling (a spec full of
+    /// orders) fails the run: the start of the prompt is the name, as for a
+    /// child terminal, since there is no second run.
+    #[test]
+    fn a_failed_first_title_names_the_terminal_from_its_first_prompt() {
+        let (scene, id) = titled(
+            "t-auto-fail",
+            Ok("Here is the plan for the feature. First, the database."),
+            None,
+        );
+        prompt(&scene, &id, "add the jobs table\nthen check it");
+        let run = finished(&scene);
+        assert!(matches!(
+            run.status,
+            connecto_core::UtilityStatus::Failed { .. }
+        ));
+        wait_for("the fallback name", || {
+            name_of(&scene, &id).as_deref() == Some("add the jobs table then check it")
+        });
+    }
+
     /// A name the user gave before the first prompt is never titled over.
     #[test]
     fn a_named_terminal_is_not_titled_on_its_first_prompt() {
@@ -2990,5 +4146,117 @@ mod tests {
         ));
         assert_eq!(titler.calls.load(Ordering::SeqCst), 1);
         assert_eq!(control.utility_runs().len(), 1);
+    }
+
+    /// A scene with one terminal this test added (the scene starts with its
+    /// own default terminals, which are not the test's).
+    fn one_terminal(name: &str) -> (Scene, String) {
+        let scene = scene(name);
+        let before = ids(&scene);
+        agent_add(&scene, Tool::Claude).unwrap();
+        let id = ids(&scene)
+            .into_iter()
+            .find(|id| !before.contains(id))
+            .unwrap();
+        (scene, id)
+    }
+
+    fn child_of(scene: &Scene, parent: &str) -> String {
+        let epoch = scene.relay.shared.pause().epoch();
+        let before = ids(scene);
+        scene
+            .relay
+            .registry
+            .agent_add(
+                Tool::Claude,
+                None,
+                AgentLaunch::default(),
+                Some(parent.to_owned()),
+                epoch,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        ids(scene)
+            .into_iter()
+            .find(|id| !before.contains(id))
+            .unwrap()
+    }
+
+    /// A job's terminal marks what it starts, and what those start, at
+    /// creation, whatever their names; other terminals are never marked.
+    #[test]
+    fn a_jobs_terminal_marks_what_it_starts_for_good() {
+        let (scene, other) = one_terminal("job-lineage");
+        let control = scene.relay.terminals();
+        let epoch = scene.relay.shared.pause().epoch();
+        let job = control
+            .add_work(
+                connecto_core::ToolKind::Claude,
+                "renamed later".into(),
+                "work".into(),
+                None,
+                None,
+                epoch,
+            )
+            .unwrap();
+        let child = child_of(&scene, &job);
+        let grandchild = child_of(&scene, &child);
+        let plain = child_of(&scene, &other);
+        let marked = |id: &str| {
+            scene
+                .relay
+                .shared
+                .slot_by_id(id)
+                .is_some_and(|slot| slot.job.load(Ordering::SeqCst))
+        };
+        for id in [&job, &child, &grandchild] {
+            assert!(marked(id), "{id}");
+        }
+        assert!(!marked(&other) && !marked(&plain));
+        // A name is no authority: renamed, they are still a job's.
+        control.rename(&job, Some("plain name".into())).unwrap();
+        control.rename(&child, Some("plain name 2".into())).unwrap();
+        assert!(marked(&job) && marked(&child));
+        // Closing the job's terminal, however it is closed, closes what it
+        // started with it: nothing it started is left running unmarked.
+        control.close(&job).unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while [&job, &child, &grandchild]
+            .iter()
+            .any(|id| ids(&scene).contains(*id))
+        {
+            assert!(Instant::now() < until, "the job's terminals did not close");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ids(&scene).contains(&other) && ids(&scene).contains(&plain));
+    }
+
+    #[test]
+    fn a_child_added_after_the_listing_makes_the_peer_close_refused_and_nothing_closed() {
+        let (scene, parent) = one_terminal("within-refused");
+        let listed = vec![parent.clone()];
+        // A child arrives after the peer looked, and before its close runs.
+        let child = child_of(&scene, &parent);
+        let terminals = scene.relay.terminals();
+        let refused = terminals.close_within(&parent, &listed);
+        assert_eq!(refused, Err(connecto_core::CLOSE_NOT_ALL_LISTED.to_owned()));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(ids(&scene).contains(&parent), "the parent was closed");
+        assert!(ids(&scene).contains(&child), "the child was closed");
+    }
+
+    #[test]
+    fn a_close_within_everything_listed_closes_the_whole_tree() {
+        let (scene, parent) = one_terminal("within-tree");
+        let child = child_of(&scene, &parent);
+        let terminals = scene.relay.terminals();
+        terminals
+            .close_within(&parent, &[parent.clone(), child.clone()])
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        wait_for("the tree to close", || {
+            let now = ids(&scene);
+            !now.contains(&parent) && !now.contains(&child)
+        });
     }
 }

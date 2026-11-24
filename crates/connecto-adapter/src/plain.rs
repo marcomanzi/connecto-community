@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use connecto_core::{AuthState, Readiness};
 
 use crate::spec::{
-    AdapterError, Capabilities, Continuation, HookCtx, LaunchCtx, LaunchSpec, LogMark, LoginCtx,
-    ToolAdapter,
+    AdapterError, Capabilities, ComposerView, Continuation, DraftKeys, HookCtx, LaunchCtx,
+    LaunchSpec, LogMark, LoginCtx, Screen, ToolAdapter,
 };
 
 /// A plain shell. See the module comment.
@@ -79,6 +79,22 @@ impl ToolAdapter for Plain {
     }
 
     fn continuation(&self, _prompt: &str) -> Option<Continuation> {
+        None
+    }
+
+    /// A readline line: Enter runs it, Ctrl-C drops it, a pasted newline would
+    /// run part of it.
+    fn draft_keys(&self) -> DraftKeys {
+        DraftKeys {
+            multiline: false,
+            esc_enter_newline: false,
+            ctrl_c_clears: true,
+            collapses_pastes: false,
+        }
+    }
+
+    /// A shell draws no input box of its own.
+    fn composer(&self, _screen: Screen<'_>) -> Option<ComposerView> {
         None
     }
 }

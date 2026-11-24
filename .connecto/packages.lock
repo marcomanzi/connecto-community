@@ -1,123 +1,235 @@
 {
   "files": {
+    ".agents/skills/agentic-works/SKILL.md": {
+      "hash": "015731cc7ca8cb95b6410545f1c664ba5fda3acdcb927c04412ec5ecfae7721a",
+      "package": "connecto"
+    },
     ".agents/skills/brainstorm-team/agents/openai.yaml": {
       "hash": "a1499d95abd8447558c535fe5554adcc3c9b988a0a39264a6283d430effe1e94",
       "package": "connecto"
     },
+    ".agents/skills/brainstorm-team/roles/architect.md": {
+      "hash": "20f91877747cd743390a3ae0fc3018e93c730396bb255001c52eccf4edf1bf2b",
+      "package": "connecto"
+    },
+    ".agents/skills/brainstorm-team/roles/critic.md": {
+      "hash": "89fbb82e572539a7a89eae802c8eae2115b416ba1a716b6435d259f5470e435f",
+      "package": "connecto"
+    },
+    ".agents/skills/brainstorm-team/roles/doc-analyst.md": {
+      "hash": "658e51069d882df91e069e8d53db04452e80cd71bab28dc7ed01ae6dce780e5b",
+      "package": "connecto"
+    },
+    ".agents/skills/brainstorm-team/roles/requirements-challenger.md": {
+      "hash": "a21a86a30f301f470735b09f84190d27dc71ef8b91d31fba3d2146600b8300e5",
+      "package": "connecto"
+    },
+    ".agents/skills/brainstorm-team/roles/spec-writer.md": {
+      "hash": "fbc8c58566fb211f50ee85040098cf3b1ed8638381fa91132620db3ae9bd4e19",
+      "package": "connecto"
+    },
     ".agents/skills/daily-team/SKILL.md": {
-      "hash": "91185be02d0aba91e57459c5dd3b5956928498254e43b8b9c908ed5b9e464909",
+      "hash": "936b84dd7c39b588d9a73c1d40068fe3e77816a4fb5579d4d66098d388226ae6",
       "package": "connecto"
     },
     ".agents/skills/daily-team/agents/openai.yaml": {
-      "hash": "a1499d95abd8447558c535fe5554adcc3c9b988a0a39264a6283d430effe1e94",
+      "hash": "8619a54e8c098122a7f3881394f84ca89b684366e848233a29ad18b6ec363935",
+      "package": "connecto"
+    },
+    ".agents/skills/daily-team/roles/coder.md": {
+      "hash": "9c21f51b31237a7e672c9618de538ccfa19a4d3e8e692e97f5fd4f4fcde89671",
+      "package": "connecto"
+    },
+    ".agents/skills/daily-team/roles/reviewer.md": {
+      "hash": "ff7218b919b5cce0f5a62d8682c3cb26afad1b6af1311fa72f70d854dac4b053",
       "package": "connecto"
     },
     ".agents/skills/dev-team/SKILL.md": {
-      "hash": "1e2066a5653ef3645f10c11f60354a3f8ee0f5666f93269c608ed4d07f4d3bfe",
+      "hash": "0f08ecefa70d15b9568b7bde7f18c68aa44acc6a65c64895181a125eed40d80e",
       "package": "connecto"
     },
     ".agents/skills/dev-team/agents/openai.yaml": {
       "hash": "a1499d95abd8447558c535fe5554adcc3c9b988a0a39264a6283d430effe1e94",
       "package": "connecto"
     },
-    ".agents/skills/dev-team/scripts/review-rules.md": {
-      "hash": "c49d6e90de2d8f7ff602755787843f44f8d858499e75a74b079b762c6d3868de",
+    ".agents/skills/dev-team/roles/backend.md": {
+      "hash": "9d841507aeeaf3e88e4f78453fc10c744194b7f6b49f009d4211a03a04e23e96",
       "package": "connecto"
     },
-    ".claude/agents/backend.md": {
-      "hash": "2d17ed5ece71f9d97d054b3d11af8dd8e9ea7ecbf6eb250e9eb669e383631c87",
+    ".agents/skills/dev-team/roles/finalizer.md": {
+      "hash": "06926d5b620cb092cd6998625db10cb0d5062b99247e12f84d2c6705d3c88ad0",
       "package": "connecto"
     },
-    ".claude/agents/developer.md": {
-      "hash": "e525e50f2662e30e96279be6d3b26fb8bd71b062fc2268ce51563627944e0a19",
+    ".agents/skills/dev-team/roles/frontend.md": {
+      "hash": "17ed3e4c3db5f30c67e6c98b95026d7a5978c93ed097826a872c7247e3ad6f43",
       "package": "connecto"
     },
-    ".claude/agents/finalizer.md": {
-      "hash": "b576c6303bb2edd2791f43883272e4c50e6578fcf00dd301e033e221f52b7ee7",
+    ".agents/skills/dev-team/roles/reviewer.md": {
+      "hash": "acef060d9339100baf9333d24c3dd7bb13334daa6bd29889b2c2ab71a53ae4b3",
       "package": "connecto"
     },
-    ".claude/agents/frontend.md": {
-      "hash": "ca1754d3756182cd28bf80ab3c37a41fee685e7a17e611df1816f84fd7833b0c",
+    ".agents/skills/second-opinion/SKILL.md": {
+      "hash": "664d64d1047e8d5cacf2ea94abae9d74cbbe86269c19ea1549626e0dc97feda3",
       "package": "connecto"
     },
-    ".claude/agents/strong-backend.md": {
-      "hash": "5f9ab735970b966f1c9b0d81ca0574e0ed6e155f810a48a13ee557ca6c174502",
+    ".agents/skills/second-opinion/agents/openai.yaml": {
+      "hash": "a1499d95abd8447558c535fe5554adcc3c9b988a0a39264a6283d430effe1e94",
       "package": "connecto"
     },
-    ".claude/agents/strong-developer.md": {
-      "hash": "fe395c6d0717a856c8f001a40471b6a5eeb380bba19e4cb955aa4e79fe5f30b7",
+    ".claude/rules/connecto-status.md": {
+      "hash": "764c93fe1e7d2612d2d1e5e951c34ec9e729a32ce6fc1642f7f638a82d151ed5",
       "package": "connecto"
     },
-    ".claude/agents/strong-finalizer.md": {
-      "hash": "c8a37dc7bcdfbb4f06152ad2156df32ba23f2bdbb242d15c143a6a19d9ffa2c0",
-      "package": "connecto"
-    },
-    ".claude/agents/strong-frontend.md": {
-      "hash": "0cc72a822c7b6a2f65ce439ea87ce96bbf699b8cfc79107d850f1d794dcd264b",
+    ".claude/scripts/statusline.ps1": {
+      "hash": "434003e3d1b9d28936456d286c46e553249d09049fb55fd3ef4be392d0c46ecf",
       "package": "connecto"
     },
     ".claude/scripts/statusline.sh": {
       "hash": "ea96b54c5d1712f87bd792d35b7b892cae9e0d0e08897b826bf399e582b7f649",
       "package": "connecto"
     },
+    ".claude/scripts/subagent-statusline.ps1": {
+      "hash": "78edfd8e6c6e466fb830be20eee249d7f4b9f80e538f5c66bd5ea740336bb04b",
+      "package": "connecto"
+    },
     ".claude/scripts/subagent-statusline.sh": {
       "hash": "fd8429dd263e88ae7301710ddcd5159e136521a0bbff2cd901a0dd1b90ccf3fa",
       "package": "connecto"
     },
+    ".claude/skills/agentic-works/SKILL.md": {
+      "hash": "06b4b1bc490d1e5a14b2d6f07502b1bb09e53e0f1bddad27654ceef850d10660",
+      "package": "connecto"
+    },
+    ".claude/skills/brainstorm-team/SKILL.md": {
+      "hash": "034296f542cbb38df60432d5180f9c016fafb0ee8bc2e856be048c9276363270",
+      "package": "connecto"
+    },
+    ".claude/skills/brainstorm-team/roles/architect.md": {
+      "hash": "20f91877747cd743390a3ae0fc3018e93c730396bb255001c52eccf4edf1bf2b",
+      "package": "connecto"
+    },
+    ".claude/skills/brainstorm-team/roles/critic.md": {
+      "hash": "89fbb82e572539a7a89eae802c8eae2115b416ba1a716b6435d259f5470e435f",
+      "package": "connecto"
+    },
+    ".claude/skills/brainstorm-team/roles/doc-analyst.md": {
+      "hash": "658e51069d882df91e069e8d53db04452e80cd71bab28dc7ed01ae6dce780e5b",
+      "package": "connecto"
+    },
+    ".claude/skills/brainstorm-team/roles/requirements-challenger.md": {
+      "hash": "a21a86a30f301f470735b09f84190d27dc71ef8b91d31fba3d2146600b8300e5",
+      "package": "connecto"
+    },
+    ".claude/skills/brainstorm-team/roles/spec-writer.md": {
+      "hash": "fbc8c58566fb211f50ee85040098cf3b1ed8638381fa91132620db3ae9bd4e19",
+      "package": "connecto"
+    },
     ".claude/skills/daily-team/SKILL.md": {
-      "hash": "7b756caa5f89abfb32aa1d614178b72d0d583883eb236bcbc9b0b81aaf944581",
+      "hash": "515421d0791d3180d96dff809c8ed8914a77fd08f8bcb14461142e985f32bc22",
+      "package": "connecto"
+    },
+    ".claude/skills/daily-team/roles/coder.md": {
+      "hash": "9c21f51b31237a7e672c9618de538ccfa19a4d3e8e692e97f5fd4f4fcde89671",
+      "package": "connecto"
+    },
+    ".claude/skills/daily-team/roles/reviewer.md": {
+      "hash": "ff7218b919b5cce0f5a62d8682c3cb26afad1b6af1311fa72f70d854dac4b053",
       "package": "connecto"
     },
     ".claude/skills/dev-team/SKILL.md": {
-      "hash": "2d0ac302e3eb1d64e8035d9999fc33480cdde63b93a061806d4f70c639c34850",
+      "hash": "52ee956ef00018e20cdc36093f61e73d2cb585537ebe745ea9b0684a8d357a55",
       "package": "connecto"
     },
-    ".claude/skills/dev-team/scripts/review-rules.md": {
-      "hash": "c49d6e90de2d8f7ff602755787843f44f8d858499e75a74b079b762c6d3868de",
+    ".claude/skills/dev-team/roles/backend.md": {
+      "hash": "9d841507aeeaf3e88e4f78453fc10c744194b7f6b49f009d4211a03a04e23e96",
       "package": "connecto"
     },
-    ".codex/agents/backend.toml": {
-      "hash": "7b2edab20b1a5b00dbabc382de54840225f009735196f41a883cba5af27d9958",
+    ".claude/skills/dev-team/roles/finalizer.md": {
+      "hash": "06926d5b620cb092cd6998625db10cb0d5062b99247e12f84d2c6705d3c88ad0",
       "package": "connecto"
     },
-    ".codex/agents/developer.toml": {
-      "hash": "ac05c5071e94540cf6616865de91b14162ac38190af7c5a14a966023a899e89b",
+    ".claude/skills/dev-team/roles/frontend.md": {
+      "hash": "17ed3e4c3db5f30c67e6c98b95026d7a5978c93ed097826a872c7247e3ad6f43",
       "package": "connecto"
     },
-    ".codex/agents/finalizer.toml": {
-      "hash": "50b101ba7478a47a2db1cbc3d1f275f0cbabe00d1be229a9633e28268ab1e8ee",
+    ".claude/skills/dev-team/roles/reviewer.md": {
+      "hash": "acef060d9339100baf9333d24c3dd7bb13334daa6bd29889b2c2ab71a53ae4b3",
       "package": "connecto"
     },
-    ".codex/agents/frontend.toml": {
-      "hash": "5535fb42ea023257cda26938826b0227136b6b27143d7abb3b21eb8b5f69cb2e",
-      "package": "connecto"
-    },
-    ".codex/agents/strong_backend.toml": {
-      "hash": "f18ac98d72d45bc4d4f8c23d3d1baed1816c296a31d0a6eee491577d9b060e4a",
-      "package": "connecto"
-    },
-    ".codex/agents/strong_developer.toml": {
-      "hash": "453d7c90fdfcf507764e841576ef6a173f0801888942e2f57b0c68785da33083",
-      "package": "connecto"
-    },
-    ".codex/agents/strong_finalizer.toml": {
-      "hash": "24043823595444e4e80f475fc47213169be2bea4aab6c223cd6c0d6a8668657e",
-      "package": "connecto"
-    },
-    ".codex/agents/strong_frontend.toml": {
-      "hash": "0bdd09825682645e09d7807bcc43b59b227a64d021446403f51b68cee29adbd1",
+    ".claude/skills/second-opinion/SKILL.md": {
+      "hash": "20391e24cb92847db795c9e61b60b3b7a3685f649f58257909ea7d3d52729f37",
       "package": "connecto"
     }
   },
   "packages": [
     {
-      "hash": "ae0a3d08d9944e86fcd3339daadf4f194a930b855527cd07b52a305dfb3a8def",
+      "hash": "71d05e42a70fdc0a12861a6cd98d2f1c25265af0f3c62477a2d69ad46e1f4de0",
       "id": "connecto",
-      "version": 1
+      "version": 10
     }
   ],
   "settings": {
     "added": [
+      {
+        "kind": "value",
+        "path": [
+          "enabledPlugins",
+          "code-simplifier@anthropic-plugin-directory"
+        ],
+        "value": true
+      },
+      {
+        "kind": "value",
+        "path": [
+          "enabledPlugins",
+          "codex@openai-codex"
+        ],
+        "value": true
+      },
+      {
+        "kind": "value",
+        "path": [
+          "enabledPlugins",
+          "frontend-design@anthropic-plugin-directory"
+        ],
+        "value": true
+      },
+      {
+        "kind": "value",
+        "path": [
+          "extraKnownMarketplaces",
+          "openai-codex",
+          "source",
+          "repo"
+        ],
+        "value": "openai/codex-plugin-cc"
+      },
+      {
+        "kind": "value",
+        "path": [
+          "extraKnownMarketplaces",
+          "openai-codex",
+          "source",
+          "source"
+        ],
+        "value": "github"
+      },
+      {
+        "kind": "value",
+        "path": [
+          "statusLine",
+          "command"
+        ],
+        "value": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/scripts/statusline.sh\""
+      },
+      {
+        "kind": "value",
+        "path": [
+          "statusLine",
+          "type"
+        ],
+        "value": "command"
+      },
       {
         "kind": "value",
         "path": [

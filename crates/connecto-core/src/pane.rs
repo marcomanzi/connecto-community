@@ -72,4 +72,16 @@ pub trait PaneControl: Send + Sync {
 
     /// Hook frames refused since the session started.
     fn rejected_hook_frames(&self) -> u64;
+
+    /// Connecto is typing into the terminal by itself (a message from another
+    /// terminal, a notice): the user's keys wait until it is done.
+    fn injecting(&self) -> bool {
+        false
+    }
+
+    /// A message waits for the user to send or clear what they are typing in
+    /// the terminal.
+    fn message_waiting(&self) -> bool {
+        false
+    }
 }

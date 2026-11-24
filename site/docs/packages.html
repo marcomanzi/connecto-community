@@ -56,13 +56,14 @@
 </ul>
 
 <h2>The built-in package</h2>
-<p>Connecto ships one package, and it is the default until you pick another. It contains team workflows in which each tool is reviewed by the other:</p>
+<p>Connecto's built-in package is the default until you pick another. It contains team workflows in which every role runs in a Connecto terminal of its own, and a reviewer checks each coder's work:</p>
 <ul>
-  <li><strong>Skills</strong>: <code>brainstorm-team</code>, <code>dev-team</code>, <code>strong-dev-team</code>, <code>daily-team</code> and <code>strong-daily-team</code>. They run only when you invoke them.</li>
-  <li><strong>Subagents</strong>: architect, backend, frontend, developer, finalizer, doc-analyst, requirements-challenger and spec-writer.</li>
+  <li><strong>Skills</strong>: <code>daily-team</code> (a coder and a reviewer for everyday work), <code>dev-team</code> (backend and frontend coders, a reviewer per side and a finalizer, in a worktree) and <code>brainstorm-team</code> (an analyst, a requirements challenger, an architect and a spec writer, with independent critics). They run only when you invoke them.</li>
+  <li><strong>Agents</strong>: by what is installed. With Claude and another agent, coders run on Claude Opus and reviewers on Codex (<code>gpt-6.2-astra</code>, medium effort), or on Gemini (<code>gemini-4-argon-medium</code>) when there is no Codex. Without Claude, Codex codes and Gemini reviews. With a single agent, it plays every role. A review that hasn't settled after 3 rounds stops and asks you to choose a compromise.</li>
   <li><strong>Plugin settings</strong> for Claude Code, and a status line showing the model, context use and session cost.</li>
 </ul>
 <p>The built-in package cannot be edited or deleted. To change it, create your own package that extends it.</p>
+<p>A second built-in package, <a href="game-dev.html">Game Dev</a>, is for making games with Godot. It is not the default unless you make it one: add it to the projects that need it, or use <strong>Set as default</strong>. Either way, Connecto checks first that the tools it needs are installed.</p>
 
 <h2>Create a package</h2>
 <ol>
@@ -78,7 +79,7 @@
 <ul>
   <li><strong>DEFAULT PACKAGE</strong>: whether this project uses the default package.</li>
   <li><strong>ADDED PACKAGES</strong>: more packages for this project only.</li>
-  <li><strong>TOOLS</strong>: Claude, Codex or both. Only the chosen tools' files are installed.</li>
+  <li><strong>TOOLS</strong>: Claude, Codex, Pi, Antigravity or All. Only the chosen tools' files are installed (Pi and Antigravity read the skills in <code>.agents/skills</code>).</li>
   <li><strong>STATUS</strong>: what is installed, and a <strong>Refresh</strong> button.</li>
 </ul>
 

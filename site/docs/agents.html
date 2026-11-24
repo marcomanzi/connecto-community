@@ -26,16 +26,19 @@
 <table>
   <tr><th>Command</th><th>What it does</th></tr>
   <tr><td><code>connecto list</code></td><td>The terminals in this project and what each is doing.</td></tr>
-  <tr><td><code>connecto send &lt;id&gt;</code></td><td>Types a message into another terminal. The message is read from standard input.</td></tr>
+  <tr><td><code>connecto send &lt;id&gt; 'message'</code></td><td>Types a message into another terminal. With no message after the id, it is read from standard input.</td></tr>
   <tr><td><code>connecto send &lt;id&gt; --ask</code></td><td>Asks a question. Prints a request id; the answer is delivered to the asking agent when the other one finishes.</td></tr>
   <tr><td><code>connecto result &lt;request&gt;</code></td><td>Just the final reply to a request.</td></tr>
   <tr><td><code>connecto read &lt;id&gt;</code></td><td>Everything on that terminal's screen and scrollback.</td></tr>
   <tr><td><code>connecto keys &lt;id&gt; &lt;key&gt;…</code></td><td>Presses keys there, for example <code>esc down enter</code>.</td></tr>
+  <tr><td><code>connecto tasks &lt;id&gt; [--stop [task]]</code></td><td>The <a href="terminals.html#background">background work</a> that terminal's agent left running, and for how long. <code>--stop</code> stops its background shells, or only the task named.</td></tr>
   <tr><td><code>connecto watch &lt;id&gt;</code><br><code>connecto unwatch &lt;id&gt;</code></td><td>Be woken on every event in that terminal: it began, finished, was interrupted, needs the user, or exited.</td></tr>
-  <tr><td><code>connecto add claude|codex|shell [--name &lt;text&gt;]</code></td><td>Opens a new terminal, as a child of this one.</td></tr>
+  <tr><td><code>connecto add claude|codex|pi|antigravity|opencode|shell [--name &lt;text&gt;] [--model &lt;model&gt;] [--effort &lt;level&gt;]</code></td><td>Opens a new terminal, as a child of this one. <code>--model</code> picks the agent's model; for Pi and OpenCode it is <code>provider/model</code>, such as <code>openrouter/&lt;id&gt;</code> or <code>lmstudio/&lt;id&gt;</code>. <code>--effort</code> picks its reasoning effort, in the agent's own words (<code>low</code>, <code>medium</code>, <code>high</code>…). Both are kept with the terminal, so a restart uses them too.</td></tr>
   <tr><td><code>connecto start &lt;id&gt;</code></td><td>Starts a terminal that is not running.</td></tr>
   <tr><td><code>connecto close &lt;id&gt;</code></td><td>Stops a terminal and moves it to the history.</td></tr>
 </table>
+
+<p>When <a href="memory.html">project memory</a> is on for the project, the same terminals also get the <code>connecto memory</code> commands. They read the project's memory and leave notes for it.</p>
 
 <h2>Driving a shell terminal</h2>
 <p>A <code>shell</code> terminal is your login shell, not an agent, so it has no turns. Run a command in it with <code>connecto send shell '&lt;one command line&gt;'</code> (one line per send; use <code>;</code> or <code>&amp;&amp;</code> to join commands) and look at the result with <code>connecto read shell</code>, waiting a moment for a slow command. <code>connecto keys shell ctrl-c</code> interrupts it. <code>send --ask</code>, <code>watch</code> and <code>result</code> are refused for a shell, with a message that says to use send and read.</p>
@@ -49,6 +52,12 @@ Review the migration in db/2031_orders.sql. Is anything unsafe
 to run on a table with live writes?
 EOF</pre>
 <p>The new terminal appears in the sidebar under the one that opened it, so you can watch the reviewer work and step in at any point.</p>
+
+<h2>Whose terminal is it</h2>
+<p>A terminal an agent opens with <code>connecto add</code> belongs to that agent. Only it, and the other terminals it opened, can send to it, press keys in it, start it or close it; any other agent is refused and told to open its own. Reading and watching stay open to all. <code>connecto list</code> marks such terminals <em>yours</em> or <em>belongs to &lt;id&gt;</em>. Terminals you open yourself belong to nobody and every agent can use them.</p>
+
+<h2>Agents working together</h2>
+<p>Terminals opened by the same agent talk to each other directly. To have two of them do something together, a review, a back-and-forth, a game, ask one of them and give it the other's id: it runs the exchange with <code>send --ask</code> and answers once, at the end. While it waits on its own asks, the first ask stays open, so the agent that started it is woken only when the work is done, not after every exchange.</p>
 
 <h2>What you should know</h2>
 <ul>

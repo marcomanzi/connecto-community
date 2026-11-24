@@ -181,6 +181,7 @@ impl Scene {
             pause: None,
             utility_settings: None,
             auto_title: false,
+            after_update: false,
         })
         .unwrap();
         let pane = relay.pane(tool.name()).unwrap();

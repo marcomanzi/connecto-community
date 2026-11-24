@@ -16,6 +16,17 @@ pub(crate) struct Known {
     started: (u64, u64),
 }
 
+impl Known {
+    /// A process for a test that never signals it: `pid`, started at `at`.
+    #[cfg(test)]
+    pub(crate) fn for_tests(pid: i32, at: u64) -> Self {
+        Self {
+            pid,
+            started: (at, 0),
+        }
+    }
+}
+
 fn info(pid: i32) -> Option<BSDInfo> {
     pidinfo::<BSDInfo>(pid, 0).ok()
 }

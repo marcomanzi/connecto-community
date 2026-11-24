@@ -51,8 +51,8 @@ const MICROSOFT_RUNTIME_LIBRARIES: [&str; 6] = [
 /// by its exact path in the release: ripgrep, which OpenAI ships unsigned
 /// (Codex 0.167.2, npm and standalone installer alike). It is still copied,
 /// hashed and checked against its digest before every use like every other
-/// file; only its origin is not proven by a signature. Any other unsigned
-/// program refuses the release.
+/// file; only its origin is not proven by a signature. Decision D-3 in
+/// docs/windows-port.md. Any other unsigned program refuses the release.
 pub const CODEX_UNSIGNED_RG: &str = "codex-path/rg.exe";
 
 /// The switch for [`CODEX_UNSIGNED_RG`]: `true` accepts that one unsigned
@@ -204,6 +204,29 @@ pub(crate) fn data_root_in(appdata: Option<OsString>, home: &Path) -> PathBuf {
         .filter(|dir| dir.is_absolute())
         .unwrap_or_else(|| home.join("AppData").join("Roaming"))
         .join("connecto")
+}
+
+/// The variables a launcher script (Pi's `pi.cmd`) is run with besides
+/// `PATH`, when the rest of the environment is cleared: Windows itself
+/// (`SystemRoot`, without which `cmd.exe` and Node.js misbehave) and the
+/// user's folders under `home`. Pi's launcher finds the Node.js installed for
+/// it by `%LOCALAPPDATA%` (`pi-node\current\node.exe`); without it, it runs
+/// the first `node` on the `PATH`, which may be too old for Pi.
+#[must_use]
+pub fn launcher_env(home: &Path) -> Vec<(OsString, OsString)> {
+    let root = std::env::var_os("SystemRoot")
+        .filter(|root| Path::new(root).is_absolute())
+        .unwrap_or_else(|| OsString::from(r"C:\Windows"));
+    let app_data = home.join("AppData");
+    vec![
+        ("SystemRoot".into(), root),
+        ("USERPROFILE".into(), home.as_os_str().to_owned()),
+        ("APPDATA".into(), app_data.join("Roaming").into_os_string()),
+        (
+            "LOCALAPPDATA".into(),
+            app_data.join("Local").into_os_string(),
+        ),
+    ]
 }
 
 /// Unix modes do not exist on Windows: nothing is changed.

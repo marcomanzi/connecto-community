@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Game Dev package · Connecto docs</title>
+<meta name="description" content="A built-in package for making games in Godot with coding agents: design, the Godot workflow, art from Blender scripts and playtests. Connecto checks for Godot (and, from 0.3.11, Blender and FFmpeg) and installs them once you agree.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="game-dev">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Game Dev package</h1>
+<p class="lead">A built-in package for making games in Godot with coding agents. It brings the skills; Connecto makes sure Godot is on the machine, and from version 0.3.11 Blender and FFmpeg too.</p>
+
+<p>Game Dev is a <a href="packages.html">Skills &amp; Plugins package</a> that ships with Connecto, next to the default one. It is not the default: you add it to the projects where you make a game. Its skills are written for Godot 4 and GDScript, and for agents that work without the editor open: they build, check, test and look at the game from the command line.</p>
+
+<div class="shots">
+  <figure class="wide">
+    <img src="../assets/img/game-dev/roots-ruins-farm.webp" width="1600" height="900" loading="lazy" alt="An isometric 3D farm at noon: tilled plots with sprouting crops inside a wooden fence, a stone well, round green trees, a river along the left edge, a greenhouse and a mine entrance in the rocks.">
+    <figcaption>Roots &amp; Ruins, a farming game with a roguelite in its mines, made with Game Dev in Godot 4.7.</figcaption>
+  </figure>
+</div>
+
+<h2>What it does</h2>
+<p>It gives your agents a way to make a game that holds together as it grows:</p>
+<ul>
+  <li><strong>Design first, and small.</strong> A one-page design and milestones whose "done" can be seen in a screenshot or a video.</li>
+  <li><strong>Every change checked.</strong> Godot runs headless to import, check scripts and run the tests, so an agent sees an error before you do.</li>
+  <li><strong>Real 3D art.</strong> Models come from Blender Python scripts, run without the Blender window and exported as <code>.glb</code> for Godot.</li>
+  <li><strong>Playtests that look.</strong> A bot plays the game with fixed seeds; the playtester judges it on screenshots, frames pulled from recordings, and logs, and files bugs instead of fixing them.</li>
+  <li><strong>Many sessions at once.</strong> A guide for a coordinator who hands the game out to gameplay coders, art sessions and reviewers in parallel Connecto terminals.</li>
+</ul>
+
+<h2>The skills</h2>
+<p>Each skill runs when the request fits it, or when you name it.</p>
+
+<h3>game-design</h3>
+<p>Turns an idea into <code>design/gdd.md</code>: a one-page design kept to the size of one developer, the first slice to build, and milestones checked by evidence. It asks only what it cannot guess (genre, 2D or 3D, platforms, art style, time). A design you already wrote is condensed faithfully, not rewritten.</p>
+<p>Its team guide is for running many sessions on one game: gameplay first on placeholder art, art made in parallel as files only, then a separate integration step; folders each session owns; a contract between gameplay and art (clip names, attachment points); and a commit at every milestone that passes its playtest.</p>
+
+<h3>godot-game</h3>
+<p>The Godot workflow, from a new project to an export:</p>
+<ul>
+  <li><strong>Headless</strong>: import, check every change, run the tests, export.</li>
+  <li><strong>Recordings</strong>: the game played and recorded frame by frame with <code>--write-movie</code>. This needs a real display, not a headless run; on macOS the game window must stay visible.</li>
+  <li><strong>A test runner that really fails</strong>: three small files and no add-on. A run passes only when Godot exits 0 and its last line says <code>TESTS RESULT: PASS</code>; an engine error, a missing verdict or a time limit is a failure. GdUnit4 is an option.</li>
+  <li><strong>Godot gotchas</strong>: the traps agents fall into with nodes, time, physics, the camera, imports and saves.</li>
+  <li><strong>Art from Blender</strong>: kits of models built by script, checked after import and then looked at, characters and animation judged on frames.</li>
+  <li>The editor through the godot-ai MCP server, when you want it.</li>
+</ul>
+
+<h3>game-playtest</h3>
+<p>Takes a game from "it compiles" to "it plays". Runs are made repeatable (fixed seeds, a fixed timestep, waits counted in physics ticks, a save file per test). A bot drives the game like a player. The evidence is screenshots, video frames pulled with FFmpeg and logs, and the verdict compares them with the acceptance criteria in the design. The playtester reports; it does not fix, so nobody grades their own work.</p>
+
+<h2>The tools it needs</h2>
+<table>
+  <thead><tr><th>Tool</th><th>Version</th><th>What for</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Godot</strong></td><td>4.7 or a later 4.x</td><td>The engine. Agents build, check, run and export the game with its command line. Godot 5 is not used: the skills are written for Godot 4.</td></tr>
+    <tr><td><strong>Blender</strong></td><td>4.2 or later</td><td>The game's 3D models: agents write Blender Python scripts, run them headless (<code>blender -b -P</code>) and export <code>.glb</code> files.</td></tr>
+    <tr><td><strong>FFmpeg</strong></td><td>4.4 or later</td><td>Pulls frames and contact sheets out of the game's recordings, so agents can look at motion and animation.</td></tr>
+  </tbody>
+</table>
+<p>All three are free and open source. None needs an account or a licence to accept.</p>
+
+<div class="note soon"><p><b>Blender and FFmpeg are checked from Connecto 0.3.11.</b> Earlier versions check for Godot only; install Blender and FFmpeg yourself before you use the art and playtest steps.</p></div>
+
+<h3>How Connecto installs them</h3>
+<p>Connecto looks for each tool where it is usually installed, and reads its version. When one is missing or too old, it offers to install it with your system's package manager:</p>
+<table class="cmds">
+  <thead><tr><th>System</th><th>Godot</th><th>Blender</th><th>FFmpeg</th></tr></thead>
+  <tbody>
+    <tr><td>macOS</td><td><code>brew install --cask godot</code></td><td><code>brew install --cask blender</code></td><td><code>brew install ffmpeg</code></td></tr>
+    <tr><td>Windows</td><td><code>winget install -e --id GodotEngine.GodotEngine</code></td><td><code>winget install -e --id BlenderFoundation.Blender</code></td><td><code>winget install -e --id Gyan.FFmpeg</code></td></tr>
+    <tr><td>Linux</td><td>Flatpak: <code>org.godotengine.Godot</code></td><td>Flatpak: <code>org.blender.Blender</code></td><td>apt-get, dnf, pacman or zypper, whichever is there</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li><strong>Nothing runs without your yes.</strong> The dialog shows the exact command. <strong>Install…</strong> asks again, and only <strong>Run it</strong> opens a shell terminal in the project, named <em>Install &lt;tool&gt;</em>, that types the command once. You watch it work and answer any password or Homebrew prompt there.</li>
+  <li><strong>Or do it by hand.</strong> Each tool also has manual steps and a download link. Once it is installed, click <strong>I've installed it, check again</strong>.</li>
+  <li><strong>No tools, no package.</strong> The package cannot be added while a tool is missing, too old, or still being checked. Cancel leaves it off.</li>
+</ul>
+
+<h2 id="enable">Turn it on for a project</h2>
+<ol>
+  <li>Open the project's settings from the gear on its row, and choose <strong>Packages</strong>.</li>
+  <li>Under <strong>ADDED PACKAGES</strong>, click <strong>+ Game Dev</strong>. If every tool is already installed, the package is added at once.</li>
+  <li>If a tool is missing, too old or still being checked, a dialog opens instead. It lists Godot, Blender and FFmpeg, each found (with its version) or missing. Install what is missing, from the dialog or by hand, then click <strong>Add Game Dev</strong>, which turns on once every tool is found.</li>
+  <li>Connecto copies the skills into the project for the tools set under <strong>TOOLS</strong>: <code>.claude</code> for Claude Code, <code>.agents</code> for Codex, Pi, Antigravity and OpenCode.</li>
+  <li>Restart a running terminal to give it the skills, then ask it for a game, or start with the design: <em>"Use game-design: a small cozy farming game in 3D."</em></li>
+</ol>
+<p>A project that already had Game Dev before 0.3.11 is updated to the new version without being asked. If Blender or FFmpeg is missing, the project's status says so and how to install it, and the skills ask before a step that needs them.</p>
+<p>Some things are offered only when the work needs them, and always with your OK: the GdUnit4 add-on, the godot-ai server, Godot's export templates, downloaded art packs, and a Python environment for image work. Generated concept images come from an agent that can make images, such as Codex; without one, the skills use placeholder art.</p>
+<p>Like the default package, Game Dev cannot be edited or deleted. To change it, create a package that extends it.</p>
+
+<h2>Made with it: Roots &amp; Ruins</h2>
+<p>An isometric 3D farming game with a soulslike roguelite in its mines: farm by day, go down five floors of rooms, fight, and bring back what you find. It was built in Godot 4.7 by one coordinator and about a dozen agent sessions working in parallel. The first three images below are from its playtests; the last is a preview of its models in Godot.</p>
+<div class="shots">
+  <figure>
+    <img src="../assets/img/game-dev/roots-ruins-boss.webp" width="1600" height="900" loading="lazy" alt="A dark stone dungeon lit in purple: a stone guardian slams the ground inside a glowing rune circle, with violet crystals around the room.">
+    <figcaption>The Rune Guardian, at the bottom of the mines.</figcaption>
+  </figure>
+  <figure>
+    <img src="../assets/img/game-dev/roots-ruins-village.webp" width="1600" height="900" loading="lazy" alt="A village square at dusk: a round fountain on a cobbled plaza, market stalls with striped awnings, lanterns and half-timbered houses with red roofs.">
+    <figcaption>The village square at dusk.</figcaption>
+  </figure>
+  <figure>
+    <img src="../assets/img/game-dev/roots-ruins-night.webp" width="1600" height="900" loading="lazy" alt="The farmhouse at night: a campfire glows under a canvas shelter, lit windows and a stone path, with a pink blossom tree in the dark.">
+    <figcaption>The farmhouse at night.</figcaption>
+  </figure>
+  <figure>
+    <img src="../assets/img/game-dev/roots-ruins-art.webp" width="1600" height="1000" loading="lazy" alt="Game models in a row on a green background: leafy trees, a pink blossom tree, a dead tree, a boulder, a workbench, a stone furnace, a chest, a well with a red roof, ore rocks and a lantern post.">
+    <figcaption>Models from Blender scripts, in Godot.</figcaption>
+  </figure>
+</div>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

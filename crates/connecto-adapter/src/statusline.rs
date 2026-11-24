@@ -1,5 +1,5 @@
-//! Claude's status lines on Windows: PowerShell twins of the `.sh` scripts,
-//! so no `bash` or `jq` is needed.
+//! Claude's status lines on Windows (decision D-1, option b of
+//! `docs/windows-port.md` 4.8.4).
 //!
 //! Connecto's builtin packages put a `statusLine` and a `subagentStatusLine`
 //! into the project's `.claude/settings.json` that run `.sh` scripts with

@@ -21,8 +21,9 @@
 <p class="lead">For each project, you choose whether a tool runs with a private profile of its own or with your everyday one. Separately, you choose how much agents may do without asking.</p>
 
 <h2>Isolated or system default</h2>
-<p>Every agent CLI keeps a folder of its own: your login, your settings, your plugins, your conversation history. Connecto lets each project decide which folder a tool uses. The choice is made separately for Claude and for Codex. A new project uses the system default; isolated is an advanced option. A project that an earlier build set up keeps the mode it had.</p>
+<p>Every agent CLI keeps a folder of its own: your login, your settings, your plugins, your conversation history. Connecto lets each project decide which folder a tool uses. The choice is made separately for Claude, Codex and Pi. Antigravity CLI has no way to be pointed at another folder, so it always uses your own <code>~/.gemini</code>. A new project uses the system default; isolated is an advanced option. A project that an earlier build set up keeps the mode it had.</p>
 <p>In system mode Connecto writes nothing into your <code>~/.claude</code> or <code>~/.codex</code>. It hands each launch its hooks on the command line (a settings file kept in Connecto's own run folder for Claude, <code>-c</code> options for Codex) and only reads the tool's transcripts to follow a turn. Anything the tool itself stores there, it stores as it does in your own terminal. Your own settings apply too: if they turn hooks off, Connecto cannot see that terminal's turns.</p>
+<p>Antigravity CLI is the exception: it reads hooks only from its own files, so Connecto keeps one entry, named <code>connecto</code>, in <code>~/.gemini/config/hooks.json</code>, and leaves your other hooks there as they are. Outside a Connecto terminal the entry does nothing.</p>
 
 <table>
   <tr><th></th><th>System default <span class="pill">default</span></th><th>Isolated (advanced)</th></tr>
@@ -54,10 +55,10 @@
 <p>This is a different question: how much may an agent do without asking? It is set once for the whole app, per tool, in <strong>Settings → HOW AGENTS ARE LAUNCHED</strong>.</p>
 
 <table>
-  <tr><th>Mode</th><th>Claude</th><th>Codex</th></tr>
-  <tr><td><strong>Bypass</strong> <span class="pill">default</span></td><td>Skip permission checks.</td><td>Skip approvals and the sandbox.</td></tr>
-  <tr><td><strong>Auto</strong></td><td>A model reviews each action.</td><td>Automatic review, sandboxed.</td></tr>
-  <tr><td><strong>Prompt</strong></td><td>Ask before acting: Claude's normal permission prompts.</td><td>Ask before acting: Codex's normal approvals.</td></tr>
+  <tr><th>Mode</th><th>Claude</th><th>Codex</th><th>Antigravity</th></tr>
+  <tr><td><strong>Bypass</strong> <span class="pill">default</span></td><td>Skip permission checks.</td><td>Skip approvals and the sandbox.</td><td>Skip permission prompts.</td></tr>
+  <tr><td><strong>Auto</strong></td><td>A model reviews each action.</td><td>Automatic review, sandboxed.</td><td>Its auto mode, where your account offers it.</td></tr>
+  <tr><td><strong>Prompt</strong></td><td>Ask before acting: Claude's normal permission prompts.</td><td>Ask before acting: Codex's normal approvals.</td><td>Ask before acting: its normal permission prompts.</td></tr>
 </table>
 
 <ul>

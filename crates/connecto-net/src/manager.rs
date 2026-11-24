@@ -14,6 +14,7 @@
 //!   carrying its endpoint id;
 //! - the Keychain: this machine's own SSH key for dialing it (`remote.pair.<id>`).
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use connecto_core::{
     AuthorizedKeyRow, HostLink, HostRow, HostingStatus, MachineRow, PairingPhase, PendingHost,
-    RemoteControl, RemoteView, TerminalsControl,
+    RemoteControl, RemoteProject, RemoteView, TerminalsControl,
 };
 use connecto_secrets::STORE_NAME;
 use serde_json::{Value, json};
@@ -42,7 +43,7 @@ use crate::pairing::{
 };
 use crate::reconnect::{Dialer, HostHandle, LinkState, SignerSource, SupervisorConfig, spawn};
 use crate::relay_access::{self, RelayAccess};
-use crate::remote_terminals::RemoteTerminals;
+use crate::remote_terminals::{RemoteTerminals, remote_projects};
 use crate::secrets::{RELAY_TOKEN, SecretStore, device_key, pair_key_name};
 use crate::staging::{
     self, LINK_PREFIX, Status, fingerprints_for, link_id, raw_lines_for, staged_comment,
@@ -236,6 +237,10 @@ struct Slot {
     running: bool,
 }
 
+/// Connections whose handshake is not done yet, at most, apart from the peers
+/// being served (which the host bounds itself).
+const MAX_HANDSHAKES: usize = 16;
+
 /// A connection a paired machine has opened to this one.
 struct Inbound {
     seq: u64,
@@ -299,11 +304,14 @@ struct Inner {
 }
 
 pub struct RemoteManager {
+    chat_only: bool,
     cfg: ManagerConfig,
     inner: Mutex<Inner>,
     node: NodeSlot,
     guard: Arc<dyn RemoteGuard>,
     host_service: Arc<HostService>,
+    /// The keys let in now, read again when a handshake ends.
+    keys: KeySource,
     inbound: Arc<Mutex<Vec<Inbound>>>,
     next_seq: AtomicU64,
     /// Serializes changes to the machine records (files and Keychain).
@@ -312,61 +320,6 @@ pub struct RemoteManager {
     listen_epoch: Mutex<u64>,
     shutting_down: AtomicBool,
     me: Mutex<std::sync::Weak<Self>>,
-}
-
-/// Passes every decision to the host's policy, and remembers which connections
-/// are live and under which key, so that a machine's session can be closed.
-struct TrackingGuard {
-    inner: Arc<dyn RemoteGuard>,
-    inbound: Arc<Mutex<Vec<Inbound>>>,
-}
-
-impl RemoteGuard for TrackingGuard {
-    fn enabled(&self) -> bool {
-        self.inner.enabled()
-    }
-    fn set_enabled(&self, on: bool) {
-        self.inner.set_enabled(on);
-    }
-    fn connected(&self, peer: &Peer, outcome: Result<(), &str>) {
-        if outcome.is_ok() {
-            let mut live = self.inbound.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(entry) = live
-                .iter_mut()
-                .find(|e| e.endpoint == peer.endpoint && e.fingerprint.is_empty())
-            {
-                entry.fingerprint.clone_from(&peer.fingerprint);
-            }
-        }
-        self.inner.connected(peer, outcome);
-    }
-    fn attach(&self, peer: &Peer, terminal: &str, attempt: u64) -> Result<(), GuardDenied> {
-        self.inner.attach(peer, terminal, attempt)
-    }
-    fn input(
-        &self,
-        peer: &Peer,
-        terminal: &str,
-        attempt: u64,
-        bytes: &[u8],
-    ) -> Result<(), GuardDenied> {
-        self.inner.input(peer, terminal, attempt, bytes)
-    }
-    fn resize(&self, peer: &Peer, terminal: &str, attempt: u64) -> Result<(), GuardDenied> {
-        self.inner.resize(peer, terminal, attempt)
-    }
-    fn manage(
-        &self,
-        peer: &Peer,
-        action: &'static str,
-        terminal: &str,
-        attempt: u64,
-    ) -> Result<(), GuardDenied> {
-        self.inner.manage(peer, action, terminal, attempt)
-    }
-    fn detach(&self, peer: &Peer, terminal: &str, attempt: u64) {
-        self.inner.detach(peer, terminal, attempt);
-    }
 }
 
 struct IrohDialer {
@@ -537,6 +490,178 @@ impl RemoteManager {
     /// Load the saved state. Hosting starts only if it was turned on.
     #[must_use]
     pub fn start(cfg: ManagerConfig) -> Arc<Self> {
+        Self::start_with_scope(cfg, false)
+    }
+
+    /// Shares pairing and reconnect behavior, attaching only project chat sessions.
+    pub fn start_chat_client(cfg: ManagerConfig) -> Arc<Self> {
+        Self::start_with_scope(cfg, true)
+    }
+
+    /// Every terminal of `project` on host `name`, as the host last listed
+    /// it: on a chat client too, which attaches only the project's chat.
+    /// `None` when there is no such host or the host lists no such project.
+    #[must_use]
+    pub fn project_roster(
+        &self,
+        name: &str,
+        project: &str,
+    ) -> Option<Vec<crate::remote_terminals::RosterTerminal>> {
+        let inner = self.lock();
+        let handle = &inner.slots[Self::index_of(&inner, name)?].handle;
+        handle
+            .listed_projects()
+            .iter()
+            .any(|p| p.id == project)
+            .then(|| handle.roster(project))
+    }
+
+    /// The connected host `name`, for a request that waits for its answer.
+    fn host_handle(&self, name: &str) -> Option<Arc<HostHandle>> {
+        let inner = self.lock();
+        Self::index_of(&inner, name).map(|index| Arc::clone(&inner.slots[index].handle))
+    }
+
+    /// The models host `name` offers for a new `tool` terminal in `project`.
+    /// `None` when that host is from before models. It waits for the host, so
+    /// never call it from the UI thread.
+    ///
+    /// # Errors
+    /// An unknown or disconnected host, or the host's refusal.
+    pub fn models(
+        &self,
+        name: &str,
+        project: &str,
+        tool: connecto_core::ToolKind,
+    ) -> Result<Option<crate::wire::ToolModels>, String> {
+        self.host_handle(name)
+            .ok_or_else(|| format!("no host called \"{name}\""))?
+            .models(tool, project)
+    }
+
+    /// Host `name`'s answer to a Siri ask of `project` (see
+    /// [`crate::siri`]), as JSON. It waits for the host, so never call it
+    /// from the UI thread. A host from before Siri asks fails with words
+    /// [`crate::siri::is_unknown_ask`] recognises.
+    ///
+    /// # Errors
+    /// Not connected, the host's refusal, or an answer that is not JSON.
+    pub fn siri(
+        &self,
+        name: &str,
+        project: &str,
+        ask: &crate::project_panels::ProjectAsk,
+    ) -> Result<serde_json::Value, String> {
+        let bytes = self
+            .host_handle(name)
+            .ok_or_else(|| format!("no host called \"{name}\""))?
+            .project_ask(project, ask)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| "that machine's answer could not be read".to_owned())
+    }
+
+    /// [`Self::siri`] within `wait` in all, whatever the link does: for
+    /// Siri, which answers within a few seconds. Never call it from the UI
+    /// thread.
+    ///
+    /// # Errors
+    /// [`crate::siri::SiriCallError`]: `NotSent` when nothing reached the
+    /// host, `Unconfirmed` when it went but no answer came in time.
+    pub fn siri_within(
+        &self,
+        name: &str,
+        project: &str,
+        ask: &crate::project_panels::ProjectAsk,
+        wait: std::time::Duration,
+    ) -> Result<serde_json::Value, crate::siri::SiriCallError> {
+        use crate::siri::SiriCallError;
+        let client = self
+            .host_handle(name)
+            .and_then(|handle| handle.client())
+            .ok_or_else(|| SiriCallError::NotSent("not connected to that machine".to_owned()))?;
+        let bytes = client.project_ask_within(project, ask, wait)?;
+        // An answer that cannot be read came after the host acted.
+        serde_json::from_slice(&bytes).map_err(|_| SiriCallError::Unconfirmed)
+    }
+
+    /// Host `name`'s functional memory of `project` (ADR 0033): its files and
+    /// where its updates stand, checked and capped again here. With `update`,
+    /// the host is asked to update it first (the answer then says it is
+    /// running). It waits for the host, so never call it from the UI thread.
+    ///
+    /// # Errors
+    /// An unknown or disconnected host, or the host's refusal (a host from
+    /// before functional memory says it does not know the ask).
+    pub fn functional_memory(
+        &self,
+        name: &str,
+        project: &str,
+        update: bool,
+    ) -> Result<
+        (
+            connecto_core::functional_memory::FmFiles,
+            connecto_core::functional_memory::FmStatus,
+        ),
+        String,
+    > {
+        use crate::project_panels::{ProjectAsk, functional_memory_from};
+        let ask = if update {
+            ProjectAsk::FunctionalMemoryUpdate
+        } else {
+            ProjectAsk::FunctionalMemory
+        };
+        let bytes = self
+            .host_handle(name)
+            .ok_or_else(|| format!("no host called \"{name}\""))?
+            .project_ask(project, &ask)?;
+        functional_memory_from(&bytes)
+    }
+
+    /// A chat completion from host `name`'s conversation model, waiting at
+    /// most the request's `wait_ms`. It waits for the host, so never call it from the UI
+    /// thread.
+    ///
+    /// # Errors
+    /// As [`crate::reconnect::HostHandle::complete`]; an unknown host fails.
+    pub fn complete(
+        &self,
+        name: &str,
+        request: &crate::wire::Completion,
+    ) -> Result<String, crate::reconnect::CompletionError> {
+        self.host_handle(name)
+            .ok_or_else(|| {
+                crate::reconnect::CompletionError::Failed(format!("no host called \"{name}\""))
+            })?
+            .complete(request)
+    }
+
+    /// Whether `text` is a finished turn of a voice call, as host `name`
+    /// judges it, waiting at most `wait`. It waits for the host, so never
+    /// call it from the UI thread.
+    #[must_use]
+    pub fn turn_check(
+        &self,
+        name: &str,
+        text: &str,
+        context: &str,
+        wait: std::time::Duration,
+    ) -> crate::wire::TurnVerdict {
+        match self.host_handle(name) {
+            Some(handle) => handle.turn_check(text, context, wait),
+            None => crate::wire::TurnVerdict::Failed(format!("no host called \"{name}\"")),
+        }
+    }
+
+    /// The projects of host `name` with a terminal working now (a turn, or
+    /// background work after one), as of its latest list.
+    #[must_use]
+    pub fn working_projects(&self, name: &str) -> HashSet<String> {
+        self.host_handle(name)
+            .map(|handle| handle.working_projects())
+            .unwrap_or_default()
+    }
+
+    fn start_with_scope(cfg: ManagerConfig, chat_only: bool) -> Arc<Self> {
         let settings_path = cfg.dir.join("settings.json");
         let mut last_error = None;
         match staging::recover(&cfg.dir, &*cfg.secrets) {
@@ -569,11 +694,11 @@ impl RemoteManager {
             })
         });
         let inbound = Arc::new(Mutex::new(Vec::new()));
-        let tracking: Arc<dyn RemoteGuard> = Arc::new(TrackingGuard {
-            inner: Arc::clone(&guard),
-            inbound: Arc::clone(&inbound),
-        });
-        let host_service = Arc::new(HostService::new(Arc::clone(&cfg.terminals), keys, tracking));
+        let host_service = Arc::new(HostService::new(
+            Arc::clone(&cfg.terminals),
+            Arc::clone(&keys),
+            Arc::clone(&guard),
+        ));
         let slots = known
             .list()
             .iter()
@@ -586,6 +711,7 @@ impl RemoteManager {
         let enabled = settings.enabled;
         cfg.terminals.set_recording(enabled);
         let manager = Arc::new(Self {
+            chat_only,
             inner: Mutex::new(Inner {
                 settings,
                 known,
@@ -611,6 +737,7 @@ impl RemoteManager {
             },
             guard,
             host_service,
+            keys,
             inbound,
             next_seq: AtomicU64::new(1),
             records: Mutex::new(()),
@@ -665,11 +792,73 @@ impl RemoteManager {
             .collect()
     }
 
+    /// What the settings say about connections to this machine, from the
+    /// connections live now: several peers may be connected at once, and one
+    /// ending says nothing about the others. Counted under the state lock, so
+    /// the last connection to change is the one shown.
+    fn note_peers(&self) {
+        {
+            let mut inner = self.lock();
+            let (authenticated, pending) = {
+                let live = self.inbound.lock().unwrap_or_else(PoisonError::into_inner);
+                // Machines, not connections: one machine may hold two for a
+                // moment (a reconnect before the old link timed out).
+                let machines: HashSet<EndpointId> = live
+                    .iter()
+                    .filter(|e| !e.fingerprint.is_empty())
+                    .map(|e| e.endpoint)
+                    .collect();
+                (machines.len(), live.len())
+            };
+            inner.peer = match (authenticated, pending) {
+                (0, 0) => None,
+                (0, _) => Some("a peer is connecting".to_owned()),
+                (1, _) => Some("1 machine".to_owned()),
+                (n, _) => Some(format!("{n} machines")),
+            };
+        }
+        (self.cfg.wake)();
+    }
+
+    /// A handshake ended with `fingerprint`: the connection is let in only if
+    /// that key is still let in, and its key is recorded on its own entry, so
+    /// closing a machine's sessions closes it. Both under the inbound lock,
+    /// which a disconnect takes after it removed the key: either this reads
+    /// the keys after the removal and refuses, or the disconnect finds the
+    /// fingerprint recorded and closes the connection.
+    fn admit(&self, seq: u64, fingerprint: &str) -> bool {
+        let admitted = {
+            let mut live = self.inbound.lock().unwrap_or_else(PoisonError::into_inner);
+            let still_allowed = (self.keys)().has_fingerprint(fingerprint);
+            match live.iter_mut().find(|e| e.seq == seq) {
+                Some(entry) if still_allowed => {
+                    entry.fingerprint = fingerprint.to_owned();
+                    true
+                }
+                _ => false,
+            }
+        };
+        self.note_peers();
+        admitted
+    }
+
+    /// A connection ended: it is no longer one of this machine's.
+    fn forget_inbound(&self, seq: u64) {
+        self.inbound
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|e| e.seq != seq);
+        self.note_peers();
+    }
+
+    /// The connections let in, for the machine rows: one still in its
+    /// handshake is not connected yet.
     fn inbound_snapshot(&self) -> Vec<(EndpointId, String, PathKind)> {
         self.inbound
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
+            .filter(|e| !e.fingerprint.is_empty())
             .map(|e| (e.endpoint, e.fingerprint.clone(), e.conn.path()))
             .collect()
     }
@@ -833,29 +1022,40 @@ impl RemoteManager {
                 Ok(Some(conn)) => {
                     let conn: Arc<dyn Connection> = Arc::from(conn);
                     let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-                    self.inbound
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push(Inbound {
+                    {
+                        let mut live = self.inbound.lock().unwrap_or_else(PoisonError::into_inner);
+                        // Handshakes not yet done are bounded apart from the
+                        // peers being served, so a flood of them holds no
+                        // more than this many threads.
+                        if live.iter().filter(|e| e.fingerprint.is_empty()).count()
+                            >= MAX_HANDSHAKES
+                        {
+                            drop(live);
+                            conn.close();
+                            continue;
+                        }
+                        live.push(Inbound {
                             seq,
                             endpoint: conn.remote_id(),
                             fingerprint: String::new(),
                             conn: Arc::clone(&conn),
                         });
+                    }
                     let me = Arc::clone(self);
-                    let _ = thread::Builder::new()
-                        .name("remote-peer".into())
-                        .spawn(move || {
-                            me.lock().peer = Some("a peer is connecting".to_owned());
-                            (me.cfg.wake)();
-                            me.host_service.serve(&*conn);
-                            me.inbound
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .retain(|e| e.seq != seq);
-                            me.lock().peer = None;
-                            (me.cfg.wake)();
-                        });
+                    let served = Arc::clone(&conn);
+                    let spawned =
+                        thread::Builder::new()
+                            .name("remote-peer".into())
+                            .spawn(move || {
+                                me.note_peers();
+                                me.host_service
+                                    .serve_with(&*served, &|peer| me.admit(seq, &peer.fingerprint));
+                                me.forget_inbound(seq);
+                            });
+                    if spawned.is_err() {
+                        self.forget_inbound(seq);
+                        conn.close();
+                    }
                 }
                 Ok(None) => {}
                 Err(_) => return,
@@ -973,6 +1173,7 @@ impl RemoteManager {
             manager: me,
             peer: peer_of(&host),
         });
+        handle.set_chat_only(self.chat_only);
         if let Err(err) = spawn(handle, dialer, signers, self.cfg.supervisor) {
             self.fail(format!("could not start the connection: {err}"));
         }
@@ -1692,6 +1893,30 @@ impl RemoteManager {
     }
 }
 
+impl RemoteManager {
+    /// What must not be cut by a restart for an update now, if anything: a
+    /// pairing under way, or a file going either way (ADR 0030).
+    #[must_use]
+    pub fn restart_blocker(&self) -> Option<String> {
+        let pairing = matches!(
+            self.lock().pairing,
+            PairingPhase::Preparing
+                | PairingPhase::ShowingCode { .. }
+                | PairingPhase::WaitingForPeer { .. }
+                | PairingPhase::Connecting
+                | PairingPhase::NameNeeded { .. }
+                | PairingPhase::Confirming
+                | PairingPhase::Keeping
+        );
+        if pairing {
+            return Some("A pairing with another machine is under way.".to_owned());
+        }
+        let transfers =
+            self.host_service.transfers_in_progress() + crate::reconnect::files_being_read();
+        (transfers > 0).then(|| "A file is being transferred.".to_owned())
+    }
+}
+
 impl RemoteControl for RemoteManager {
     fn view(&self) -> Arc<RemoteView> {
         let inbound = self.inbound_snapshot();
@@ -2203,9 +2428,137 @@ impl RemoteControl for RemoteManager {
     fn terminals(&self, name: &str) -> Option<Arc<dyn TerminalsControl>> {
         let inner = self.lock();
         let index = Self::index_of(&inner, name)?;
-        Some(Arc::new(RemoteTerminals(Arc::clone(
+        Some(Arc::new(RemoteTerminals::all(Arc::clone(
             &inner.slots[index].handle,
         ))))
+    }
+
+    fn file_offers(&self) -> Vec<connecto_core::RemoteOffer> {
+        let handles: Vec<Arc<HostHandle>> = self
+            .lock()
+            .slots
+            .iter()
+            .map(|slot| Arc::clone(&slot.handle))
+            .collect();
+        let mut out = Vec::new();
+        for handle in handles {
+            let projects = handle.listed_projects();
+            let labels = remote_projects(&projects);
+            for offer in handle.offers() {
+                let Some(project) = labels.iter().find(|p| p.id == offer.project) else {
+                    continue;
+                };
+                out.push(connecto_core::RemoteOffer {
+                    host: handle.name(),
+                    id: offer.id,
+                    project: project.name.clone(),
+                    terminal: crate::remote_terminals::display_text(&offer.terminal),
+                    name: save_name(&offer.name),
+                    bytes: offer.bytes,
+                });
+            }
+        }
+        out
+    }
+
+    fn download_offer(&self, name: &str, id: u64) -> Result<(String, Vec<u8>), String> {
+        let handle = {
+            let inner = self.lock();
+            let index = Self::index_of(&inner, name).ok_or("that machine is no longer saved")?;
+            Arc::clone(&inner.slots[index].handle)
+        };
+        handle
+            .download_offer(id)
+            .map(|(file, bytes)| (save_name(&file), bytes))
+    }
+
+    fn project_groups(&self, name: &str) -> Option<connecto_core::RemoteGroups> {
+        let handle = {
+            let inner = self.lock();
+            let index = Self::index_of(&inner, name)?;
+            Arc::clone(&inner.slots[index].handle)
+        };
+        handle.groups()
+    }
+
+    fn secret_asks(&self) -> Vec<connecto_core::RemoteSecretAsk> {
+        let handles: Vec<Arc<HostHandle>> = self
+            .lock()
+            .slots
+            .iter()
+            .map(|slot| Arc::clone(&slot.handle))
+            .collect();
+        let mut out = Vec::new();
+        for handle in handles {
+            let labels = remote_projects(&handle.listed_projects());
+            for ask in handle.secret_asks() {
+                let Some(project) = labels
+                    .iter()
+                    .find(|p| ask.project.as_deref() == Some(p.id.as_str()))
+                else {
+                    continue;
+                };
+                out.push(connecto_core::RemoteSecretAsk {
+                    host: handle.name(),
+                    project: project.id.clone(),
+                    project_name: project.name.clone(),
+                    ask,
+                });
+            }
+        }
+        out
+    }
+
+    fn project_vault(
+        &self,
+        name: &str,
+        project: &str,
+        shown_as: &str,
+    ) -> Option<Arc<dyn connecto_core::VaultControl>> {
+        let inner = self.lock();
+        let index = Self::index_of(&inner, name)?;
+        let handle = Arc::clone(&inner.slots[index].handle);
+        if !handle.listed_projects().iter().any(|p| p.id == project) {
+            return None;
+        }
+        Some(Arc::new(crate::remote_secrets::RemoteVault::new(
+            handle,
+            project.to_owned(),
+            shown_as.to_owned(),
+        )))
+    }
+
+    fn projects(&self, name: &str) -> Vec<RemoteProject> {
+        let inner = self.lock();
+        match Self::index_of(&inner, name) {
+            Some(index) => remote_projects(&inner.slots[index].handle.listed_projects()),
+            None => Vec::new(),
+        }
+    }
+
+    fn project_terminals(&self, name: &str, project: &str) -> Option<Arc<dyn TerminalsControl>> {
+        let inner = self.lock();
+        let index = Self::index_of(&inner, name)?;
+        let handle = Arc::clone(&inner.slots[index].handle);
+        // Only a project the host listed: an empty one is listed too.
+        if !handle.listed_projects().iter().any(|p| p.id == project) {
+            return None;
+        }
+        Some(Arc::new(RemoteTerminals::for_project(handle, project)))
+    }
+}
+
+/// A file name from a peer as one safe to save by: one name, no folder, no
+/// control or bidirectional characters, not hidden.
+#[must_use]
+pub fn save_name(raw: &str) -> String {
+    let last = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let clean = crate::remote_terminals::display_text(last);
+    let clean = clean.trim_start_matches('.').trim();
+    if clean.is_empty() {
+        "download".to_owned()
+    } else {
+        clean.to_owned()
     }
 }
 
@@ -2313,6 +2666,22 @@ mod tests {
             pairing_lifetime: Duration::from_secs(30),
             default_relay: None,
         })
+    }
+
+    #[test]
+    fn a_pairing_or_a_file_read_blocks_an_update_restart() {
+        let m = manager_for("restart-blocker");
+        assert_eq!(m.restart_blocker(), None);
+        m.lock().pairing = PairingPhase::Connecting;
+        assert!(m.restart_blocker().unwrap().contains("pairing"));
+        m.lock().pairing = PairingPhase::Failed {
+            message: "x".to_owned(),
+        };
+        assert_eq!(m.restart_blocker(), None, "an ended pairing does not");
+        let reading = crate::reconnect::Reading::start();
+        assert!(m.restart_blocker().unwrap().contains("file"));
+        drop(reading);
+        assert_eq!(m.restart_blocker(), None);
     }
 
     /// An endpoint is obtained for relay A. Before its watch is started, the

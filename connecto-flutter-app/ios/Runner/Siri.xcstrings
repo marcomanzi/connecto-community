@@ -1,0 +1,306 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    "Project": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Progetto"
+          }
+        }
+      }
+    },
+    "Agent": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Agente"
+          }
+        }
+      }
+    },
+    "Request": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Richiesta"
+          }
+        }
+      }
+    },
+    "Answer": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Risposta"
+          }
+        }
+      }
+    },
+    "Project status": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stato del progetto"
+          }
+        }
+      }
+    },
+    "Says what the project's agent is doing.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dice cosa sta facendo l'agente del progetto."
+          }
+        }
+      }
+    },
+    "Last reply": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ultima risposta"
+          }
+        }
+      }
+    },
+    "Reads the agent's last reply.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Legge l'ultima risposta dell'agente."
+          }
+        }
+      }
+    },
+    "Open project": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apri progetto"
+          }
+        }
+      }
+    },
+    "Opens the project's chat.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apre la chat del progetto."
+          }
+        }
+      }
+    },
+    "Open reply": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apri risposta"
+          }
+        }
+      }
+    },
+    "Ask Connecto": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chiedi a Connecto"
+          }
+        }
+      }
+    },
+    "Sends a message to the project's agent and says its reply.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Manda un messaggio all'agente del progetto e ne dice la risposta."
+          }
+        }
+      }
+    },
+    "What do you want to ask Connecto?": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cosa vuoi chiedere a Connecto?"
+          }
+        }
+      }
+    },
+    "Answer the agent": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rispondi all'agente"
+          }
+        }
+      }
+    },
+    "Answers the question the project's agent is asking.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Risponde alla domanda dell'agente del progetto."
+          }
+        }
+      }
+    },
+    "What's your answer?": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cosa vuoi rispondere?"
+          }
+        }
+      }
+    },
+    "Stop the agent": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ferma l'agente"
+          }
+        }
+      }
+    },
+    "Asks the project's agent to stop its turn.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chiede all'agente del progetto di fermarsi."
+          }
+        }
+      }
+    },
+    "Stop": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ferma"
+          }
+        }
+      }
+    },
+    "Cancel": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Annulla"
+          }
+        }
+      }
+    },
+    "Start over": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ricomincia"
+          }
+        }
+      }
+    },
+    "Call the agent": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chiama l'agente"
+          }
+        }
+      }
+    },
+    "Starts a voice call with the project.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Avvia una chiamata vocale con il progetto."
+          }
+        }
+      }
+    },
+    "Start a session": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Avvia una sessione"
+          }
+        }
+      }
+    },
+    "Starts or resumes the project's app session.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Avvia o riprende la sessione dell'app del progetto."
+          }
+        }
+      }
+    },
+    "Ask": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chiedi"
+          }
+        }
+      }
+    },
+    "Status": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stato"
+          }
+        }
+      }
+    },
+    "Call": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chiama"
+          }
+        }
+      }
+    },
+    "Open": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apri"
+          }
+        }
+      }
+    }
+  },
+  "version": "1.0"
+}

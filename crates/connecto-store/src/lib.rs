@@ -13,9 +13,11 @@ mod platform;
 mod signature;
 mod store;
 
-pub use discover::{is_launcher, prefetch_login_path, run_path};
+pub use discover::{is_launcher, launcher_path, prefetch_login_path, run_path, user_path};
+pub use hash::sha256_file;
+pub use platform::launcher_env;
 pub use signature::{Codesign, Failure, Signature};
 pub use store::{
     Installed, Store, StoreError, Tool, data_dir_override, data_root, describe_list, home_dir,
-    shown_path,
+    opencode_unsupported, shown_path, version_text,
 };

@@ -53,11 +53,12 @@ fn line(text: String, buttons: Vec<(&'static str, &'static str, StripAction)>) -
     Some(Line { text, buttons })
 }
 
-fn turns(n: usize) -> String {
+/// "1 agent turn finishes", "2 agent turns finish".
+fn turns_finish(n: usize) -> String {
     if n == 1 {
-        "1 agent turn".to_owned()
+        "1 agent turn finishes".to_owned()
     } else {
-        format!("{n} agent turns")
+        format!("{n} agent turns finish")
     }
 }
 
@@ -74,8 +75,8 @@ pub(crate) fn line_for(view: &UpdateView, state: &StripState, working: usize) ->
     if state.waiting {
         return line(
             format!(
-                "Connecto restarts to update when {} finish.",
-                turns(working)
+                "Connecto restarts to update when {}.",
+                turns_finish(working)
             ),
             vec![
                 ("update-restart-now", "Restart now", StripAction::RestartNow),
@@ -85,6 +86,18 @@ pub(crate) fn line_for(view: &UpdateView, state: &StripState, working: usize) ->
     }
     let later = |version: &str| state.later.as_deref() == Some(version);
     match &view.status {
+        // It installs itself: the strip says so, and what holds it back.
+        UpdateStatus::Ready { version } if view.auto_install => line(
+            match &view.held {
+                Some(held) => {
+                    format!("Connecto {version} installs itself when nothing holds it back. {held}")
+                }
+                None => format!(
+                    "Connecto {version} installs itself and restarts in a moment. Agents carry on afterwards."
+                ),
+            },
+            vec![("update-install", "Update and restart", StripAction::Install)],
+        ),
         UpdateStatus::Ready { version } if !later(version) => line(
             format!("Connecto {version} is ready. Your terminals are restored after the restart."),
             vec![
@@ -153,7 +166,26 @@ mod tests {
             auto_check: true,
             asked,
             notice: None,
+            ..UpdateView::default()
         }
+    }
+
+    #[test]
+    fn with_automatic_installs_a_ready_update_says_it_installs_itself_and_what_holds_it() {
+        let state = StripState::default();
+        let mut ready = view(
+            UpdateStatus::Ready {
+                version: "0.1.9".into(),
+            },
+            false,
+        );
+        ready.auto_install = true;
+        let line = line_for(&ready, &state, 0).unwrap();
+        assert!(line.text.contains("installs itself"), "{}", line.text);
+        assert_eq!(actions(&line), [StripAction::Install], "no Later");
+        ready.held = Some("A file is being transferred.".into());
+        let line = line_for(&ready, &state, 0).unwrap();
+        assert!(line.text.contains("A file is being transferred."));
     }
 
     fn actions(line: &Line) -> Vec<StripAction> {
@@ -200,16 +232,17 @@ mod tests {
             false,
         );
         let line = line_for(&ready, &state, 2).unwrap();
-        assert!(line.text.contains("2 agent turns"), "{}", line.text);
+        assert_eq!(
+            line.text,
+            "Connecto restarts to update when 2 agent turns finish."
+        );
         assert_eq!(
             actions(&line),
             [StripAction::RestartNow, StripAction::CancelWait]
         );
-        assert!(
-            line_for(&ready, &state, 1)
-                .unwrap()
-                .text
-                .contains("1 agent turn finish")
+        assert_eq!(
+            line_for(&ready, &state, 1).unwrap().text,
+            "Connecto restarts to update when 1 agent turn finishes."
         );
     }
 

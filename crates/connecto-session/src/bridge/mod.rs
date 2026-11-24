@@ -6,9 +6,15 @@
 //! terminals is stored and handed over, and generated text holds only ids that
 //! Connecto made.
 
+pub(crate) mod context;
+pub(crate) mod memory;
+pub(crate) mod ops;
 pub(crate) mod render;
+pub(crate) mod roster;
 pub(crate) mod server;
 pub(crate) mod state;
+pub(crate) mod vault;
+pub(crate) mod works;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,6 +50,9 @@ pub enum WriteOutcome {
     NotRunning { pasted: bool },
     /// The write failed.
     Failed { pasted: bool, why: String },
+    /// Not an outcome: a send waits for the user to send or clear their draft,
+    /// and its sender is told so at once. The outcome follows, to bridge state.
+    Waiting { note: String },
 }
 
 /// Which kind of write an outcome is for.
@@ -161,6 +170,67 @@ pub(crate) struct Caller {
     pub uid: u64,
     pub id: String,
     pub attempt: u64,
+    /// Set when the caller is a terminal of another project, reaching this
+    /// one with `--project` (ADR 0035). `slot`, `uid` and `attempt` are then
+    /// its own project's.
+    pub origin: Option<Arc<Origin>>,
+}
+
+/// The project a cross-project caller comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Origin {
+    pub project_id: String,
+    pub project_name: String,
+    /// The bridge instance it called from: a project closed and opened again
+    /// is a new instance, whose terminal numbers start again.
+    pub instance: u64,
+}
+
+impl Caller {
+    /// How a terminal is told who wrote: `claude-55`, or `claude-55 in
+    /// project connecto` for a caller from another project.
+    pub(crate) fn label(&self) -> String {
+        match &self.origin {
+            None => self.id.clone(),
+            Some(origin) => format!(
+                "{} in project {}",
+                self.id,
+                header_name(&origin.project_name)
+            ),
+        }
+    }
+
+    /// The audit's `source`: the id, or `<project id>/<id>` for a caller
+    /// from another project.
+    pub(crate) fn audit_source(&self) -> String {
+        match &self.origin {
+            None => self.id.clone(),
+            Some(origin) => format!("{}/{}", origin.project_id, self.id),
+        }
+    }
+}
+
+/// A project name as it may appear in a `[connecto from ...]` header: no
+/// character that could end the header or forge a line. Letters, digits,
+/// space, `.`, `_` and `-` stay; anything else becomes `_`.
+pub(crate) fn header_name(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let clean = clean.trim().to_owned();
+    if clean.is_empty() {
+        "_".to_owned()
+    } else {
+        clean
+    }
 }
 
 /// The sender bridge state listens on.

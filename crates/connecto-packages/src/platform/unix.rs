@@ -6,7 +6,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Folders in the home folder that hold the CLIs' or the system's state.
-pub(crate) const HOME_STATE: [&str; 4] = [".claude", ".codex", ".local", "Library"];
+pub(crate) const HOME_STATE: [&str; 6] =
+    [".claude", ".codex", ".local", "Library", ".pi", ".gemini"];
 
 /// The variable that names the user's home folder.
 pub(crate) const HOME_VAR: &str = "HOME";

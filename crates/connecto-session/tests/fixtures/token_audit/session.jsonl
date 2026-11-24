@@ -1,0 +1,20 @@
+{"type":"custom-title","customTitle":"synthetic","sessionId":"s1"}
+{"parentUuid":null,"type":"user","message":{"role":"user","content":"Fix the parser please"},"uuid":"u1","timestamp":"2026-11-20T10:00:00.000Z"}
+{"type":"attachment","attachment":{"type":"skill_listing","names":["product-management:brainstorm","dataviz","dev-team","update-config"],"content":"- product-management:brainstorm: Brainstorm an idea\n- dataviz: Charts and\nmore charts\n- dev-team: Connecto team\n- update-config: Configure the harness","skillCount":4},"timestamp":"2026-11-20T10:00:00.100Z"}
+{"type":"attachment","attachment":{"type":"deferred_tools_delta","addedNames":["Monitor","mcp__plugin_product-management_amplitude__authenticate","mcp__claude_ai_Google_Drive__authenticate","mcp__easel__chart"],"removedNames":[]}}
+{"type":"attachment","attachment":{"type":"mcp_instructions_delta","addedNames":["easel"],"addedBlocks":["## easel\nTools registered by a plugin."]}}
+{"type":"attachment","attachment":{"type":"agent_listing_delta","addedLines":["- Explore: Read-only search agent","- Plan: Software architect"]}}
+{"type":"attachment","attachment":{"type":"instructions","files":[{"path":"/home/x/.claude/CLAUDE.md","type":"User","content":"short"}]}}
+{"type":"api-request-blob","message":{"type":"user","content":"ignored"}}
+{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":40000,"cache_creation":{"ephemeral_1h_input_tokens":40000,"ephemeral_5m_input_tokens":0},"output_tokens":10},"content":[{"type":"thinking","thinking":""}]},"timestamp":"2026-11-20T10:00:05.000Z"}
+{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":40000,"cache_creation":{"ephemeral_1h_input_tokens":40000,"ephemeral_5m_input_tokens":0},"output_tokens":120},"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test --workspace"}}]},"timestamp":"2026-11-20T10:00:06.000Z"}
+this line is broken {
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok ok ok ok ok ok ok ok ok ok"}]},"timestamp":"2026-11-20T10:00:30.000Z"}
+{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":2,"cache_read_input_tokens":40000,"cache_creation_input_tokens":500,"output_tokens":50},"content":[{"type":"tool_use","id":"t2","name":"mcp__easel__chart","input":{}}]},"timestamp":"2026-11-20T10:00:40.000Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"chart"}]}]},"timestamp":"2026-11-20T10:00:41.000Z"}
+{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":2,"cache_read_input_tokens":40500,"cache_creation_input_tokens":300,"output_tokens":80},"content":[{"type":"text","text":"done"}]},"timestamp":"2026-11-20T10:00:50.000Z"}
+{"type":"user","message":{"role":"user","content":"<command-name>/update-config</command-name>"},"timestamp":"2026-11-20T12:00:00.000Z"}
+{"type":"assistant","message":{"id":"m4","usage":{"input_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":41000,"output_tokens":30},"content":[{"type":"tool_use","id":"t3","name":"Agent","input":{"subagent_type":"Explore","description":"look"}}]},"timestamp":"2026-11-20T12:00:10.000Z"}
+{"type":"system","subtype":"compact_boundary","timestamp":"2026-11-20T12:01:00.000Z"}
+{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued"},"timestamp":"2026-11-20T12:01:01.000Z"}
+{"type":"assistant","isSidechain":true,"message":{"id":"side","usage":{"input_tokens":1,"cache_read_input_tokens":999999,"cache_creation_input_tokens":0,"output_tokens":1},"content":[]},"timestamp":"2026-11-20T12:01:02.000Z"}

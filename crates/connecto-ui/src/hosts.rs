@@ -40,21 +40,25 @@ fn link_color(link: &HostLink) -> Option<Color32> {
     }
 }
 
-/// The most host rows shown at once.
-const MAX_ROWS: usize = 6;
-const HEAD_HEIGHT: f32 = 22.0;
+/// The height of the switcher's row.
+pub(crate) const DROPDOWN_HEIGHT: f32 = 30.0;
+/// Room left of the switcher, the group filter and the group headers, which
+/// line up with each other a step right of the projects.
+pub(crate) const LEFT_INSET: f32 = 4.0;
 
-/// How tall the section is for `hosts` saved hosts (and `localhost`).
-pub(crate) fn section_height(hosts: usize) -> f32 {
-    HEAD_HEIGHT + ROW_HEIGHT * (1 + hosts.min(MAX_ROWS)) as f32 + 8.0
+/// How tall the switcher is.
+pub(crate) fn section_height() -> f32 {
+    DROPDOWN_HEIGHT + 8.0
 }
 
-/// Where each row of the section was drawn, for tests.
+/// Where each part of the switcher was drawn, for tests: `hosts` (the
+/// dropdown), and while it is open `localhost`, each host and `add`.
 #[cfg(test)]
 pub(crate) type RowRects = Vec<(String, Rect)>;
 
-/// Draw `HOSTS`, `localhost` and the saved hosts. `selected` is the remote host
-/// shown, or `None` for this machine.
+/// The host switcher: a dropdown showing the host in view, which lists
+/// `localhost`, the saved hosts, the actions of the host in view and Add host.
+/// `selected` is the remote host shown, or `None` for this machine.
 pub(crate) fn section(
     ui: &mut Ui,
     rows: &[HostRow],
@@ -62,70 +66,175 @@ pub(crate) fn section(
     commands: &mut Vec<Command>,
     #[cfg(test)] rects: &mut RowRects,
 ) {
-    // The heading, with the add button.
-    let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEAD_HEIGHT), Sense::hover());
-    ui.painter().text(
-        pos2(head.min.x + 8.0, head.center().y),
-        Align2::LEFT_CENTER,
-        "HOSTS",
-        FontId::monospace(10.5),
+    let (full, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), DROPDOWN_HEIGHT), Sense::hover());
+    let rect = Rect::from_min_max(
+        pos2(full.min.x + LEFT_INSET, full.min.y + 2.0),
+        pos2(full.max.x, full.max.y - 2.0),
+    );
+    let button = ui.interact(rect, Id::unique("host-switcher"), Sense::click());
+    #[cfg(test)]
+    rects.push(("hosts".to_owned(), rect));
+    #[cfg(feature = "ui-test-driver")]
+    crate::driver::note(ui.ctx(), "host-switcher", rect);
+
+    let shown = selected.and_then(|name| {
+        rows.iter()
+            .find(|host| host.name.eq_ignore_ascii_case(name))
+    });
+    let (name, word, color) = match shown {
+        Some(host) => (
+            host.name.as_str(),
+            link_word(&host.link),
+            link_color(&host.link),
+        ),
+        None => (LOCALHOST, "this machine".to_owned(), Some(theme::GREEN)),
+    };
+    let painter = ui.painter();
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&button));
+    let fill = if button.hovered() || open {
+        theme::ROW_HOVER
+    } else {
+        theme::RAISED_BG
+    };
+    painter.rect_filled(rect, 7.0, fill);
+    painter.rect_stroke(
+        rect,
+        7.0,
+        Stroke::new(1.0, theme::BORDER),
+        egui::StrokeKind::Inside,
+    );
+    dot(painter, pos2(rect.min.x + 14.0, rect.center().y), color);
+    let chevron_x = rect.max.x - 14.0;
+    let word_galley =
+        painter.layout_no_wrap(word.clone(), FontId::proportional(10.5), theme::FAINT);
+    let word_x = chevron_x - 12.0 - word_galley.size().x;
+    let name_galley = crate::tree::fit(
+        painter,
+        name,
+        FontId::proportional(13.0),
+        theme::TEXT,
+        word_x - rect.min.x - 34.0,
+    );
+    painter.galley(
+        pos2(
+            rect.min.x + 26.0,
+            rect.center().y - name_galley.size().y / 2.0,
+        ),
+        name_galley,
+        theme::TEXT,
+    );
+    painter.galley(
+        pos2(word_x, rect.center().y - word_galley.size().y / 2.0),
+        word_galley,
         theme::FAINT,
     );
-    let plus = Rect::from_center_size(pos2(head.max.x - 14.0, head.center().y), vec2(20.0, 20.0));
-    let add = ui.interact(plus, Id::unique("host-add"), Sense::click());
-    if add.hovered() {
-        ui.painter().rect_filled(plus, 6.0, theme::RAISED_BG);
-    }
-    icons::plus(
-        ui.painter(),
-        plus.center(),
-        4.5,
-        if add.hovered() {
-            theme::TEXT
-        } else {
-            theme::TEXT_MUTED
-        },
+    icons::twisty(
+        painter,
+        pos2(chevron_x, rect.center().y),
+        true,
+        theme::TEXT_MUTED,
     );
-    add.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, true, "Add host"));
-    #[cfg(feature = "ui-test-driver")]
-    crate::driver::note(ui.ctx(), "host-add", plus);
-    #[cfg(test)]
-    rects.push(("add".to_owned(), plus));
-    if add.on_hover_text("Add host").clicked() {
-        commands.push(Command::AddHost);
+    button.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::accesskit::Role::ComboBox,
+            true,
+            format!("Host: {name}, {word}"),
+        )
+    });
+    let button = match shown {
+        Some(host) => button.on_hover_text(hint(host)),
+        None => button,
+    };
+    if let Some(host) = shown {
+        button.context_menu(|ui| host_actions(ui, host, commands));
     }
 
-    one_row(
-        ui,
-        LOCALHOST,
-        "this machine",
-        Some(theme::GREEN),
-        selected.is_none(),
-        None,
-        commands,
-        #[cfg(test)]
-        rects,
-    );
-    for host in rows.iter().take(MAX_ROWS) {
-        let hint = match &host.link {
-            HostLink::Refused(why) => why.clone(),
-            other => format!("{}  ·  {}", link_word(other), host.fingerprint),
-        };
+    let width = rect.width();
+    egui::Popup::menu(&button).show(|ui| {
+        ui.set_min_width(width);
+        ui.set_max_width(width);
+        ui.spacing_mut().item_spacing.y = 1.0;
         one_row(
             ui,
-            &host.name,
-            &link_word(&host.link),
-            link_color(&host.link),
-            selected.is_some_and(|name| name.eq_ignore_ascii_case(&host.name)),
-            Some((host, hint)),
+            LOCALHOST,
+            "this machine",
+            Some(theme::GREEN),
+            selected.is_none(),
+            None,
             commands,
             #[cfg(test)]
             rects,
         );
-    }
-    ui.add_space(6.0);
+        for host in rows {
+            one_row(
+                ui,
+                &host.name,
+                &link_word(&host.link),
+                link_color(&host.link),
+                selected.is_some_and(|name| name.eq_ignore_ascii_case(&host.name)),
+                Some(host),
+                commands,
+                #[cfg(test)]
+                rects,
+            );
+        }
+        if let Some(host) = shown {
+            ui.separator();
+            host_actions(ui, host, commands);
+        }
+        ui.separator();
+        let add = ui.button("Add host…");
+        #[cfg(test)]
+        rects.push(("add".to_owned(), add.rect));
+        #[cfg(feature = "ui-test-driver")]
+        crate::driver::note(ui.ctx(), "host-add", add.rect);
+        if add.clicked() {
+            commands.push(Command::AddHost);
+            ui.close();
+        }
+    });
 }
 
+fn hint(host: &HostRow) -> String {
+    match &host.link {
+        HostLink::Refused(why) => why.clone(),
+        other => format!("{}  ·  {}", link_word(other), host.fingerprint),
+    }
+}
+
+fn dot(painter: &egui::Painter, center: egui::Pos2, color: Option<Color32>) {
+    match color {
+        Some(color) => {
+            painter.circle_filled(center, DOT_RADIUS, color);
+        }
+        None => {
+            painter.circle_stroke(center, DOT_RADIUS - 0.5, Stroke::new(1.2, theme::FAINT));
+        }
+    }
+}
+
+/// Connect or Reconnect, Disconnect, Rename and Forget for one saved host.
+fn host_actions(ui: &mut Ui, row: &HostRow, commands: &mut Vec<Command>) {
+    let connected = !matches!(row.link, HostLink::Disconnected);
+    let items: [(&str, Command); 4] = [
+        (
+            if connected { "Reconnect" } else { "Connect" },
+            Command::ConnectHost(row.name.clone()),
+        ),
+        ("Disconnect", Command::DisconnectHost(row.name.clone())),
+        ("Rename host…", Command::RenameHostAt(row.name.clone())),
+        ("Forget host…", Command::AskForgetHost(row.name.clone())),
+    ];
+    for (label, command) in items {
+        if ui.button(label).clicked() {
+            commands.push(command);
+            ui.close();
+        }
+    }
+}
+
+/// One host in the open dropdown: its dot, name and link.
 #[allow(clippy::too_many_arguments)]
 fn one_row(
     ui: &mut Ui,
@@ -133,7 +242,7 @@ fn one_row(
     word: &str,
     color: Option<Color32>,
     selected: bool,
-    host: Option<(&HostRow, String)>,
+    host: Option<&HostRow>,
     commands: &mut Vec<Command>,
     #[cfg(test)] rects: &mut RowRects,
 ) {
@@ -147,22 +256,14 @@ fn one_row(
     } else if response.hovered() {
         painter.rect_filled(rect, 6.0, theme::ROW_HOVER);
     }
-    let center = pos2(rect.min.x + 16.0, rect.center().y);
-    match color {
-        Some(color) => {
-            painter.circle_filled(center, DOT_RADIUS, color);
-        }
-        None => {
-            painter.circle_stroke(center, DOT_RADIUS - 0.5, Stroke::new(1.2, theme::FAINT));
-        }
-    }
+    dot(painter, pos2(rect.min.x + 12.0, rect.center().y), color);
     let text_color = if selected {
         Color32::WHITE
     } else {
         theme::TEXT_ROW
     };
     painter.text(
-        pos2(rect.min.x + 28.0, rect.center().y),
+        pos2(rect.min.x + 24.0, rect.center().y),
         Align2::LEFT_CENTER,
         name,
         FontId::proportional(13.0),
@@ -183,32 +284,13 @@ fn one_row(
             format!("{name}, {word}"),
         )
     });
-    let response = match &host {
-        Some((_, hint)) => response.on_hover_text(hint.as_str()),
+    let response = match host {
+        Some(host) => response.on_hover_text(hint(host)),
         None => response,
     };
     if response.clicked() {
-        commands.push(Command::SelectHost(host.as_ref().map(|_| name.to_owned())));
-    }
-    if let Some((row, _)) = host {
-        response.context_menu(|ui| {
-            let connected = !matches!(row.link, HostLink::Disconnected);
-            let items: [(&str, Command); 4] = [
-                (
-                    if connected { "Reconnect" } else { "Connect" },
-                    Command::ConnectHost(row.name.clone()),
-                ),
-                ("Disconnect", Command::DisconnectHost(row.name.clone())),
-                ("Rename host…", Command::RenameHostAt(row.name.clone())),
-                ("Forget host…", Command::AskForgetHost(row.name.clone())),
-            ];
-            for (label, command) in items {
-                if ui.button(label).clicked() {
-                    commands.push(command);
-                    ui.close();
-                }
-            }
-        });
+        commands.push(Command::SelectHost(host.map(|_| name.to_owned())));
+        ui.close();
     }
 }
 

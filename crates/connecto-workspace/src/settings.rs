@@ -46,6 +46,9 @@ impl Settings {
             value["launch_modes"] = json!({
                 "claude": self.launch_modes.claude.cli_value(),
                 "codex": self.launch_modes.codex.cli_value(),
+                "pi": self.launch_modes.pi.cli_value(),
+                "antigravity": self.launch_modes.antigravity.cli_value(),
+                "opencode": self.launch_modes.opencode.cli_value(),
             });
         }
         if self.secrets_in_system_store {
@@ -84,8 +87,10 @@ impl Settings {
                 .and_then(Value::as_str)
                 .filter(|path| crate::platform::absolute(path))
                 .map(PathBuf::from),
+            // `magneto_home` is the key an install under the earlier name wrote.
             connecto_home: value
                 .get("connecto_home")
+                .or_else(|| value.get("magneto_home"))
                 .and_then(Value::as_str)
                 .filter(|path| crate::platform::absolute(path))
                 .map(PathBuf::from),
@@ -101,6 +106,9 @@ impl Settings {
                 LaunchModes {
                     claude: word("claude"),
                     codex: word("codex"),
+                    pi: word("pi"),
+                    antigravity: word("antigravity"),
+                    opencode: word("opencode"),
                 }
             },
             secrets_in_system_store: value
@@ -261,6 +269,25 @@ mod tests {
     }
 
     #[test]
+    fn the_earlier_installs_home_key_is_still_read() {
+        let old = format!(r#"{{"version":1,"magneto_home":"{}"}}"#, abs("old/home"));
+        let parsed = Settings::parse(&old).unwrap();
+        assert_eq!(parsed.connecto_home, Some(PathBuf::from(abs("old/home"))));
+        let both = format!(
+            r#"{{"version":1,"magneto_home":"{}","connecto_home":"{}"}}"#,
+            abs("old"),
+            abs("new")
+        );
+        assert_eq!(
+            Settings::parse(&both).unwrap().connecto_home,
+            Some(PathBuf::from(abs("new")))
+        );
+        // Saved again, it is under the new key only.
+        let text = parsed.to_json();
+        assert!(text.contains("connecto_home") && !text.contains("magneto_home"));
+    }
+
+    #[test]
     fn connecto_home_is_optional_absolute_and_kept_beside_the_old_folder() {
         let old = format!(r#"{{"version":1,"automations_root":"{}"}}"#, abs("a"));
         let parsed = Settings::parse(&old).unwrap();
@@ -324,6 +351,9 @@ mod tests {
             launch_modes: LaunchModes {
                 claude: AgentMode::Auto,
                 codex: AgentMode::Prompt,
+                pi: AgentMode::Bypass,
+                antigravity: AgentMode::Prompt,
+                opencode: AgentMode::Auto,
             },
             ..parsed
         };

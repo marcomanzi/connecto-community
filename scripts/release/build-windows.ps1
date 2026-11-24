@@ -3,7 +3,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release\build-windows.ps1
 #
 # Run it on Windows x86_64 with the MSVC Rust toolchain (scripts\windows\bootstrap.ps1
-# sets a machine up; CI: .github/workflows/release-build.yml). Works in Windows
+# sets a machine up; releases use build-windows-cross.sh instead). Works in Windows
 # PowerShell 5.1 and PowerShell 7. See README.md for what is different on Windows.
 #
 # Output (VERSION is the workspace version):

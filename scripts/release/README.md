@@ -2,6 +2,65 @@
 
 Everything lands in `dist/` (git-ignored). Website: https://connecto.studio
 
+## Automatic tag releases on the release Mac
+
+Install or refresh the user LaunchAgent with `scripts/release/install-watcher.sh`.
+It polls origin every minute while the Mac is awake and the user is logged in.
+It remembers existing tags at installation. Each subsequent tag uses the version
+from its own Cargo.toml. Use a new version for each release. Numeric tags (with
+an optional v prefix) must match that version. Multiple pending versions run in
+order and an older version cannot replace a newer live feed.
+
+With Docker Desktop running and the release keychain unlocked, push a tag on
+the versioned commit, or use the following command on clean, up-to-date main:
+
+```sh
+scripts/release/release.sh all 0.1.19 "One line of release notes"
+```
+
+The watcher builds the Windows x64 ZIP with MinGW and both experimental Linux
+archives in Docker. It builds and notarizes the three macOS DMGs locally, signs
+the updater feed, writes the download cards on main, checks the uploaded files
+on the server, then deploys the site and publishes the feed last. Windows cross
+builds are unsigned. Linux agent provisioning still requires porting. There is
+no GitHub Actions workflow: every release file is built on the release Mac.
+
+The watcher also builds the Connecto Chat companion for Windows x64 on this Mac
+and publishes its ZIP and checksum in the Connecto Chat section of the site.
+To build that ZIP alone, run `scripts/release/build-chat-windows.sh`. It uses
+the Flutter SDK in `FLUTTER_ROOT` (or `~/development/flutter`), its matching
+Windows engine, and Docker Desktop with x86_64 emulation. The filename uses
+the repository release version. The executable uses the Flutter app version.
+
+State, the dedicated checkout and cached artifacts live in
+`~/Library/Application Support/ConnectoRelease`. Inspect `tags.json` for per-tag
+outcomes and `~/Library/Logs/ConnectoRelease/watcher.log` for build output.
+Failed tags retry with backoff up to an hour and reuse completed stages.
+To uninstall the watcher, run
+`launchctl bootout gui/$(id -u)/studio.connecto.release` and remove
+`~/Library/LaunchAgents/studio.connecto.release.plist`.
+
+### Site-only releases
+
+To put documentation or other site changes live without a new version, push
+them to main and tag that commit with a name starting with `site_v`:
+
+```sh
+git tag -a site_v0.2.9-docs1 -m "Docs: Agentic Works guide" && git push origin site_v0.2.9-docs1
+```
+
+The watcher builds nothing and publishes no update feed. It deploys `site/` as
+it is at the tagged commit (`scripts/release/release.sh deploy-site <ref>`, which
+also runs by hand) and leaves `downloads/` alone. The tagged commit must include
+main's latest download list (`site/assets/releases.js`), so an old commit never
+puts back old downloads; tag current main. After changing `watch-tags.py`, run
+`scripts/release/install-watcher.sh` again: the LaunchAgent runs an installed
+copy.
+
+A release runs no tests and waits for none: it builds and ships as fast as it
+can. The developer runs `cargo test --workspace` before releasing. The Windows
+tests run on the Windows machine.
+
 ## Artifact names
 
 `VERSION` is the workspace version in the root `Cargo.toml`
@@ -39,7 +98,7 @@ On an Apple Silicon Mac (macOS) and on a Windows 11 Pro x86_64 PC (Windows):
 | x86_64-apple-darwin | built (minimum macOS 10.15, and a build with 10.13 linked too), the app ran under Rosetta |
 | universal | built (`lipo`), both slices verified |
 | x86_64-pc-windows-msvc | built with `build-windows.ps1` (2026-11-13, Rust 1.99.1, VS 2022 Build Tools, Windows SDK 10.0.26100, Windows PowerShell 5.1 and PowerShell 7); the zip unpacked into a fresh folder, the app ran (isolated data folder) and installed its helper; `cargo test --workspace` 1392 passed, 0 failed, 8 ignored |
-| x86_64 / aarch64 Linux | NOT ported: not built since the Windows port, expected to fail, see below |
+| x86_64 / aarch64 Linux | experimental archives built in Docker; see Linux limitations below |
 | aarch64 Windows (ARM64) | not supported, see below |
 
 The macOS minimum: Rust's own floor is 11.0 on arm64 and 10.12 on Intel; the
@@ -49,7 +108,8 @@ newer macOS than that, so an old Intel Mac can run Connecto but not the agents.
 
 ## Windows
 
-The zip holds `connecto-app.exe`, `connecto-hook.exe`, `connecto.exe`
+The port is on the `windows-port` branch (`docs/windows-port.md` has the details and
+its status). The zip holds `connecto-app.exe`, `connecto-hook.exe`, `connecto.exe`
 (a copy of the helper) and a `README.txt` for the user. The app copies its helper
 from beside itself into `%APPDATA%\connecto\cli\bin` when it starts.
 
@@ -102,7 +162,7 @@ as below (`$env:CONNECTO_RELAY_TOKEN`, `scripts\release\relay-token.local`, or
 - The menu is inside the window (Windows has no system menu bar).
 - SSH: with `SSH_AUTH_SOCK` unset, the Windows OpenSSH agent's pipe
   `\\.\pipe\openssh-ssh-agent`. Implemented and unit-tested, but not yet tried
-  against a real agent.
+  against a real agent (see `docs/windows-port.md` 4.7 for the manual test).
 
 **Unsigned unless set up.** Without signing variables the Windows build is not
 signed: Windows SmartScreen warns the first time it is started on a machine ("More
@@ -112,31 +172,12 @@ info", then "Run anyway"), and the README in the zip says so. See "Signing
 **ARM64 Windows is not supported:** there ring compiles C with clang, which the
 bootstrap does not set up, and no ARM64 build or test has been made.
 
-## Linux is not ported
+## Experimental Linux archives
 
-The Linux script and CI job are in place so they can be run on a native machine,
-but the build has not been made since the Windows port and is expected to fail. By
-reading the code, what stands in the way:
-
-- The secret store: the default secrets file works on Linux too (0600 in a 0700
-  folder); there is no system-store option there (the Keychain and the Credential
-  Manager are the macOS and Windows ones). (`security-framework` is a dependency of
-  `connecto-secrets` only, for macOS.)
-- Agent trust: `connecto-store` checks Apple signatures (`codesign`) on macOS and
-  Authenticode on Windows; Linux has no equivalent.
-- Peer credentials: the hook and bridge sockets read the caller's pid with
-  `LOCAL_PEERPID` (`nix`'s `LocalPeerPid`, macOS only); Linux needs `SO_PEERCRED`.
-- Unix-only code: 36 files mention `std::os::unix`, now behind `cfg` gates, with
-  macOS and Windows branches written and tested; the Linux branches are not.
-  (`libproc` is a macOS crate, used by `connecto-session` only; other platforms
-  read the process tree with `sysinfo`.)
-- Paths: on every Unix the data folder is `~/Library/Application Support/connecto`,
-  the macOS folder; Linux wants an XDG folder (`~/.local/share`).
-- Tools: the computer's name comes from `scutil` (macOS); elsewhere on Unix only
-  `HOSTNAME` is tried.
-
-Rough size: a week or two of focused work (secret store, trust model, peer
-credentials, paths), much of it smaller now that the per-platform modules exist.
+The Linux binaries are packaged on Debian 12 for x86_64 and aarch64. The hook
+and bridge read Unix peer credentials through SO_PEERCRED. Linux still shares
+some macOS conventions, including the data directory and agent signature
+verification. Provisioning agents that require macOS codesign is incomplete.
 
 ## Relay access token (required)
 
@@ -174,8 +215,7 @@ git-ignored: never commit it, keep a copy in your password manager) and prints
 the public key. Put the public key in `crates/connecto-update/update-public-key.txt`
 and commit that file: builds made from then on check feeds against it. A build
 with that file empty has updates turned off ("This build has no update key").
-For CI, add the private key text as the repository secret
-`CONNECTO_UPDATE_SIGNING_KEY`. Losing the private key means existing installs
+Losing the private key means existing installs
 can no longer update themselves (a new key needs a new build, downloaded by hand).
 
 **Each release**, after the builds:
@@ -191,9 +231,6 @@ from `CONNECTO_UPDATE_SIGNING_KEY`, `CONNECTO_UPDATE_SIGNING_KEY_FILE`, or
 on the server first and `update.json` last, so no install reads a feed whose
 files are not there yet. `connecto-update-feed verify dist/update.json` checks a
 feed against the public key built into this checkout.
-
-In CI, the `checksums` job makes `update.json` (artifact `update-feed`) when the
-secret is set.
 
 The updater sends the user agent `Connecto-Updater/<version>`; the site's
 download count (`scripts/site/download-stats`) leaves those downloads out of
@@ -260,42 +297,6 @@ With any of them SmartScreen may still warn for a while on a new release, until
 downloads build reputation; a signature makes the publisher name show instead of
 "Unknown publisher".
 
-## CI
-
-`.github/workflows/release-build.yml` runs the same scripts on native runners. It
-starts only by hand (Actions, "Run workflow"), only uploads the files as run
-artifacts and never publishes a release. For signed macOS builds add the repository
-secrets `CONNECTO_SIGN_IDENTITY` and `CONNECTO_NOTARY_PROFILE` (a CI runner also
-needs the certificate and notary profile installed, which is a setup of its own).
-The `windows` job (`windows-2022`) adds the `x86_64-pc-windows-msvc` target, as
-the macOS job adds its targets, runs `build-windows.ps1` and uploads the zip as
-the artifact `windows-x86_64`. It ran on GitHub for the first time on 2026-11-13
-(about 16 minutes) and its zip started on a Windows 11 PC. The `checksums` job puts
-every artifact's line into one `SHA256SUMS`.
-
-The `windows` job signs with Azure Artifact Signing when the repository variable
-`CONNECTO_WIN_ARTIFACT_SIGNING_ACCOUNT` is set: it installs the
-`Microsoft.ArtifactSigning.Client` package with `nuget` and passes the repository
-variables `CONNECTO_WIN_ARTIFACT_SIGNING_ENDPOINT`, `..._ACCOUNT` and `..._PROFILE`
-and the secrets `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET` to
-the build. Without the variable the zip is unsigned, as before. A certificate on a
-USB token cannot be used from GitHub's runners.
-
-"Run workflow" has two inputs. `only` limits the run to one platform (`macos`,
-`linux` or `windows`; the default `all` builds every platform). `no_relay_token`
-makes a test build with no built-in relay access token (the scripts'
-`CONNECTO_NO_RELAY_TOKEN=1`); never publish such a build.
-
-There is no test CI (no `cargo test` on push or pull request) for any platform.
-Recommended: one workflow that runs `cargo clippy --workspace --all-targets` and
-`cargo test --workspace` on `macos-14` and `windows-2022`.
-
-The build steps need one more repository secret, `CONNECTO_RELAY_TOKEN`: the relay
-access token built into the app (see above). Without it the macOS, Linux and
-Windows build steps fail with "no relay access token". The workflow passes the
-secret only to those build steps, as an environment variable, and nothing prints it.
-Add it under Settings, Secrets and variables, Actions.
-
 ## Publishing a build on the site
 
 The site (`site/`, see its README) lists the downloads in `site/assets/releases.js`;
@@ -308,10 +309,8 @@ The Windows zip, from the Mac (the Windows texts of the landing page and of
 `docs/install.html` appear by themselves once the entry is there):
 
 1. Get a zip built **with** the relay token, from the same commit as the macOS
-   files: either the artifact `windows-x86_64` of a manual run of the
-   `release-build` workflow (with the `CONNECTO_RELAY_TOKEN` secret set; its
-   `SHA256SUMS` artifact has the line), or a run of `build-windows.ps1` on a
-   Windows machine with `CONNECTO_RELAY_TOKEN` or `relay-token.local`, copying
+   files: the release Mac's cross build (`build-tag.sh`), or a run of
+   `build-windows.ps1` on a Windows machine with `CONNECTO_RELAY_TOKEN` or `relay-token.local`, copying
    the zip and the zip's line of `dist\SHA256SUMS`. A zip built with
    `CONNECTO_NO_RELAY_TOKEN=1` is for testing only: never publish it.
 2. Check it on the Mac, in the folder that holds the zip:

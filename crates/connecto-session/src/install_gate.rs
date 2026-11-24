@@ -85,6 +85,17 @@ pub fn is_pending(data_root: &Path, project_id: &str) -> bool {
         .is_some_and(|slot| slot.pending)
 }
 
+/// Whether a package install, or a terminal's start, is under way in any
+/// project of this data folder: an update restart waits for it.
+#[must_use]
+pub fn busy(data_root: &Path) -> bool {
+    gates().get(data_root).is_some_and(|gate| {
+        gate.projects
+            .values()
+            .any(|slot| slot.installing || slot.launchers > 0)
+    })
+}
+
 /// A launch's shared hold on a project. Dropped once the process is spawned.
 pub struct Permit {
     data_root: PathBuf,

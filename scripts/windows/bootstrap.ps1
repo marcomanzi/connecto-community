@@ -8,7 +8,7 @@
 # changes the machine or user execution policy.
 #
 # UNTESTED: this was written on macOS and has not been run on Windows. Run it with
-# -CheckOnly first and fix the script if it misbehaves.
+# -CheckOnly first and fix the script if it misbehaves. See docs/windows-port.md.
 #
 # What building the workspace on Windows needs (checked against Cargo.lock and the
 # build scripts of the locked crates, not guessed):
@@ -362,5 +362,5 @@ if ($script:Missing.Count -gt 0) {
   Write-Host 'Open a new PowerShell window and run it again.'
   exit 1
 }
-Write-Host 'All required tools are present. Next: cargo check --workspace.' -ForegroundColor Green
+Write-Host 'All required tools are present. Next: cargo check --workspace (see docs/windows-port.md).' -ForegroundColor Green
 exit 0

@@ -10,7 +10,7 @@ use crate::bridge::valid_key;
 
 /// The only schema version.
 pub const VERSION: u64 = 1;
-/// The model the first release pins (Jev's router).
+/// The model the first release pins (docs/poc/ARCHITECTURE.md, JevRouter).
 pub const DEFAULT_MODEL: &str = "jev-1.14.0";
 pub const DEFAULT_THRESHOLD: f64 = 0.8;
 /// The placeholders of [`Definition::template`], which the authoring agent

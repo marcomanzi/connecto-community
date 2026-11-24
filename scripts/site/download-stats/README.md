@@ -8,9 +8,9 @@ missing or holds no usable number, the page shows nothing.
 
 ## How it is counted
 
-The release files are served by Caddy from the site's `downloads/` folder. Caddy
-writes one JSON line per request for a `.dmg` or `.zip` in that
-folder into `connecto-downloads.log` in its log folder, without the IP address, port,
+The release files are served by Caddy from `connecto.studio/downloads/` (a
+Caddy container on the site's server; there are no GitHub Releases). Caddy writes one JSON line per request for a `.dmg` or `.zip` in that
+folder into `/config/logs/connecto-downloads.log`, without the IP address, port,
 cookies or response headers (`caddy-snippet.caddy`). Every other request is not
 logged.
 
@@ -30,41 +30,71 @@ themselves: they are counted apart, in `updates`, and never in `total` or
 The count starts when the log is turned on: downloads before that were not
 logged anywhere and cannot be recovered.
 
-## Install (on your web server, as root)
+## Install (on the server, as root)
 
-These steps assume Caddy serves the site; adapt the paths to your server.
+The steps below use these values; set them for your own server first:
 
-1. Copy `count-downloads.py`, the two systemd units and `caddy-snippet.caddy`
-   to the server, then install the script and the timer:
+| Variable | Meaning | Example |
+|---|---|---|
+| `SERVER` | SSH target of the server that runs Caddy | `root@site.example.com` |
+| `SSH_KEY` | Private key for that login | `~/.ssh/site_deploy` |
+| `CADDY_CONTAINER` | Name of the Caddy container | `caddy` |
+| `CADDY_LOG_DIR` | Host folder where the container's `/config/logs` lands (the `_data/logs` folder of the Docker volume mounted at `/config`) | `/var/lib/docker/volumes/caddy_config/_data/logs` |
+| `SITE_DOWNLOADS_DIR` | Host folder served as `connecto.studio/downloads/` | `/var/www/connecto/downloads` |
+
+`CADDY_LOG_DIR` and `SITE_DOWNLOADS_DIR` are read by the systemd service from
+`/etc/default/connecto-download-stats` (one `NAME=value` per line); the
+service's own `Environment=` lines are only defaults.
+
+Follow the server's Caddy rules: back up, validate, then reload gracefully.
+Never restart or recreate containers you do not own.
+
+1. Copy the files:
+
+   ```sh
+   scp -i "$SSH_KEY" -o IdentitiesOnly=yes \
+     scripts/site/download-stats/count-downloads.py \
+     scripts/site/download-stats/connecto-download-stats.service \
+     scripts/site/download-stats/connecto-download-stats.timer \
+     scripts/site/download-stats/caddy-snippet.caddy \
+     "$SERVER":/root/
+   ```
+
+2. Install the script and the timer:
 
    ```sh
    install -d /usr/local/lib/connecto
-   install -m 755 count-downloads.py /usr/local/lib/connecto/count-downloads.py
-   install -m 644 connecto-download-stats.service connecto-download-stats.timer /etc/systemd/system/
+   install -m 755 /root/count-downloads.py /usr/local/lib/connecto/count-downloads.py
+   install -m 644 /root/connecto-download-stats.service /root/connecto-download-stats.timer /etc/systemd/system/
+   printf 'CADDY_LOG_DIR=%s\nSITE_DOWNLOADS_DIR=%s\n' "$CADDY_LOG_DIR" "$SITE_DOWNLOADS_DIR" \
+     > /etc/default/connecto-download-stats
    systemctl daemon-reload
    ```
 
-   In `connecto-download-stats.service`, set `--logs` to the folder Caddy writes
-   the download log to, and `--downloads` to the site's downloads folder.
-
-2. Turn the log on: add the lines of `caddy-snippet.caddy` (without the comment
-   header) inside the site block that serves `/downloads/`, before
-   `file_server`, with the log path you chose. Back up the Caddyfile first, then:
+3. Turn the log on. Add the lines of `caddy-snippet.caddy` (without the comment
+   header) inside the `connecto.studio { ... }` block, before `file_server`. Do
+   this in the Caddyfile the container loads (`docker inspect "$CADDY_CONTAINER"`
+   shows which host file is mounted), and also in whatever source that file is
+   deployed from, or the next deploy drops it. Then:
 
    ```sh
-   caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
-   caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+   docker exec "$CADDY_CONTAINER" mkdir -p /config/logs
+   docker exec "$CADDY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+   docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
    ```
 
-3. Start the timer and run it once:
+4. Start the timer and run it once:
 
    ```sh
    systemctl enable --now connecto-download-stats.timer
    systemctl start connecto-download-stats.service
-   curl -fsS https://<your site>/downloads/stats.json
+   journalctl -u connecto-download-stats.service -n 5
+   curl -fsS https://connecto.studio/downloads/stats.json
    ```
 
-Keep `stats.json` when you redeploy the site (it sits in `downloads/`).
+`stats.json` sits in `downloads/`, which the site redeploy already protects
+(`--filter 'P /downloads/**'`), so a redeploy keeps it. Until a first download
+is counted, `total` is 0 and the page shows nothing.
 
 ## Check it locally
 

@@ -18,17 +18,32 @@ const LOGIN_SHELL_WAIT: Duration = Duration::from_secs(3);
 const BEGIN: &str = "__CONNECTO_PATH_BEGIN__";
 const END: &str = "__CONNECTO_PATH_END__";
 
-/// The folders a login shell would search, asked once per process.
+/// The folders a login shell would search. Asked until the shell answers,
+/// then kept for the process: a shell that was too slow once (a busy
+/// machine, a heavy startup file) is asked again at the next lookup, so one
+/// miss does not leave the whole run without the user's search path.
 #[must_use]
 pub fn login_path() -> &'static [PathBuf] {
     static PATH: OnceLock<Vec<PathBuf>> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let shell = std::env::var_os("SHELL")
-            .map(PathBuf::from)
-            .filter(|shell| shell.is_absolute() && shell.is_file())
-            .unwrap_or_else(|| PathBuf::from("/bin/zsh"));
-        ask_shell(&shell, LOGIN_SHELL_WAIT).unwrap_or_default()
-    })
+    static ASKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if let Some(path) = PATH.get() {
+        return path;
+    }
+    // One question at a time; whoever waited here finds the answer.
+    let _one = ASKING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(path) = PATH.get() {
+        return path;
+    }
+    let shell = std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .filter(|shell| shell.is_absolute() && shell.is_file())
+        .unwrap_or_else(|| PathBuf::from("/bin/zsh"));
+    match ask_shell(&shell, LOGIN_SHELL_WAIT) {
+        Some(path) => PATH.get_or_init(|| path),
+        None => &[],
+    }
 }
 
 /// The most of the shell's output that is kept; a shell that says more than a
@@ -131,6 +146,11 @@ pub fn split_path(value: &str) -> Vec<PathBuf> {
 pub fn known_dirs(home: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = [
         ".bun/bin",
+        // Where Pi's installer puts `pi` when no folder of the search path
+        // will take it.
+        ".pi/agent/bin",
+        // Where OpenCode's installer puts `opencode`.
+        ".opencode/bin",
         ".cargo/bin",
         ".volta/bin",
         ".volta/tools/image/packages/@openai/codex/bin",
@@ -160,17 +180,30 @@ pub fn known_dirs(home: &Path) -> Vec<PathBuf> {
                 .map(|v| v.join(bin)),
         );
     }
-    dirs.push(PathBuf::from("/opt/homebrew/opt/node/bin"));
+    if machine_wide(home) {
+        dirs.push(PathBuf::from("/opt/homebrew/opt/node/bin"));
+    }
     dirs
+}
+
+/// Whether the folders outside `home` (Homebrew's, `/usr/local/bin`) are
+/// searched: only for the user's real home. Any other home (a test, a trial
+/// build) sees only what is under it, so what is installed on the machine
+/// running it cannot change the answer. Same rule as `ambient_path`.
+fn machine_wide(home: &Path) -> bool {
+    crate::platform::home_dir().is_some_and(|real| real == home)
 }
 
 /// The fixed folders, searched last.
 pub fn fixed_dirs(home: &Path) -> Vec<PathBuf> {
-    vec![
-        home.join(".local/bin"),
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-    ]
+    let mut dirs = vec![home.join(".local/bin")];
+    if machine_wide(home) {
+        dirs.extend([
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+        ]);
+    }
+    dirs
 }
 
 /// The system's own folders, the end of every [`super::run_path`].
@@ -201,6 +234,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::canonicalize(root).unwrap()
+    }
+
+    /// Homebrew's and `/usr/local/bin` are the real home's only: a test home
+    /// never finds the agents installed on the machine running it.
+    #[test]
+    fn the_machines_folders_are_searched_for_the_real_home_only() {
+        let fake = tree("machine-wide");
+        let machine = [
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/opt/homebrew/opt/node/bin"),
+        ];
+        let fake_dirs: Vec<PathBuf> = fixed_dirs(&fake)
+            .into_iter()
+            .chain(known_dirs(&fake))
+            .collect();
+        assert!(fake_dirs.contains(&fake.join(".local/bin")));
+        for dir in &machine {
+            assert!(!fake_dirs.contains(dir), "{dir:?} for a test home");
+        }
+        if let Some(home) = crate::platform::home_dir() {
+            let real: Vec<PathBuf> = fixed_dirs(&home)
+                .into_iter()
+                .chain(known_dirs(&home))
+                .collect();
+            for dir in &machine {
+                assert!(real.contains(dir), "{dir:?} for the real home");
+            }
+        }
     }
 
     #[test]

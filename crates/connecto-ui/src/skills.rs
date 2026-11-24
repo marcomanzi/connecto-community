@@ -1,5 +1,6 @@
 //! The Skills & Plugins sheet (Terminal menu): the packages in Connecto Home,
-//! which one is the default, and creating, editing and deleting them.
+//! which one is the default, and creating, editing, deleting, exporting and
+//! importing them.
 
 use connecto_core::{PackageItem, PackagesView};
 use egui::{Id, Key, Rect, RichText, TextEdit, Ui};
@@ -29,6 +30,10 @@ pub(crate) enum SkillsAction {
     Edit(String),
     Delete(String),
     Create(String, Option<String>),
+    /// Ask where to save the package, then export it there.
+    Export(String),
+    /// Ask for an exported package file, then import it.
+    Import,
 }
 
 fn name_id() -> Id {
@@ -104,6 +109,9 @@ fn errors(ui: &mut Ui, state: &SkillsSheet, view: &PackagesView, out: &mut Out<S
     if let Some(error) = &view.last_error {
         out.say(ui, problem(format!("Last error: {error}")));
     }
+    if let Some(notice) = &view.notice {
+        out.say(ui, RichText::new(notice).color(theme::GREEN));
+    }
 }
 
 fn empty_home(ui: &mut Ui, out: &mut Out<SkillsAction>) {
@@ -141,6 +149,10 @@ fn top(ui: &mut Ui, state: &mut SkillsSheet, view: &PackagesView, out: &mut Out<
             state.creating = true;
             state.focus_name = true;
             state.error = None;
+        }
+        if out.button(ui, "import-package", "Import package…", true) {
+            state.error = None;
+            out.actions.push(SkillsAction::Import);
         }
     });
     out.say(
@@ -197,7 +209,7 @@ fn new_form(
         });
         out.say(
             ui,
-            muted("A Claude terminal opens in Connecto Home to ask which skills and plugins to include."),
+            muted("A Claude terminal opens in Connecto Home to ask which skills and plugins to include. Tell it where to take them from, e.g. \"make it from project X\"."),
         );
     });
 }
@@ -265,6 +277,10 @@ fn package_card(
             if out.button_hint(ui, &format!("edit:{id}"), "Edit", !item.builtin, why) {
                 state.error = None;
                 out.actions.push(SkillsAction::Edit(id.clone()));
+            }
+            if out.button_hint(ui, &format!("export:{id}"), "Export…", !item.builtin, why) {
+                state.error = None;
+                out.actions.push(SkillsAction::Export(id.clone()));
             }
             if out.button_hint(ui, &format!("delete:{id}"), "Delete", !item.builtin, why) {
                 state.confirm_delete = Some(id.clone());

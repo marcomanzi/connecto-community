@@ -236,6 +236,7 @@ impl Bridged {
             pause: None,
             utility_settings: None,
             auto_title: false,
+            after_update: false,
         })
         .unwrap();
         let bridged = Self { relay, scene };

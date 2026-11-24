@@ -200,7 +200,7 @@ Three rules hold the design together:
 - UI methods return promptly and never block. No session work, relay step or Stop may depend on a UI pass, because a hidden window runs none (ADR 0011).
 - `crates/connecto-session/tests/dependency_rules.rs` still holds: only `connecto-session` depends on `connecto-gate` and `connecto-pty`, `connecto-adapter` and `connecto-hook` stay below session and gate, and the UI sees only `connecto-core`.
 - `--dangerously-bypass-hook-trust` is never used.
-- Only `USER`, `LOGNAME`, `PATH` and `LANG` are inherited into a terminal. MCP stays off: Claude runs with `--strict-mcp-config` and no `--mcp-config`.
+- Only `USER`, `LOGNAME`, `PATH` and `LANG` are inherited into a terminal. MCP is the user's: a terminal loads the MCP servers of its profile (isolated or the user's own) and of the project, as the plain CLI does. Claude terminals do not pass `--strict-mcp-config`; only utility sessions run without MCP (Claude `--strict-mcp-config`, Codex `-c mcp_servers={}`).
 - Any policy change bumps `POLICY_REVISION`, which every audit record carries.
 
 ### 5.3 Step 1: remove the sandbox, switch off Claude messaging
@@ -316,7 +316,7 @@ struct ProfileUse { sessions: Vec<SessionClaim>, login: bool }
 `Actor::Session` becomes `Actor::Agent`. `decide_deliver` still denies it with `NotUser`, so an agent can never use the manual path or its confirmation logic.
 
 ```rust
-pub enum AgentAction { Type, Keys, Wake, Add, Start, Close }
+pub enum AgentAction { Type, Keys, Wake, Add, Start, Close, StopTasks }
 
 pub struct AgentRequest {
     pub action: AgentAction,
@@ -332,16 +332,17 @@ pub struct AgentRequest {
 /// Captured when the bridge accepts an action, before any queue.
 pub struct Admitted { pub pause_epoch: u64, pub attempt: u64 }
 
-// Pure, like decide_deliver. Add, Start and Close have no target state to check.
+// Pure, like decide_deliver. Add, Start, Close and StopTasks have no target state to check.
 pub const fn decide_agent(action: AgentAction, state: &TargetState) -> Decision;
 ```
 
-The order in `agent_submit` is: paused now, pause epoch equal to the admitted one, target attempt equal to the admitted one, `decide_agent`, durable audit intent. There is no call to `Limits`, so the limits of 6 hops, 4 messages a minute, duplicates and one open delivery do not apply to agents (R3, R7, A16). User Sends keep them. For `Type`, `Keys` and `Wake`, `decide_agent` refuses a target that is not running, and a target in manual mode. `Add`, `Start` and `Close` are process control, so they pass: section 6.2 allows them on a bridge-off target, and `close` on a stopped terminal succeeds. Readiness and busy are not consulted (R3).
+The order in `agent_submit` is: paused now, pause epoch equal to the admitted one, target attempt equal to the admitted one, `decide_agent`, durable audit intent. There is no call to `Limits`, so the limits of 6 hops, 4 messages a minute, duplicates and one open delivery do not apply to agents (R3, R7, A16). User Sends keep them. For `Type`, `Keys` and `Wake`, `decide_agent` refuses a target that is not running, and a target in manual mode. `Add`, `Start`, `Close` and `StopTasks` are process control, so they pass: section 6.2 allows them on a bridge-off target, and `close` on a stopped terminal succeeds. Readiness and busy are not consulted (R3).
 
 - `still_valid` becomes generic over the action. An agent `Authorized` carries the admitted epoch, not the epoch at dequeue.
 - `agent_note` records a read: actor `agent`, source, target, action `read`, no body (A33). It never waits, and is allowed under Pause.
 - Agent text is `sanitize`d, never redacted. `audit_body` holds `redact()` of the same text (A47). If redaction fails, the audit keeps the hash only.
 - `POLICY_REVISION` goes from 3 to 4. New ADR 0015 supersedes ADR 0006, and the README line that nothing moves unless you click Send changes. A21 holds because no operation touches Pause or Stop all.
+- `StopTasks` (`connecto tasks <id> --stop`) takes `POLICY_REVISION` to 5.
 
 ### 5.7 Agent typing in `SessionActor`
 
@@ -402,7 +403,7 @@ The tracker keeps open prompts in order.
 **Pairing several open prompts.** Text typed at a busy target can leave several prompts open. Time alone proves nothing, because a separate queued prompt can sit silent for minutes on a slow tool or model call. So there is no timeout, and a reply is given only on evidence.
 
 - **Codex.** Exact, by turn identity (below). If the id is missing, a request id found in the turn's `input-messages` also proves it.
-- **Claude.** The tail catches up with the transcript at `Stop`. A prompt belongs to this turn if its `user` record sits after the previous `end_turn` assistant record and before the last one. A later record means a separate turn, which stays open. This covers a measured case: a typed prompt landed 0.7 s before a self-started turn's `Stop`, which would otherwise look like the end of the typed turn.
+- **Claude.** The tail catches up with the transcript at `Stop`. A prompt belongs to this turn if its `user` record sits after the previous `end_turn` assistant record and before the last one. A later record means a separate turn, which stays open. This covers a measured case: a typed prompt landed 0.7 s before a self-started turn's `Stop`, which would otherwise look like the end of the typed turn. Turns end in order and each fires one `Stop`, so a `Stop` belongs to the oldest turn that has not had one, and that turn holds the oldest open prompt: every `Stop` closes the oldest open prompt (by count), never a prompt accepted after it. Which other open prompts were in that turn (messages queued into it) only the log shows. The hook gives a prompt's text only and the log's records carry ids the hook never sees, so prompts and records are linked by text and order: each prompt record, as it is read, is assigned once to the earliest open prompt with no record and the same text, and never reassigned (a prompt already closed by count keeps its claim until the next end record). A turn ends at the first end record after its first prompt's record; an end record is an assistant record whose `stop_reason` is `end_turn` or `stop_sequence` (an API failure), outside subagent records, the one rule the adapter uses for the turn log, the reply and past conversations. A `Stop` waits up to 2 s for that end; past it, it closes its first prompt alone, and the others are closed with its reply when its end record, however late, places them, or when a prompt accepted after it shows its record (a separate queued turn would have had its own `Stop` first). If the log shows a later turn already ended, the `Stop`s between were lost, and older prompts end `unavailable`. An API error ends a turn with `StopFailure` instead of `Stop` (Claude Code 2.1.78 and later; it is registered only where Claude knows it, as before 2.1.101 an unknown hook name made Claude ignore the whole settings file): it counts as the turn's `Stop`, and its requests end `unavailable`. `StopFailure` is registered only when the store's probed version of the CLI is known to have it; an unknown or unreadable version gets no `StopFailure` hook. On such a CLI an API-error turn is not settled from the log alone (a late `Stop` would be counted twice): it stays `working` until the next `Stop` or prompt. After every `Stop` the turn log is still read for 600 s (Claude's default command-hook timeout, within which another `Stop` hook decides to keep the turn going), so a continued turn and a late end record are seen; after that an idle terminal's log is not read until its next prompt. A turn that another `Stop` hook keeps going (`decision: "block"`) fires `Stop` again with `stop_hook_active`; that `Stop` closes no prompt by count, and from the moment the log shows the turn at work after its end record the terminal reads `working` until it. A wrong `ok` is worse than `unmatched`: a request the log cannot place for sure (left by a turn whose end record was not seen in time, or past an end record that a later prompt's record shows is a later turn's) ends `unmatched`, never with another turn's reply. Invariants: no `Stop` closes a prompt accepted after it; no prompt is closed by an end record that precedes its own record; with every record and `Stop` arrived, nothing is open, except a message queued into a last turn whose end record is missing or unreadable, which cannot be told from a queued separate turn still to run and stays open (`working`) until a later prompt or `Stop`. There is no recovery by silence.
 - **A prompt older than the previous `end_turn`** had its own turn, and its end was never reported. Its requests end `unavailable`.
 - **No evidence** (no record found, or the log is unreadable): every prompt then open is marked `ambiguous`, and the end closes the oldest of them. Both tools run separate prompts in order, so if they were separate the oldest is the one that ended, and the rest stay open for their own ends. If they were merged, the rest stay open as described below. Requests of `ambiguous` prompts end `unmatched` when their prompt closes, or on interrupt or exit, never `ok`. Being `ambiguous` lasts, so a later end that finds one prompt open still gives `unmatched`.
 
@@ -447,9 +448,18 @@ Check 1 settles which case holds, by comparing three ids from one turn. The resu
 
 So two requests that each left work running cannot overwrite each other's result. Check 8 shows whether notifications name their task. If they do not, overlap gives `unmatched`, and a single waiting turn still works.
 
-`Background` counts as not busy for typing and wakes, but `finished` waits, as R19 says. The design adds no timeout for long background work. It makes the state visible instead: `list` shows `background`, and `result` says `pending`, with the reason that the target has background work running and that `read` is available.
+`Background` counts as not busy for typing and wakes, but `finished` waits, as R19 says. The design adds no timeout for long background work. It makes the work visible, and lets it be stopped, instead:
 
-**Claude specifics.** `Stop` fills `background` from the ids in `background_tasks`. `Notification` becomes `NeedsUser` under the filter in section 3. Without that filter an idle Claude would wake its watchers. `transcript_path` comes from hook payloads, and is used only if it sits under the terminal's profile. The interrupt marker was measured only for a turn interrupted during a tool call. An interrupted Claude turn fires no hook at all: no `Stop`, `StopFailure` or `Notification` in 8 s.
+- The tracker keeps each running task's details from the latest `Stop`, and the time of the `Stop` that first listed it. Its age counts from there. The tracker reads no clock: that time is the `now` of the `Stop`.
+- A task is named by its command for a shell, otherwise by its description, its type, or its id. The name is redacted, put on one line and cut, as history fields are.
+- `list` keeps the state word `background`, marks the row with the number of tasks and the oldest's age, and adds a note. `connecto tasks <id>` lists each task with its id, type, age and name (section 6.2).
+- `result` says `pending`. Its reason says that the target has background work running, names the first three tasks with their type and age, and points to `read` and `connecto tasks`.
+- The desktop row of such a terminal reads `background · <oldest's age>`. After 15 minutes the line turns a calm sand colour (long-running). The row's tooltip lists each task with its age. Its menu has Stop background shells.
+- Stop background shells, and `connecto tasks <id> --stop [task]`, end Claude's background shells (below). Claude then reports each as failed, runs its notification turn, and the next `Stop` clears the phase. Subagents, monitors and workflows are never stopped: the action says that only shells can be.
+
+**Stopping a background shell.** Claude Code runs one as a direct child of the `claude` process: a shell started with `-c`, whose script sources one of Claude's shell snapshots (`.../shell-snapshots/snapshot-...`) and runs the command as `eval '<command>'`. Connecto reads the process list and takes only the children of the terminal's process that are such shells and run a listed shell task's command. The command a `Stop` cut short matches by its start. MCP servers and other children never match. Each shell found gets SIGTERM, to its process group when it leads one of its own and to it and everything under it. What is left after 3 s gets SIGKILL. On Windows the stop is refused as not supported yet. Only the commands of tasks still listed are matched, so nothing else the agent runs is touched.
+
+**Claude specifics.** `Stop` fills `background` from `background_tasks`: each task's `id`, and its `type`, `description` and (for a shell) `command` when given. A bare id is still accepted. `Notification` becomes `NeedsUser` under the filter in section 3. Without that filter an idle Claude would wake its watchers. `transcript_path` comes from hook payloads, and is used only if it sits under the terminal's profile. The interrupt marker was measured only for a turn interrupted during a tool call. An interrupted Claude turn fires no hook at all: no `Stop`, `StopFailure` or `Notification` in 8 s.
 
 **Codex specifics.**
 
@@ -459,6 +469,31 @@ So two requests that each left work running cannot overwrite each other's result
 - With the pin, the thread comparison replaces the `has_rollout` walk, which silently drops a turn end when it runs out of its 50,000-entry budget. The walk stays only for a terminal with no hooks.
 - The turn log is the hook's `transcript_path`, and the interrupt marker is a `turn_aborted` event record (Check 4). The docs warn that this format is not a stable interface. Versions are pinned, so that is acceptable here.
 - Codex readiness stays screen-based. Manual Send benefits from the change, as `working` now reflects Codex turns.
+
+**Antigravity specifics.** Antigravity CLI is Google's `agy`, the successor of Gemini CLI. What follows was read from its documentation and from the strings of the 1.5.11 program. No signed-in turn has been run against it yet (L13).
+
+- **Where the hooks live.** `agy` reads hooks only from `~/.gemini/config/hooks.json` and `<workspace>/.agents/hooks.json`. No flag names another file, and no variable moves its folders. So Connecto keeps one named entry, `connecto`, in the global file, and leaves every other entry as it is. It writes the file at each start, only when the entry differs, and refuses to start a terminal when the file is not a JSON object. The entry runs `connecto-hook antigravity --event <name>` for `SessionStart`, `PreInvocation` and `Stop`. Outside a Connecto terminal the helper has no hook variables, reports nothing and answers `{}`.
+- **No isolated profile.** For the same reason an Antigravity terminal always uses the user's own `~/.gemini` and sign-in. The profile is `~/.gemini/antigravity-cli`. Its sign-in sits in the system keychain.
+- **Files given by path.** Chat uploads and images pasted or dropped on a terminal are kept in `<data>/chat-attachments/<project id>`, outside the workspace, and Antigravity reads outside its workspace only by a permission rule. So at each start Connecto keeps one rule, `read_file(<data>/chat-attachments)`, in `permissions.allow` of `~/.gemini/antigravity-cli/settings.json`, beside the user's own settings and rules. It allows reading that folder and nothing more: `--add-dir` was not used because it makes a workspace folder, which the agent may write. A settings file that is not a JSON object, or whose `permissions` or `allow` has another shape, is left alone, and the terminal starts without that access (L17).
+- **Events.** The helper turns Antigravity's payloads (camelCase) into the ones Claude's hooks send, so the Claude path does the rest:
+
+| Antigravity hook | Connecto event | How |
+| - | - | - |
+| `SessionStart` | `Started` | `conversationId` is the tool session, `transcriptPath` the turn log. Its answer hands the model the launch text, as a system message |
+| `PreInvocation`, first model call of a turn | `PromptSubmitted` | `lastUserInput` is the prompt. A turn's first call is the one whose `initialNumSteps` differs from the last turn's. Its answer hands the model the inbox, as a system message |
+| `PreInvocation`, later calls | none | |
+| `Stop`, `terminationReason` `NO_TOOL_CALL` and the like | `TurnEnded` | The reply is the last `PLANNER_RESPONSE` step without tool calls in `transcript.jsonl`. The helper waits up to 1.5 s for it. A reply the compact transcript cut is `Reply::Dropped` |
+| `Stop`, `USER_CANCELED` | `TurnEnded` with failure `user_canceled` | Requests end `unavailable`, and the terminal goes idle. It does not emit `interrupted` (L14) |
+| `Stop`, `ERROR` or a `MAX_*` limit | `TurnEnded` with that failure | Requests end `unavailable` |
+| `Stop` with `continuationActive` | `TurnEnded`, `continued` | As Claude's `stop_hook_active` |
+| none | `NeedsUser` | Antigravity has no hook for a permission prompt (L15) |
+
+- **Whose events.** The helper keeps a small state file per attempt in the session's temporary folder. It follows the first conversation it sees. Another conversation's events are dropped, unless it starts while no turn is open: that is the user's `/new` or `/clear`. A subagent's conversation starts while a turn is open, so its `Stop` cannot close the main turn (L13).
+- **A turn it starts by itself.** A turn that shows the same `lastUserInput` as the last one is taken for one Antigravity started by itself, and reports no prompt. A person who sends the same words twice in a row is missed the second time (L16).
+- **Turn log.** `transcript.jsonl` under the profile: one step a line. `USER_INPUT` is a prompt, `PLANNER_RESPONSE` without tool calls ends a turn, and one with tool calls is the turn at work. Pairing then follows the Claude rules.
+- **Launch.** `--dangerously-skip-permissions` for full power, `--mode=auto` for auto, no flag for prompts. `--conversation=<id>` resumes. `--model=<name>` picks the model. The first message goes with `--prompt-interactive=<text>`. The launch text is in a file in the run folder, named by `CONNECTO_AGY_LAUNCH_TEXT`. `CONNECTO_AGY_INBOX` is set when the inbox is on.
+- **Readiness.** The input box has not been measured. A send waits for the `SessionStart` hook, then for 1 s, as for the other tools. The screen is not read for drafts or for sign-in and trust screens.
+- **Install.** The official installer, `https://antigravity.google/cli/install.sh` (`install.ps1` on Windows). It puts `agy` in `~/.local/bin` (`%LOCALAPPDATA%\agy\bin`). `agy` updates itself in place, so it runs where it is installed, as Pi does, and the store only records where.
 
 **Adapter methods.** `turn_log(&self, reported: &Path, ctx: &HookCtx) -> Option<PathBuf>`, `read_log(&self, line: &str) -> LogMark`, and `continuation(&self, prompt: &str) -> Option<Continuation>`. `LogMark` is one of `Interrupt`, `TurnComplete`, `Prompt`, `FinalReply` or `Other`.
 
@@ -684,8 +719,10 @@ So at the start of `managed_panes`, `Store::refresh_hook(source)` compares the d
 | `PATH` | `<data>/cli/bin` first | Same |
 | `CONNECTO_BRIDGE_SOCK` | Socket path | Same |
 | `CONNECTO_TERMINAL` | Own id, for the agent's reading only. Never trusted | Same |
-| Launch text (section 6.8) | `--append-system-prompt` | `-c developer_instructions=...` |
+| Launch text (section 6.8) | `--append-system-prompt` | `CONNECTO_CODEX_BRIDGE_TEXT`, handed over by the `SessionStart` hook as `additionalContext` (ADR 0046; `-c developer_instructions` would replace the user's) |
 | Hooks | One command per event, `connecto-hook claude --event <name>`, with `--context` on `UserPromptSubmit` | `-c hooks...` with `connecto-hook codex-hook --event <name>`, `--context` on `UserPromptSubmit`, plus `-c hooks.state=...` |
+
+Pi gets the same values through the extension Connecto loads into it, the launch text as a `connecto-bridge` prompt section (ADR 0046; `--append-system-prompt` would replace Pi's `APPEND_SYSTEM.md`). Antigravity gets the socket, the id and `PATH` the same way; its launch text and hooks are in "Antigravity specifics", section 5.8.
 
 `cli/bin` holds no model CLI, so the private copies stay off `PATH`. `connecto-hook codex-hook` is a new mode that reads stdin. `connecto-hook codex` keeps reading `notify`'s argument.
 
@@ -703,7 +740,7 @@ So at the start of `managed_panes`, `Store::refresh_hook(source)` compares the d
 | Audit stalls | `audit_failed`, nothing typed |
 | Session actor stuck | The caller gets `timeout`. Other terminals are unaffected |
 | Event channel full | A notification is lost. It is counted, found on the next tick, and reported to the watchers. Request ends, wake outcomes and `exited` use the lossless outbox, so a pending request or a wake never waits on a lost message |
-| Unread-notice wake fails, or Pause is on | One attempt per stop, nothing queued. A wake never typed gives its notices back for the next stop. A typed wake that was swallowed leaves them for the next prompt, which may not come (L12) |
+| Unread-notice wake fails, or Pause is on | One attempt per stop, plus the bridge-state retry (10 s, doubling to 5 min) while the agent is not working, not paused and has no draft. A wake never typed gives its notices back. A typed wake that was swallowed leaves them for the next prompt (L12) |
 | `terminals.json` unreadable | Default two, warning, bad file kept. If the file can't be read or renamed: read-only list mode (section 5.4) |
 | Saving the list fails | Add and remove are refused with `save_failed`, and nothing changes. Starts and stops happen anyway, the list is marked unsaved, retries run every 30 s, and a warning shows until a save succeeds |
 | App crash or `kill -9` | Sockets stay in the folder and are replaced on bind. The list keeps its last state, so running terminals restart |
@@ -742,7 +779,7 @@ The bridge socket sits in an owner-only folder. There is no token: a request fra
 
 ### 6.2 The `connecto` command
 
-These are the ten operations (A43). Long text arrives on stdin. With no text argument and a TTY on stdin, it is a usage error.
+These are the eleven operations (A43). Long text arrives on stdin. With no text argument and a TTY on stdin, it is a usage error.
 
 | Command | Prints on stdout | Under Pause |
 | - | - | - |
@@ -755,12 +792,14 @@ These are the ten operations (A43). Long text arrives on stdin. With no text arg
 | `connecto add claude\|codex` | The new id and its state | Refused |
 | `connecto start <id>` | Id and state | Refused |
 | `connecto close <id>` | Stops the terminal and removes it: `<id> stopped and removed`, `<id> is stopping and will be removed`, or `<id> stopped, but not removed: <reason>` for the last terminal or an unwritable list | Refused |
+| `connecto tasks <id>` | The background work its agent left running: a line with the id and state, then a table of task, type, age (`(long)` after 15 minutes) and what it runs. `<id> has no background work running.` when there is none | Allowed |
+| `connecto tasks <id> --stop [task]` | Stops its background shells, or only that task: `Stopping 1 background shell. ...`. Same rules as `keys`: only a terminal of yours, through the Gate. A subagent, monitor or workflow gives `nothing_to_stop`, saying that only shells can be stopped | Refused |
 
 Every `send` that is not refused before any paste has a request id and records a result (section 5.12). Any agent in the project can read any result.
 
 **Keys.** `enter esc tab space backspace delete up down left right home end pageup pagedown insert`, `f1` to `f12`, `shift-tab`, `ctrl-<letter>`, `alt-<letter>`, or any single printable character, sent as that character. Anything else is refused with `unknown_key`, before any key is sent.
 
-**State words in `list`:** `starting`, `idle`, `working`, `background`, `needs-user`, `stopped`, `exited`, `needs-login`, `logging-in`, `failed`.
+**State words in `list`:** `starting`, `idle`, `working`, `background`, `needs-user`, `stopped`, `exited`, `needs-login`, `logging-in`, `failed`. A `background` row also has the mark `<n> tasks, oldest <age>`, with `, long-running` after 15 minutes, and a note that `connecto tasks <id>` lists them. `seconds` stays the time in the state.
 
 **`close` on your own terminal** is allowed (R13). Its client dies with the terminal, so the order is fixed: Gate and audit first, then the reply with state `closing`, and Stop 250 ms later on the registry thread, only if the attempt is still the admitted one, so a quick restart is not killed. Refusals are sent before anything happens. The reply is best effort, as the agent may not live to read it. The delayed Stop is not checked against Pause again, since stopping is the safe direction.
 
@@ -771,11 +810,11 @@ Every `send` that is not refused before any paste has a request id and records a
 | Operation | Caller is bridge off | Target is bridge off |
 | - | - | - |
 | Every operation | `bridge_off` | |
-| `list`, `read`, `result` | | Allowed. `list` marks it. These depend on no tool behaviour |
+| `list`, `read`, `result`, `tasks` | | Allowed. `list` marks it. These depend on no tool behaviour |
 | `send`, `keys` | | `bridge_off`. Wakes are not typed |
 | `watch` | | `bridge_off`, because it would never report events |
 | `unwatch` | | Allowed |
-| `start`, `close` | | Allowed. These are process control, and the terminal stays off |
+| `start`, `close`, `tasks --stop` | | Allowed. These are process control, and the terminal stays off |
 | `add` | | Allowed. A new terminal on an unverified version comes up off, and `list` says so |
 
 **Exit codes:**
@@ -803,6 +842,8 @@ A request is an existing hook frame (`connecto_hook::encode`) with an empty toke
 { "v": 1, "op": "add", "tool": "claude" }
 { "v": 1, "op": "start", "target": "claude-2" }
 { "v": 1, "op": "close", "target": "claude-2" }
+{ "v": 1, "op": "tasks", "target": "claude-2", "stop": false }
+{ "v": 1, "op": "tasks", "target": "claude-2", "stop": true, "task": "b1" }
 { "v": 1, "op": "drain", "event": "UserPromptSubmit" }
 ```
 
@@ -811,11 +852,12 @@ A reply is a big-endian `u32` length and a JSON header. For `read`, `result` and
 | Op | Header on success | Body |
 | - | - | - |
 | `list` | See below | None |
-| `send`, `keys` | `{ "ok": true, "id": "r12", "state": "typed" }` | None |
+| `send`, `keys` | `{ "ok": true, "id": "r12", "state": "typed" }`. A `send` to a terminal whose user has a draft Connecto cannot move aside answers at once with `"state": "waiting"` and a `note` the command prints: the text is typed when the user sends or clears their line, or refused after 5 minutes. `result` says `pending` meanwhile, and an `--ask` sender gets the usual end notice | None |
 | `read` | `{ "ok": true, "history_full": false }` | Text |
 | `result` | `{ "ok": true, "state": "ok", "from": "claude", "target": "codex-2", "reason": null }` | The reply, only when `state` is `ok` |
 | `watch`, `unwatch` | `{ "ok": true, "target": "codex-2", "watching": true }` | None |
 | `add`, `start`, `close` | `{ "ok": true, "id": "claude-2", "state": "starting", "saved": true }`. `saved` is false when a change of `desired` could not be written yet | None |
+| `tasks` | `{ "ok": true, "id": "claude-2", "state": "background", "tasks": [ { "id": "b1", "type": "shell", "label": "python3 grind.py big.log", "seconds": 8400, "age": "2 h 20 min", "long": true } ] }`. With `stop`: `{ "ok": true, "id": "claude-2", "state": "stopping", "note": "..." }` | None |
 | `drain` | `{ "ok": true }` | Bytes to print |
 
 `watch` and `unwatch` are idempotent. `close` on a stopped terminal succeeds and removes it. The `close` reply header carries `removal` (`done`, `pending` or `kept`) and, for `kept`, a `reason`. A refusal is the same for every op, with no body:
@@ -836,7 +878,7 @@ A reply is a big-endian `u32` length and a JSON header. For `read`, `result` and
 ] }
 ```
 
-`seconds` is time in the current state, `last_event` is null before the first one, and `bridge_reason` is set when `bridge` is `off`.
+`seconds` is time in the current state, `last_event` is null before the first one, and `bridge_reason` is set when `bridge` is `off`. A terminal in `background` also carries `background`: its tasks, oldest first, as `tasks` gives them. It is null otherwise.
 
 `drain` is used only by the helper, and is not one of the ten operations. It is allowed under Pause, because under Pause notices arrive as context. Its body is the exact bytes to print: `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"..."}}`, the form both tools document. The host builds that JSON, so the helper stays simple. With nothing to render (section 6.7) the body is empty, and the helper prints nothing.
 
@@ -861,6 +903,8 @@ A reply is a big-endian `u32` length and a JSON header. For `read`, `result` and
 | `unknown_request`, `unknown_key`, `bad_request`, `bad_version` | The request is wrong |
 | `no_content` | Nothing to read: never started, or the app has restarted since |
 | `logging_in` | The terminal is running a login, so it can't be read, written, watched or started. `close` still works |
+| `nothing_to_stop` | `tasks --stop` found no background shell to stop: none runs, the task named is not a shell, or Claude did not say its command |
+| `not_stopped` | `tasks --stop` found no process for the shells (they may have just ended), or the platform cannot stop them (Windows) |
 | `timeout` | No outcome in 30 s. The text may or may not have been typed. Not retried. Carries the request id for `send`, and the key id for `keys` |
 
 ### 6.5 Request states
@@ -1116,7 +1160,7 @@ Each is a first-release default, expected to change as things are tried.
 | A40 | A request is an agent message with a request id. A sender using `--ask` is told when that request ends. It gets a short notice, by wake if not busy or next-prompt context if busy, and then reads the result. A sender that stops being busy with that notice unread gets one wake (R5). Nothing blocks the sender | Medium |
 | A41 | The result is only the target's final reply for the turn that handled that request, matched by the request id seen at prompt submission. It has no screen or tool output. If the turn was interrupted, the terminal exited, or no match can be made, the result says so, and the agent can read everything instead | Medium: text typed at once to a busy target makes matching depend on the id reaching the hook |
 | A42 | Results are kept in memory for the life of the app, so they survive a terminal stopping but not a Connecto restart. Up to 64 MiB of replies are held, because R7 allows loops with no end. Past that the oldest reply goes and its request says `unavailable`. A reply over the 256 KiB frame limit also reports `unavailable` | Low: an agent can still read everything |
-| A43 | "Lean" means the smallest set of operations that meets the answers, which is ten: list, send, keys, read, result, watch, unwatch, add, start, close. Any agent in the project can read any result | Low |
+| A43 | "Lean" means the smallest set of operations that meets the answers, which was ten: list, send, keys, read, result, watch, unwatch, add, start, close. `tasks` makes eleven, to see and stop background work (L10). Any agent in the project can read any result | Low |
 | A44 | Interrupted turns: Claude is detected from the transcript. Codex is best effort, because its `Interrupt` hook has not been run | Medium: a watcher of Codex may hear nothing |
 | A45 | The bridge applies to every terminal started on the new build | Low |
 | A46 | Codex plan and credits stay unknown for the first release. Usage is not metered | Medium: see A16 |
@@ -1127,7 +1171,7 @@ Each is a first-release default, expected to change as things are tried.
 | Id | Shown to the user? | Limit |
 | - | - | - |
 | L1 | Not recorded | Pause and the messaging switch-off cover Connecto's routes and the tool's launch settings. Still untested: raw socket writes, posting to a peer's socket through Bash, and editing settings mid-session. An agent with a shell can also run `codex queue` itself. None of this can be fully closed with no sandbox |
-| L2 | Told, draft guards declined | Typed text can land in a half-typed prompt, and Enter then submits both |
+| L2 | Told; a draft guard was added later | While Connecto types into a terminal, the user's keys are held and go in after. A draft Connecto could follow from the user's keys is taken out (Right, then Backspace), the text is entered alone, and the draft is pasted back with the cursor where it was. A draft it could not follow (after Up, Tab, Esc, a word move, a pasted image) is never typed into: a send waits up to 5 minutes for the user to send or clear the line (separate from the 25 s wait for a starting tool), its sender is answered `waiting` at once, and the pane says "Connecto has a message waiting: send or clear your line"; past 5 minutes it is refused and never typed. A notice goes back to the inbox. A long draft comes back as the tool's paste placeholder, with the cursor at its end |
 | L3 | Not recorded | A send to a refusing Claude session reports success, then a refusal notice starts an extra turn on the sender |
 | L4 | Stated when "no approval" was chosen | With no sandbox and no approval, text on one screen can steer an agent with full access to the Mac |
 | L5 | Told, and chose to type at once | Typed Enter can pick the highlighted option on a Claude menu, because Connecto can't see menus there. Nothing is held for a busy target, so how a busy tool treats typed text is up to the tool |
@@ -1135,9 +1179,14 @@ Each is a first-release default, expected to change as things are tried.
 | L7 | Told and accepted | A20 conflicts with the user's saved rule that mutation tests of guards on paid calls must fail locally under an OS network deny |
 | L8 | **Not yet shown** | "Nothing left" can't be fully met on Codex: **Codex "finished" can't mean no background work is left.** No Codex signal for background work is known, and Codex background shells were never tested. So on Codex `finished` means the main thread's turn ended, and background shells may still be running. A watcher can be woken early, and a result can arrive before that work ends. No alternative exists to offer, so this is a limit and not a question |
 | L9 | Not recorded | "No limit" removes the rate, hop and 4096-byte limits. Resource bounds stay, each refused with a reason: a 256 KiB request frame, the 1 MiB input queue, a bounded write queue per target, and 32 bridge connections at once. The inbox is bounded too: when full it merges entries and says how many it merged. Held results are capped at 64 MiB. None of these stops agents waking each other |
-| L10 | **Not yet shown** | `finished` waits for all Claude background work. A long `monitor` task holds it back, and a background shell that never ends, such as a dev server, holds it back for as long as it runs. A request to that terminal stays `pending` over the same time, so a sender using `--ask` gets no notice. The sender is not stuck: `list` shows `background`, `result` says `pending`, and it can read everything |
+| L10 | **Not yet shown** | `finished` waits for all Claude background work. A long `monitor` task holds it back, and a background shell that never ends, such as a dev server, holds it back for as long as it runs. A request to that terminal stays `pending` over the same time, so a sender using `--ask` gets no notice. The sender is not stuck: `list` shows `background` with the oldest task's age, `result` says `pending` and names what runs, `connecto tasks` lists each task, and it can read everything. A Claude background shell can be stopped from the terminal's menu or with `connecto tasks <id> --stop`. A subagent, monitor or workflow cannot: it holds `finished` until it ends |
 | L11 | **Not yet shown** | Two agents that watch each other can keep waking each other with nothing new to say, because each wake starts a turn, and that turn's events wake the other. `finished` alone does this, and `began` makes it faster. Each wake is a model turn on the plan. Accepted under "no limit". Only an explicit `watch` causes it: `--ask` wakes on the end of a request only. The unread-notice wake adds at most one more wake after each busy spell. It can't loop by itself, because a new wake needs a new event |
-| L12 | **Not yet shown** | The unread-notice wake is one attempt each time an agent stops working. It is not typed under Pause (A34), and nothing is queued for Resume. A wake that was never typed, because the agent was busy, it was refused, it was stale, or it had no outcome in 30 s, puts its still-unread notices back in line for a wake. The next time that agent stops working may try again. Nothing retries at once, and an idle agent is never woken again for the same notices. A wake that was typed but swallowed puts nothing back: its notices wait for the next prompt. So an agent that stops working during Pause, or whose wake fails, can keep those notices until it next stops working or gets a prompt, and neither may come. A drain commits when the reply is written to the socket. If that write fails, nothing is cleared and the notices wait for the next prompt. If the helper dies after it, those notices are lost, which fits A29's at-most-once delivery |
+| L12 | **Not yet shown** | The unread-notice wake is tried each time an agent stops working. It is not typed under Pause (A34), and nothing is queued for Resume. A wake that was never typed, because the agent was busy, it was refused, it was stale, it had no outcome in 30 s, or a turn started between its paste and Enter (then the text is taken back off the input line), puts its still-unread notices back in line for a wake. The next time that agent stops working tries again, and so does a safety net in bridge state: while wanted notices wait in the inbox of an agent that is not working, with no wake on its way, Connecto not paused and no user draft in the input line, a wake is tried again after 10 s, then after twice as long each time, up to 5 minutes. Nothing retries at once, and a wake is never typed into a working agent or over a user's draft. A wake that was typed but swallowed puts nothing back: its notices wait for the next prompt. So an agent that stops working during Pause can keep those notices until Pause ends and it next stops working or gets a prompt. A drain commits when the reply is written to the socket. If that write fails, nothing is cleared and the notices wait for the next prompt. If the helper dies after it, those notices are lost, which fits A29's at-most-once delivery. Every wake that typed nothing is in the audit log as `busy`, `not_ready`, `parked`, `retried` or `withdrawn`, with a fixed reason |
+| L13 | Not recorded | Antigravity was never run signed in. Its hook payloads, its transcript format and the moment the final reply reaches the transcript come from its documentation and the strings of version 1.5.11. Whether `SessionStart` fires for a resumed conversation, and whether subagents run the user's hooks, are not known. If `SessionStart` does not fire on resume, a send to a resumed Antigravity terminal waits until its first turn and can time out |
+| L14 | Not recorded | An interrupted Antigravity turn ends its requests `unavailable` and the terminal goes idle, with `finished` and not `interrupted`: the event model has no hook-reported interrupt, and the transcript format of a cancelled turn is not known |
+| L15 | Not recorded | Antigravity has no hook for a permission prompt or a question, so it is never marked as needing the user. With launch modes other than full power, a terminal can sit at a prompt and read `working` |
+| L16 | Not recorded | Antigravity's `fullyIdle` is not used: `finished` can come while its background tasks run, as on Codex (L8). A prompt sent twice in a row with the same words is not reported the second time. Connecto writes one entry into the user's global `~/.gemini/config/hooks.json`; it stays there when Connecto is removed, and the helper it names then no longer exists |
+| L17 | Not recorded | Antigravity's reading of the attachments folder through the `read_file` rule is from its permissions documentation and was not run signed in. A path with spaces (`Application Support` on macOS) inside the rule's parentheses is assumed to match as written. Antigravity rewrites its settings file sparsely; if it ever drops the rule, the next start adds it back. |
 
 ### 9.3 Assumptions the user accepted
 
@@ -1195,7 +1244,7 @@ Accepted for the first release. None holds it up.
 - Codex interrupt detection (A44), and `needs-user` for Codex (A15).
 - Nested subagents in `finished`, and background work on Codex (L8). Codex's `task_started` and `task_complete` rollout records may help. Not checked.
 - `codex queue` or hook wakes in place of typing, if L2 or L5 cause trouble.
-- Draft guards and resume, if wanted after trying it.
+- Resume, if wanted after trying it.
 - Usage metering, or limits on unattended loops (A16, A46).
 - A way past unverified versions (A32).
 - Behaviour at eight live terminals.
@@ -1287,7 +1336,7 @@ The user's overall direction, word for word: "go for all your assumptions, we sh
 | Every R4 event wakes a not-busy watcher, `began` included | `began` never wakes | The original request names "started" as an event. The worry that a wake could set off another applies equally to `finished`, and Q6 accepted it |
 | Unread-notice wake | Leaving notices for a next prompt | An agent that goes idle may have no next prompt, so a watcher or `--ask` sender could never hear what it asked for |
 | Reply pairing uses evidence, with no timeout | Pairing by time | A silent queued prompt can last minutes, so time proves nothing |
-| No timeout for long background work | A rule ending `finished` after a time | Follows Q27. Listed as a later fix |
+| No timeout for long background work | A rule ending `finished` after a time | Follows Q27. Instead the work is shown with its age, marked long-running after 15 minutes, and a background shell can be stopped by the user or its owner. A rule is still a later fix |
 | R15 ships in step 1 | R15 with the bridge | Sandbox removal reopens Claude's messaging until R15 lands |
 | A shrunk `notify` carries `connecto_input_total`, keeping positions absolute | Disabling input-based pairing when entries are dropped | Retained entries stay usable as evidence, and any lost ones fail towards `unmatched` |
 | `hooks/list` runs under one lock and is cached, failures included | Retrying a failed read at each start | A terminal launched without hooks is live, and a retry would read beside it |

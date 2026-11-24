@@ -34,13 +34,13 @@ enum Filter {
 }
 
 /// The tabs of the filter strip: All, then every kind that can have automations
-/// (a plain shell cannot).
+/// (Claude and Codex: there are none for Pi's screens, and a plain shell
+/// cannot have any).
 fn filter_tabs() -> Vec<Filter> {
     std::iter::once(Filter::All)
         .chain(
-            ToolKind::ALL
+            [ToolKind::Claude, ToolKind::Codex]
                 .into_iter()
-                .filter(|kind| kind.is_agent())
                 .map(Filter::Only),
         )
         .collect()

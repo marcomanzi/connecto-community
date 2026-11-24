@@ -16,3 +16,6 @@ scripts/release/relay-token.local
 
 # The private key that signs the update feed (never committed)
 scripts/release/update-signing-key.local
+
+# Release settings for scripts/release/release.sh: signing, deploy host (never committed)
+scripts/release/release.local

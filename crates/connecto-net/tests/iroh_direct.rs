@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ use connecto_core::{
 use connecto_gate::Gate;
 use connecto_net::auth::{AuthorizedKeySet, KeySigner};
 use connecto_net::client::{ClientError, RemoteClient};
-use connecto_net::host::{FixedTerminals, HostService, HostTerminal, RingTap};
+use connecto_net::host::{FixedTerminals, HostService, HostTerminal, HostTerminals, RingTap};
 use connecto_net::iroh_transport::{IrohConfig, IrohNode, PeerAddr};
 use connecto_net::seq::Ring;
 use connecto_net::transport::PathKind;
@@ -34,6 +35,9 @@ struct Fake {
 }
 
 impl TerminalSession for Fake {
+    fn chat_history(&self) -> Option<Arc<connecto_core::session::ChatHistory>> {
+        Some(Arc::new(connecto_core::session::ChatHistory::default()))
+    }
     fn poll_snapshot(&self, out: &mut TermSnapshot) -> SnapshotOutcome {
         self.emulator.poll_snapshot(out)
     }
@@ -108,7 +112,25 @@ struct Setup {
     allowed: PrivateKey,
 }
 
+struct SharedTerminals {
+    terminals: FixedTerminals,
+    attachments: Option<tempfile::TempDir>,
+}
+
+impl HostTerminals for SharedTerminals {
+    fn list(&self) -> Vec<HostTerminal> {
+        self.terminals.list()
+    }
+    fn attachment_root(&self) -> Option<&Path> {
+        self.attachments.as_ref().map(tempfile::TempDir::path)
+    }
+}
+
 fn setup() -> Setup {
+    setup_with_attachments(None)
+}
+
+fn setup_with_attachments(attachments: Option<tempfile::TempDir>) -> Setup {
     let allowed = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
     let ring = Arc::new(Ring::new(1 << 20));
     let fake = Arc::new(Fake {
@@ -129,15 +151,30 @@ fn setup() -> Setup {
     ));
     let guard = Arc::new(RemoteGate::with_gate(Arc::clone(&gate)));
     guard.set_enabled(true);
-    let terminals = Arc::new(FixedTerminals(Mutex::new(vec![HostTerminal {
-        id: 1,
-        name: "claude-1".into(),
-        tool: 1,
-        attempt: 1,
-        activity: 0,
-        session: Arc::clone(&fake) as Arc<dyn TerminalSession>,
-        ring,
-    }])));
+    let name = if attachments.is_some() {
+        connecto_core::session::APP_SESSION
+    } else {
+        "claude-1"
+    };
+    let terminals = Arc::new(SharedTerminals {
+        attachments,
+        terminals: FixedTerminals(Mutex::new(vec![HostTerminal {
+            entry: None,
+            ran: true,
+            owner: None,
+            background: Vec::new(),
+            id: 1,
+            name: name.into(),
+            tool: 1,
+            project_id: "p".into(),
+            project_name: "Project".into(),
+            parent: None,
+            attempt: 1,
+            activity: 0,
+            session: Arc::clone(&fake) as Arc<dyn TerminalSession>,
+            ring,
+        }])),
+    });
     let keys = Arc::new(
         AuthorizedKeySet::parse(&format!("{}\n", allowed.public_key().to_openssh().unwrap()))
             .unwrap(),
@@ -277,4 +314,45 @@ fn dialing_an_id_that_is_not_the_host_never_reaches_the_handshake() {
         direct: setup.host_node.direct_addrs(),
     });
     assert!(result.is_err());
+}
+
+#[test]
+fn an_authenticated_iroh_peer_uploads_bytes_and_gets_a_host_reference() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().to_owned();
+    let setup = setup_with_attachments(Some(root));
+    let node = IrohNode::start(&config(5)).unwrap();
+    let signer = KeySigner(setup.allowed.clone());
+    let client = RemoteClient::connect(
+        dial(&setup, &node),
+        "build-box",
+        &setup.host_node.id(),
+        &signer,
+    )
+    .unwrap();
+    client.list().unwrap();
+    let remote = connecto_net::client::RemoteSession::new(
+        connecto_net::wire::TerminalAddr {
+            host: "build-box".into(),
+            terminal: 1,
+        },
+        GridSize { cols: 60, rows: 12 },
+        Arc::new(|| {}),
+    );
+    remote.attach(&client, 1).unwrap();
+    wait_until("chat history", || remote.chat_history().is_some());
+    wait_until("attachment support", || remote.chat_attachments_supported());
+    let bytes = vec![0xE7; 300_000];
+    let reference = remote
+        .upload_chat_attachment("p", &"1".repeat(32), "photo.bin", &bytes)
+        .unwrap();
+    assert!(Path::new(&reference).starts_with(path.join("chat-attachments").join("p")));
+    assert_eq!(std::fs::read(&reference).unwrap(), bytes);
+    remote
+        .send_chat_input(reference.as_bytes().to_vec())
+        .unwrap();
+    wait_until("host-side reference in terminal input", || {
+        *setup.fake.typed.lock().unwrap() == reference.as_bytes()
+    });
+    client.close();
 }

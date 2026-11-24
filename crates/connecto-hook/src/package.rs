@@ -15,6 +15,9 @@ pub const FILE_NAME: &str = "package.json";
 pub const TOOL_DIRS: [&str; 3] = [".claude", ".codex", ".agents"];
 pub const MAX_NAME_CHARS: usize = crate::name::MAX_NAME_CHARS;
 pub const MAX_DESCRIPTION_CHARS: usize = 500;
+/// The packages built into Connecto: its team workflows, and Game Dev (Godot).
+/// A package may extend them though no folder holds them.
+pub const BUILTIN_IDS: [&str; 2] = ["connecto", "game-dev"];
 
 /// `package.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +28,9 @@ pub struct Manifest {
     pub version: u32,
     /// The id of the package this one builds on.
     pub extends: Option<String>,
+    /// The tools it needs on the machine (ADR 0037). A project cannot add the
+    /// package while one is missing.
+    pub requires: Vec<crate::requires::Requirement>,
 }
 
 /// A package id is its folder name: lowercase letters, digits and `-`.
@@ -51,7 +57,7 @@ impl Manifest {
         };
         let mut errors = Vec::new();
         for key in object.keys() {
-            if !["name", "description", "version", "extends"].contains(&key.as_str()) {
+            if !["name", "description", "version", "extends", "requires"].contains(&key.as_str()) {
                 errors.push(format!("unknown field {key:?}"));
             }
         }
@@ -100,12 +106,17 @@ impl Manifest {
                 None
             }
         };
+        let requires = object
+            .get("requires")
+            .map(|v| crate::requires::parse_list(v, &mut errors))
+            .unwrap_or_default();
         if errors.is_empty() {
             Ok(Self {
                 name,
                 description,
                 version,
                 extends,
+                requires,
             })
         } else {
             Err(errors)
@@ -120,6 +131,13 @@ impl Manifest {
         object.insert("version".into(), json!(self.version));
         if let Some(base) = &self.extends {
             object.insert("extends".into(), json!(base));
+        }
+        if !self.requires.is_empty() {
+            let list = self
+                .requires
+                .iter()
+                .map(crate::requires::Requirement::to_json);
+            object.insert("requires".into(), Value::Array(list.collect()));
         }
         Value::Object(object)
     }
@@ -267,7 +285,9 @@ pub fn check_dir(dir: &Path) -> (bool, String) {
     }
     if let Some(base) = &manifest.extends {
         let sibling = dir.parent().map(|p| p.join(base));
-        if base != "connecto" && !sibling.is_some_and(|p| p.join(FILE_NAME).is_file()) {
+        if !BUILTIN_IDS.contains(&base.as_str())
+            && !sibling.is_some_and(|p| p.join(FILE_NAME).is_file())
+        {
             problems.push(format!("\"extends\": no package {base:?} next to this one"));
         }
     }

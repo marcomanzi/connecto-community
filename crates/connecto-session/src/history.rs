@@ -74,14 +74,6 @@ fn tail_bytes(text: &str, max: usize) -> &str {
     &text[start..]
 }
 
-fn tool_from(name: &str) -> Option<ToolKind> {
-    match name {
-        "claude" => Some(ToolKind::Claude),
-        "codex" => Some(ToolKind::Codex),
-        _ => None,
-    }
-}
-
 /// Safe as a file name: what Connecto itself makes.
 fn valid_history_id(id: &str) -> bool {
     (1..=80).contains(&id.len())
@@ -209,7 +201,7 @@ impl History {
                 id,
                 terminal_id: text("terminal_id")?,
                 name: text("name"),
-                tool: tool_from(item["tool"].as_str()?)?,
+                tool: ToolKind::from_name(item["tool"].as_str()?)?,
                 parent: text("parent"),
                 closed_at_ms: item["closed_at_ms"].as_u64()?,
                 task: text("task"),
@@ -387,6 +379,22 @@ mod tests {
         assert_eq!(loaded, records);
         assert_eq!(loaded[0].entry.id, "h2-claude", "newest first");
         assert_eq!(history.transcript("h1-claude").unwrap(), "hello");
+        let _ = fs::remove_dir_all(&history.dir);
+    }
+
+    #[test]
+    fn every_kind_of_terminal_round_trips() {
+        let history = scratch("kinds");
+        let mut records = Vec::new();
+        for (at, tool) in (1..).zip(ToolKind::ALL) {
+            let mut kind = record(&format!("h{at}-{}", tool.name()), at);
+            kind.entry.tool = tool;
+            kind.entry.terminal_id = tool.name().to_owned();
+            history.add(&mut records, kind, "text").unwrap();
+        }
+        let (loaded, warning) = history.load();
+        assert_eq!(warning, None, "a closed shell is not an unusable entry");
+        assert_eq!(loaded, records);
         let _ = fs::remove_dir_all(&history.dir);
     }
 

@@ -425,6 +425,123 @@ impl Gate {
         })
     }
 
+    /// Record an agent's action that crosses projects (ADR 0035), in the
+    /// project this gate serves: `source` and `target_name` name the other
+    /// project where they are in it. Never waits; the action itself, if it
+    /// types, also passes [`Gate::agent_submit`] in the target project.
+    pub fn agent_cross_note(
+        &self,
+        source: &str,
+        target_name: &str,
+        action: &str,
+        decision: &str,
+        reason: &str,
+    ) -> bool {
+        self.audit.append_nowait(Record {
+            actor: Actor::Agent.name().to_owned(),
+            source: source.to_owned(),
+            target: target_name.to_owned(),
+            action: action.to_owned(),
+            decision: decision.to_owned(),
+            reason: reason.to_owned(),
+            policy_revision: POLICY_REVISION,
+            pause_epoch: self.pause.epoch(),
+            evidence_class: self.evidence_class.to_owned(),
+            project: self.project.clone(),
+            ..Record::default()
+        })
+    }
+
+    /// The intent of an agent's action that crosses projects (ADR 0035),
+    /// durable before the action. Gives the Pause epoch it was admitted in,
+    /// for the caller to check again right before it acts; an error means
+    /// Pause is on or the log did not take it, and nothing may be done.
+    /// Blocks up to [`AUDIT_WAIT`], so never call it on the UI thread.
+    pub fn agent_cross_intent(
+        &self,
+        source: &str,
+        target_name: &str,
+        action: &str,
+    ) -> Result<u64, Denial> {
+        // The epoch first, then the flag: a Pause after this read changes
+        // the epoch, which the caller checks again.
+        let epoch = self.pause.epoch();
+        if self.pause.is_paused() {
+            return Err(Denial::Paused);
+        }
+        self.cross_record(&self.project, source, target_name, action, "allow", "")
+            .map(|()| epoch)
+    }
+
+    /// Record a cross-project action's refusal or outcome, durably: false
+    /// when the log did not take it in [`AUDIT_WAIT`]. Never call it on the
+    /// UI thread.
+    #[must_use]
+    pub fn agent_cross_record(
+        &self,
+        source: &str,
+        target_name: &str,
+        action: &str,
+        decision: &str,
+        reason: &str,
+    ) -> bool {
+        self.cross_record(&self.project, source, target_name, action, decision, reason)
+            .is_ok()
+    }
+
+    /// As [`Gate::agent_cross_record`], in the record of `project`: a
+    /// project that is not open has no gate of its own, but its record is
+    /// in the same log (A5), so a refusal reaching it is kept there too.
+    #[must_use]
+    pub fn agent_cross_record_for(
+        &self,
+        project: &str,
+        source: &str,
+        target_name: &str,
+        action: &str,
+        decision: &str,
+        reason: &str,
+    ) -> bool {
+        self.cross_record(project, source, target_name, action, decision, reason)
+            .is_ok()
+    }
+
+    /// Whether Pause is off and still in `epoch`: what an admitted action
+    /// checks right before it acts.
+    #[must_use]
+    pub fn still_in(&self, epoch: u64) -> bool {
+        !self.pause.is_paused() && self.pause.epoch() == epoch
+    }
+
+    fn cross_record(
+        &self,
+        project: &str,
+        source: &str,
+        target_name: &str,
+        action: &str,
+        decision: &str,
+        reason: &str,
+    ) -> Result<(), Denial> {
+        self.audit
+            .append_durable(
+                Record {
+                    actor: Actor::Agent.name().to_owned(),
+                    source: source.to_owned(),
+                    target: target_name.to_owned(),
+                    action: action.to_owned(),
+                    decision: decision.to_owned(),
+                    reason: reason.to_owned(),
+                    policy_revision: POLICY_REVISION,
+                    pause_epoch: self.pause.epoch(),
+                    evidence_class: self.evidence_class.to_owned(),
+                    project: project.to_owned(),
+                    ..Record::default()
+                },
+                AUDIT_WAIT,
+            )
+            .map_err(|_| Denial::AuditFailed)
+    }
+
     /// Whether Pause is on now.
     #[must_use]
     pub fn is_paused(&self) -> bool {
@@ -679,7 +796,7 @@ mod tests {
         let text = lines.0.lock().unwrap().join("\n");
         assert!(text.contains(r#""decision":"deny""#), "{text}");
         assert!(text.contains("own reply"), "{text}");
-        assert!(text.contains(r#""policy_revision":4"#), "{text}");
+        assert!(text.contains(r#""policy_revision":5"#), "{text}");
 
         let mut other = request("t2", "b");
         other.source = "Claude".to_owned();

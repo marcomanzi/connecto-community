@@ -16,14 +16,19 @@
     ["Working with agents", [
       ["agents", "Agents using other terminals", "connecto command send ask list read keys watch add bridge"],
       ["automations", "Automations", "trigger jev classifier keys threshold approve prompt"],
+      ["agentic-works", "Agentic Works", "jobs queue postgresql postgres connecto_jobs connecto_works work type schema json prompt producer n8n cron"],
       ["packages", "Skills & Plugins packages", "skills plugins subagents commands hooks connecto home default package extends"],
+      ["game-dev", "Game Dev package", "game games godot blender ffmpeg gdscript playtest design 3d art glb requirements install"],
+      ["memory", "Project memory", "memory palace rooms decisions conventions pitfalls notes dream development cycle initial build ask brief search recall connecto memory privacy redaction"],
       ["isolation", "Isolated and system terminals", "profile config login launch mode bypass auto permissions"],
+      ["cli-improvements", "CLI improvements", "claude insights /insights report apply suggestions settings hooks claude.md skills opus"],
       ["remote", "Remote sessions", "host pairing code relay ssh key device revoke"],
       ["relay", "Run your own relay", "relay self-host iroh-relay server token tls caddy nginx upgrade"],
       ["history", "History and utility sessions", "transcript continue resume title robot"]
     ]],
     ["Staying in control", [
-      ["safety", "Pause, audit and redaction", "stop brake audit log verify secrets redacted security"]
+      ["safety", "Pause, audit and redaction", "stop brake audit log verify secrets redacted security"],
+      ["secrets", "Secrets", "vault secret api key token password ssh key keychain request url run proxy ssh-agent connecto secret"]
     ]],
     ["Reference", [
       ["agents-supported", "Supported agents", "claude code codex gemini cli cursor cli opencode roadmap"],

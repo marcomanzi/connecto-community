@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLI improvements · Connecto docs</title>
+<meta name="description" content="CLI improvements: Claude Code reads its /insights report and applies its suggestions to your set-up, asking before anything risky.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="cli-improvements">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>CLI improvements</h1>
+<p class="lead">A coding CLI can improve how it is set up for you, from what it learned of your work. Connecto starts it on that task in a terminal you watch, and it asks you whenever it is in doubt and before anything risky.</p>
+
+<p>Open <strong>Settings → CLI improvements</strong>. What it offers depends on the CLIs installed on this machine. An item that needs a CLI you do not have is not shown. Install the CLI in <strong>Settings → Agents</strong> and it appears.</p>
+
+<h2>Claude auto apply insights</h2>
+<p>Shown only when Claude Code is installed. <strong>Claude auto apply insights</strong> opens a new Claude Code terminal named <code>claude-insights</code>, on Opus, in the project you have open, and shows it. Settings closes so you can follow it. It is not offered, and says why, while a paired machine's project is shown (that machine's Claude set-up is its own), or when Claude Code is deactivated in <strong>Settings → Agents</strong> or turned off in the project's settings. The terminal:</p>
+<ol>
+  <li><strong>Finds the Claude config folder it runs on.</strong> That is <code>~/.claude</code>, or, when the project's Claude config is Isolated, the separate one Connecto keeps for it (<code>$CLAUDE_CONFIG_DIR</code>). It tells you before changing an isolated one, since a change there applies to that project's Connecto terminals only.</li>
+  <li><strong>Makes a fresh insights report.</strong> It runs <code>claude -p "/insights"</code>, Claude Code's own command that reads your past sessions and writes a report in that config folder (<code>usage-data/report.html</code>, or the path it prints). This can take several minutes. If it does not work, the terminal asks you to type <code>/insights</code> in it, and goes on when you say it is done.</li>
+  <li><strong>Reads the report</strong> and lists each concrete suggestion: settings, permissions, hooks, <code>CLAUDE.md</code> instructions, skills, commands, agents, MCP servers.</li>
+  <li><strong>Applies them where they belong.</strong> What is about you and all your projects goes to your user-level set-up in that config folder (<code>settings.json</code>, <code>CLAUDE.md</code>, <code>skills</code>). What is about the project goes in the project (<code>CLAUDE.md</code>, <code>.claude/settings.json</code>, <code>.claude/skills</code>). It reads a file before changing it, keeps what is there, and makes small changes.</li>
+  <li><strong>Asks you first</strong>, and waits, when a suggestion is unclear, and before anything risky: more permissions, a hook that runs commands, deleting or rewriting what is there, another project, installing anything, or anything that reaches the network. A suggestion about your habits rather than your set-up is told to you, not applied.</li>
+  <li><strong>Ends with a summary</strong> of what changed and where, and what it skipped and why.</li>
+</ol>
+<p><strong>Why the project you have open.</strong> <code>/insights</code> looks at your work in every project, and most of what it suggests is user-level. But a Connecto terminal belongs to a project, and the project you are working in is the one whose own set-up the suggestions can improve. Open a project first: without one the item is shown but cannot be used.</p>
+<p>The terminal is an ordinary Claude terminal: Pause stops it like any other, and you can type into it, answer its questions, or close it.</p>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

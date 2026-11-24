@@ -1,90 +1,230 @@
 #!/usr/bin/env python3
-"""Regenerate crates/connecto-packages/builtin/ (the built-in `connecto` package).
+"""Regenerate crates/connecto-packages/builtin/ (the built-in `connecto`
+package, and the Game Dev package carried along: see `game_dev()` below).
 
-Usage: vendor_builtin.py <extracted-tree> <out-dir>
+Usage: vendor_builtin.py <source-tree> <out-dir>
 
-The tree holds `.claude/`, `.codex/` and `.agents/` as the `both` variant has
-them. `builtin/both` is where the content is edited, so to bring the other two
-variants in line, write to a new folder and copy it over (the out-dir is
-emptied first, so it must not be `builtin` itself):
+The source is `builtin/both`. Its `.claude/skills/<team>/` folders are where
+the teams are edited; everything else is generated from them. The out-dir is
+emptied first, so it must not be `builtin` itself:
 
   vendor_builtin.py builtin/both /tmp/regen && rsync -a --delete /tmp/regen/ builtin/
 
+Every role of a team runs in a Connecto terminal of its own, so the package
+has no agent definitions (`.claude/agents`, `.codex/agents`). Each SKILL.md
+holds an `<!-- agents -->` ... `<!-- /agents -->` block, filled per variant
+from `tools/agents/variant-<variant>.md`: which coding agent runs the coders
+and the reviewers.
+
 It writes three variants:
 
-  both/    the content as it is (each side is reviewed by the other tool)
-  claude/  `.claude` only; reviewers and critics run as Claude terminals
-           (`connecto add claude`), and the Codex plugin is dropped from settings
-  codex/   `.codex` and `.agents` only; reviewers and critics run as Codex
+  both/    `.claude` and `.agents` (Codex, Pi, Antigravity and OpenCode read
+           `.agents/skills`); agents are chosen by what is installed
+  claude/  `.claude` only; every role runs as Claude, and the Codex plugin is
+           dropped from settings
+  codex/   `.agents` only; every role runs on the one agent the project allows
 
-Bump `version` in each variant's package.json when the content changes in a release.
+`.agents/skills/<team>/` is `.claude/skills/<team>/` with the SKILL.md
+reworded for a tool without `$ARGUMENTS` or `${CLAUDE_SKILL_DIR}`, plus the
+`agents/openai.yaml` kept from the source.
+
+`.claude/rules/` holds always-on instructions (the end-of-task status recap),
+which Claude Code reads from there. Connecto compiles the same text in and
+passes it to Codex, Pi, Antigravity and OpenCode when it starts them in a
+project with this package (`connecto-session/src/package_text.rs`).
+
+Bump VERSION when the content changes in a release.
 """
-import os, re, shutil, json, sys
+import json
+import os
+import re
+import sys
+
+VERSION = 10
+HERE = os.path.dirname(os.path.abspath(__file__))
+import shutil
+
 src, out = sys.argv[1], sys.argv[2]
+
+
+def _chain(path):
+    """`path` and each folder above it, as far as they exist: above the path
+    as given and above the path it resolves to, so a link can't hide one."""
+    for start in (os.path.abspath(path), os.path.realpath(path)):
+        while True:
+            if os.path.exists(start):
+                yield start
+            parent = os.path.dirname(start)
+            if parent == start:
+                break
+            start = parent
+
+
+def _same(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+# The out-dir is emptied: it must not hold the source, nor be inside it.
+# Compared by identity, not by name, so a case-insensitive disk or a link
+# can't hide that they are the same folder.
+if any(_same(above, out) for above in _chain(src) if os.path.exists(out)) or any(
+    _same(above, src) for above in _chain(out)
+):
+    sys.exit("the out-dir must be a new folder outside the source (not builtin itself)")
 shutil.rmtree(out, ignore_errors=True)
+
+BLOCK = re.compile(r"<!-- agents -->\n.*?<!-- /agents -->", re.S)
+
 
 def walk(base):
     for d, _, fs in os.walk(os.path.join(src, base)):
-        for f in fs:
-            if f == '.DS_Store': continue
-            p = os.path.join(d, f)
-            yield os.path.relpath(p, src)
+        for f in sorted(fs):
+            if f == '.DS_Store':
+                continue
+            # Forward slashes on every platform: paths are split on `/`.
+            yield os.path.relpath(os.path.join(d, f), src).replace(os.sep, '/')
 
-def put(variant, rel, data):
+
+def read(rel):
+    with open(os.path.join(src, rel), 'rb') as fh:
+        return fh.read()
+
+
+def put(variant, rel, data, like=None):
     dest = os.path.join(out, variant, rel)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    mode = os.stat(os.path.join(src, rel)).st_mode if os.path.exists(os.path.join(src, rel)) else 0o644
-    with open(dest, 'wb') as fh: fh.write(data)
+    origin = os.path.join(src, like or rel)
+    mode = os.stat(origin).st_mode if os.path.exists(origin) else 0o644
+    with open(dest, 'wb') as fh:
+        fh.write(data)
     os.chmod(dest, mode & 0o755 | 0o644)
 
-def swap(text, other, me):
-    # other: the tool the original names as the reviewer; me: the tool to name instead.
-    O, M = other, me
-    ol, ml = O.lower(), M.lower()
-    text = re.sub(r"don't substitute an? (Claude|Codex) review", "don't substitute your own review", text)
-    text = text.replace("independent review by a different model", "independent review in a separate terminal")
-    text = text.replace("so a different model reviews the work", "so a fresh, independent session reviews the work")
-    text = text.replace("so a different model critiques the work", "so a fresh, independent session critiques the work")
-    text = text.replace(f"{O} reviewers", f"{M} reviewers")
-    text = text.replace(f"| {O}, in a Connecto terminal |", f"| {M}, in a Connecto terminal |")
-    text = text.replace(f"separate {O} terminal", f"separate {M} terminal")
-    text = text.replace(f"and {O} critiques the result", f"and {M} critiques the result")
-    text = text.replace(f"connecto add {ol}", f"connecto add {ml}")
-    # Reviewers and critics always run on the strong model of their own tool.
-    strong = {"Codex": ("Codex `gpt-6.1-sol`", "gpt-6.1-sol"), "Claude": ("Claude Opus 5.5", "claude-opus-5-5")}
-    text = text.replace(f"{strong[O][0]}, in a Connecto terminal", f"{strong[M][0]}, in a Connecto terminal")
-    text = text.replace(strong[O][1], strong[M][1])
-    text = text.replace(f"`{ol}-2 starting`", f"`{ml}-2 starting`")
+
+def agents_block(variant):
+    with open(os.path.join(HERE, 'agents', f'variant-{variant}.md')) as fh:
+        text = fh.read().strip('\n')
+    return f"<!-- agents -->\n{text}\n<!-- /agents -->"
+
+
+def fill(text, variant):
+    if '<!-- agents -->' not in text:
+        return text
+    return BLOCK.sub(lambda _: agents_block(variant), text, count=1)
+
+
+def for_agents(text, team):
+    """A Claude skill reworded for Codex, Pi, Antigravity and OpenCode."""
+    # `disable-model-invocation` stays: Pi reads it to keep a skill out of
+    # its own choice, and Codex accepts it (its `agents/openai.yaml` says
+    # the same for Codex).
+    text = re.sub(r"^argument-hint:.*\n", "", text, flags=re.M)
+    head, body = text.split("\n---\n", 1)
+    body = f"\n<!-- Generated by tools/vendor_builtin.py from .claude/skills/{team}. Don't edit by hand. -->\n" + body
+    text = head + "\n---\n" + body
+    swaps = [
+        ("First task: $ARGUMENTS", f"The first task is the text the user wrote with `${team}`."),
+        ("If there's no first task above,", "If there's no first task,"),
+        ("Task: $ARGUMENTS", f"The task is the text the user wrote with `${team}`."),
+        ("If the task above is empty,", "If there's no task,"),
+        ("Topic: $ARGUMENTS", f"The topic is the text the user wrote with `${team}`."),
+        ("If the topic above is empty,", "If there's no topic,"),
+        ("${CLAUDE_SKILL_DIR}/", "<the absolute path of this skill's folder>/"),
+        ("/dev-team", "$dev-team"),
+    ]
+    for old, new in swaps:
+        text = text.replace(old, new)
+    text = text.replace(
+        "the `connecto` command, because",
+        "the `connecto` command (in Codex, whose default sandbox may block it, that can mean starting it with `codex --sandbox danger-full-access`), because",
+    )
+    assert "$ARGUMENTS" not in text and "CLAUDE_SKILL_DIR" not in text, team
     return text
 
-def manifest(extra):
-    return json.dumps({"name": "Connecto", "description": extra, "version": 1}, indent=2) + "\n"
 
-# both: as it is
-for rel in walk('.claude'): put('both', rel, open(os.path.join(src, rel), 'rb').read())
-for rel in walk('.codex'): put('both', rel, open(os.path.join(src, rel), 'rb').read())
-for rel in walk('.agents'): put('both', rel, open(os.path.join(src, rel), 'rb').read())
-open(os.path.join(out, 'both', 'package.json'), 'w').write(manifest("Connecto's team workflows (dev, daily and brainstorm teams) for Claude and Codex: each side is reviewed by the other tool."))
+def skills(variant, side):
+    """Write `.claude/skills` (side 'claude') or `.agents/skills` (side 'agents')."""
+    for rel in walk('.claude/skills'):
+        parts = rel.split('/')
+        team = parts[2]
+        inside = '/'.join(parts[3:])
+        data = read(rel)
+        if inside == 'SKILL.md':
+            text = fill(data.decode(), variant)
+            if side == 'agents':
+                text = for_agents(text, team)
+            data = text.encode()
+        dest = rel if side == 'claude' else f".agents/skills/{team}/{inside}"
+        put(variant, dest, data, like=rel)
+    if side == 'agents':
+        for rel in walk('.agents/skills'):
+            if '/agents/' in rel:
+                put(variant, rel, read(rel))
 
-# claude only
-for rel in walk('.claude'):
-    data = open(os.path.join(src, rel), 'rb').read()
-    if rel == '.claude/settings.json':
-        j = json.loads(data)
-        j['enabledPlugins'].pop('codex@openai-codex', None)
-        j['extraKnownMarketplaces'].pop('openai-codex', None)
-        if not j['extraKnownMarketplaces']: j.pop('extraKnownMarketplaces')
-        data = (json.dumps(j, indent=2) + "\n").encode()
-    elif rel.endswith('.md'):
-        data = swap(data.decode(), 'Codex', 'Claude').encode()
-    put('claude', rel, data)
-open(os.path.join(out, 'claude', 'package.json'), 'w').write(manifest("Connecto's team workflows for Claude only: reviewers and critics run as Claude terminals."))
 
-# codex only
-for base in ('.codex', '.agents'):
-    for rel in walk(base):
-        data = open(os.path.join(src, rel), 'rb').read()
-        if rel.endswith('.md'):
-            data = swap(data.decode(), 'Claude', 'Codex').encode()
-        put('codex', rel, data)
-open(os.path.join(out, 'codex', 'package.json'), 'w').write(manifest("Connecto's team workflows for Codex only: reviewers and critics run as Codex terminals."))
+def claude_rest(variant):
+    for rel in walk('.claude'):
+        if rel.startswith(('.claude/skills/', '.claude/agents/')):
+            continue
+        data = read(rel)
+        if variant == 'claude' and rel == '.claude/settings.json':
+            j = json.loads(data)
+            j['enabledPlugins'].pop('codex@openai-codex', None)
+            j.get('extraKnownMarketplaces', {}).pop('openai-codex', None)
+            if not j.get('extraKnownMarketplaces', True):
+                j.pop('extraKnownMarketplaces')
+            data = (json.dumps(j, indent=2) + "\n").encode()
+        put(variant, rel, data)
+
+
+def manifest(variant, description):
+    text = json.dumps({"name": "Connecto", "description": description, "version": VERSION}, indent=2) + "\n"
+    put(variant, 'package.json', text.encode())
+
+
+skills('both', 'claude')
+skills('both', 'agents')
+claude_rest('both')
+manifest('both', "Connecto's team workflows (dev, daily and brainstorm teams) and a second opinion: every role runs in its own Connecto terminal, on the coding CLIs the project allows and can start (`connecto agents --roles`), coders on Claude and reviewers on Codex when both are ready. Also how to set up a project's Agentic Works.")
+
+skills('claude', 'claude')
+claude_rest('claude')
+manifest('claude', "Connecto's team workflows and a second opinion for Claude only: every role runs in its own Claude terminal. Also how to set up a project's Agentic Works.")
+
+skills('codex', 'agents')
+manifest('codex', "Connecto's team workflows and a second opinion for one agent (Codex, Antigravity, Pi or OpenCode): every role runs in its own terminal of that agent. Also how to set up a project's Agentic Works.")
+
+
+def game_dev():
+    """The built-in Game Dev package (ADR 0037), next to the source as
+    `builtin/game-dev`: edited in its `.claude/skills`. Its `package.json` is
+    carried over as it is, and `.agents/skills` is made from `.claude/skills`
+    (the same text: these skills use neither `$ARGUMENTS` nor
+    `${CLAUDE_SKILL_DIR}`), each with an `agents/openai.yaml` that lets Codex
+    pick the skill by itself. Bump its own `version` in `package.json` when
+    the content changes in a release."""
+    game = os.path.join(os.path.dirname(os.path.abspath(src)), 'game-dev')
+    if not os.path.isdir(game):
+        return
+    dest = os.path.join(out, 'game-dev')
+    os.makedirs(dest, exist_ok=True)
+    shutil.copy2(os.path.join(game, 'package.json'), os.path.join(dest, 'package.json'))
+    skills_dir = os.path.join(game, '.claude', 'skills')
+    for skill in sorted(os.listdir(skills_dir)):
+        if skill == '.DS_Store':
+            continue
+        for side in ('.claude', '.agents'):
+            shutil.copytree(
+                os.path.join(skills_dir, skill),
+                os.path.join(dest, side, 'skills', skill),
+                ignore=shutil.ignore_patterns('.DS_Store'),
+            )
+        yaml = os.path.join(dest, '.agents', 'skills', skill, 'agents', 'openai.yaml')
+        os.makedirs(os.path.dirname(yaml), exist_ok=True)
+        with open(yaml, 'w') as f:
+            f.write("policy:\n  allow_implicit_invocation: true\n")
+
+
+game_dev()

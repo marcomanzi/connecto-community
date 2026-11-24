@@ -4,11 +4,14 @@
 //! byte, the token, and the tool's raw payload. The server answers with one
 //! byte, so the sender stays alive while its process ancestry is checked.
 
+pub mod antigravity;
 pub mod automation;
 pub mod bridge;
 pub mod client;
+pub mod codex;
 pub mod name;
 pub mod package;
+pub mod requires;
 pub mod shrink;
 pub mod transport;
 

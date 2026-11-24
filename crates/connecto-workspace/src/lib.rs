@@ -9,6 +9,7 @@
 //! starts, stops or types into anything.
 
 mod platform;
+mod project_files;
 mod saved;
 mod settings;
 
@@ -21,16 +22,21 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use connecto_audit::Audit;
 use connecto_core::{
-    MAX_NAME_CHARS, PauseSwitch, ProjectView, RecentProject, UtilitySettings, WorkspaceControl,
-    WorkspaceView,
+    MAX_NAME_CHARS, PauseSwitch, ProjectGroup, ProjectView, RecentProject, UtilitySettings,
+    WorkspaceControl, WorkspaceView,
 };
 use connecto_session::launch::{LaunchExtras, Layout, project_id, validated};
-use connecto_session::{Relay, RelayConfig, SIGKILL_GRACE, Wake, wait_for_sweeps};
+use connecto_session::project_folder::within_protected;
+use connecto_session::{
+    ProjectDirectory, ProjectEntry, Relay, RelayConfig, SIGKILL_GRACE, Wake, wait_for_sweeps,
+};
 use connecto_store::Tool;
 use crossbeam_channel::{Receiver, Sender, bounded};
 
 use saved::{Disk, Loaded, MAX_RECENTS, Saved, SavedProject};
 
+/// Delete confirmations open at once whose folders are held open.
+const MAX_PLANS: usize = 8;
 /// Commands waiting for the worker.
 const QUEUE: usize = 256;
 /// Extra time for the kernel to reap children after SIGKILL.
@@ -47,6 +53,11 @@ pub struct WorkspaceConfig {
     pub wake: Wake,
     /// One terminal of each tool, running, when a project has no saved list.
     pub default_tools: Vec<Tool>,
+    /// This launch is the new version an update's hand-over started: the
+    /// projects restored now bring back every terminal that was running when
+    /// the app quit, idle ones included (ADR 0030). Projects opened later
+    /// restore as usual.
+    pub after_update: bool,
 }
 
 /// What the worker and the callers share.
@@ -73,12 +84,157 @@ struct Inner {
     closing: AtomicBool,
     /// Teardowns of closed projects still running.
     tearing: AtomicUsize,
+    /// Confirmed deletions not yet handed to their teardown (queued, or in
+    /// their checks). A shutdown waits for them, and one that finishes its
+    /// checks after the shutdown began is refused.
+    deleting: AtomicUsize,
     /// Relays being started right now. A shutdown waits for them, so none is
     /// installed after it has looked at the open ones.
     setups: AtomicUsize,
+    /// Run by Stop Everything after the pause: what else must stop (memory
+    /// runs, spec §2.4).
+    stop_hooks: Mutex<Vec<StopHook>>,
+    /// The projects every relay's bridge may reach with `--project` (ADR
+    /// 0035): the sidebar's, open, and the recent ones, closed.
+    directory: Arc<ProjectDirectory>,
+    /// Where this workspace keeps its data, and the home folder: what a
+    /// deletion must never reach.
+    layout: Layout,
+    /// Where deleted project folders go.
+    bin: Mutex<project_files::Bin>,
+    /// The open projects that were opened through a link somewhere in their
+    /// path, by id: never deleted.
+    linked: Mutex<std::collections::HashSet<String>>,
+    /// Folders being deleted or cloned into, until the outcome is known.
+    /// Two holds never overlap (one inside the other), and nothing inside a
+    /// folder being deleted opens.
+    reserved: Mutex<Vec<(PathBuf, Hold)>>,
+    /// The worker's own queue, for work that ends on other threads (a
+    /// deletion's outcome). Taken when the [`Workspace`] is dropped, so the
+    /// worker then sees its queue close and ends.
+    tx: Mutex<Option<Sender<Cmd>>>,
+    /// The folders shown in open delete confirmations, held open by plan
+    /// token until the deletion takes them or the dialog gives them back.
+    plans: Mutex<Vec<(u64, project_files::Held)>>,
+    next_plan: std::sync::atomic::AtomicU64,
+    /// Clones under way: cancelled and waited for when Connecto closes.
+    clones: Mutex<Vec<Arc<dyn connecto_core::project_files::ProjectTask>>>,
+    /// Run while a clone is being admitted, for tests.
+    clone_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Run on the worker before a deletion's checks, for tests.
+    delete_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Run at the end of every teardown, for tests: it may wait, and says
+    /// whether the teardown counts as stopped.
+    teardown_hook: Mutex<Option<TeardownHook>>,
 }
 
+/// What a reserved folder is held for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    Delete,
+    Clone,
+}
+
+/// See [`Workspace::on_teardown`].
+pub type TeardownHook = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Something Stop Everything also stops.
+pub type StopHook = Arc<dyn Fn() + Send + Sync>;
+
 impl Inner {
+    /// The folder of an open project as the person sees it, and what a
+    /// deletion of it must never reach.
+    fn deletion_guards(&self, project: &str) -> Result<(PathBuf, project_files::Guards), String> {
+        let view = self.view.load_full();
+        let open = view
+            .projects
+            .iter()
+            .find(|open| open.id == project)
+            .ok_or("no such project")?;
+        let path = PathBuf::from(&open.path);
+        let others = view
+            .projects
+            .iter()
+            .filter(|other| other.id != project)
+            .map(|other| PathBuf::from(&other.path))
+            .chain(
+                view.recents
+                    .iter()
+                    .map(|recent| PathBuf::from(&recent.path)),
+            )
+            .filter(|other| !(within_protected(other, &path) && within_protected(&path, other)))
+            .collect();
+        let connecto: Vec<PathBuf> = [self.home(), self.root()]
+            .into_iter()
+            .flatten()
+            .chain(connecto_itself())
+            .collect();
+        let linked = self
+            .linked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(project);
+        let internal = [
+            self.root(),
+            self.home().map(|home| home.join(AGENTIC_JOBS_FOLDER)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        Ok((
+            path,
+            project_files::Guards {
+                home: self.layout.home.clone(),
+                data_root: self.layout.data_root.clone(),
+                connecto,
+                internal,
+                others,
+                linked,
+            },
+        ))
+    }
+
+    /// The confirmed folder, checked again just before the deletion: still
+    /// allowed, still the directory the confirmation showed and holds open,
+    /// with a usable Trash, and not being deleted already. Disk work, so on
+    /// the worker, never the window's thread.
+    fn confirm_delete(
+        &self,
+        plan: &connecto_core::project_files::DeletePlan,
+        held: &project_files::Held,
+    ) -> Result<project_files::Checked, String> {
+        let hook = self
+            .delete_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+        let (path, guards) = self.deletion_guards(&plan.project)?;
+        let checked = project_files::refusal(&path, &guards)?;
+        // The confirmation was for one directory, held open since: this must
+        // still be it.
+        if checked.identity != held.identity
+            || checked.identity[..] != plan.identity[..]
+            || platform::shown(&checked.real) != plan.path
+        {
+            return Err(
+                "The project's folder changed since it was looked at, so nothing was deleted. Ask again to see what is there now."
+                    .to_owned(),
+            );
+        }
+        self.bin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .name(&checked.real)?;
+        if self.reserved_for(&checked.real).is_some() {
+            return Err("The project is already being deleted.".to_owned());
+        }
+        Ok(checked)
+    }
+
     fn root(&self) -> Option<PathBuf> {
         self.automations_root
             .lock()
@@ -98,6 +254,58 @@ impl Inner {
     /// an install from before Home, the Automations folder itself.
     fn allowed(&self) -> Option<PathBuf> {
         self.home().or_else(|| self.root())
+    }
+
+    /// The folder being deleted that `path` is in, if any.
+    fn reserved_for(&self, path: &Path) -> Option<PathBuf> {
+        self.reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(folder, hold)| *hold == Hold::Delete && within_protected(path, folder))
+            .map(|(folder, _)| folder.clone())
+    }
+
+    /// Hold `folder` for a deletion or a clone, unless a hold already covers
+    /// it, or it covers one. Why not, when it is refused.
+    fn reserve(&self, folder: &Path, hold: Hold) -> Result<(), String> {
+        let mut held = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((other, kind)) = held
+            .iter()
+            .find(|(other, _)| within_protected(other, folder) || within_protected(folder, other))
+        {
+            return Err(format!(
+                "{} is being {} now. Try again once that has finished.",
+                other.display(),
+                match kind {
+                    Hold::Delete => "deleted",
+                    Hold::Clone => "cloned into",
+                }
+            ));
+        }
+        held.push((folder.to_owned(), hold));
+        Ok(())
+    }
+
+    fn release(&self, folder: &Path) {
+        self.reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(held, _)| held != folder);
+    }
+
+    /// The clones still running (finished ones are dropped from the list).
+    fn running_clones(&self) -> Vec<Arc<dyn connecto_core::project_files::ProjectTask>> {
+        let mut clones = self.clones.lock().unwrap_or_else(PoisonError::into_inner);
+        clones.retain(|clone| clone.state().is_running());
+        clones.clone()
+    }
+
+    fn sender(&self) -> Option<Sender<Cmd>> {
+        self.tx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn relays(&self) -> Vec<Arc<Relay>> {
@@ -121,8 +329,29 @@ enum Cmd {
     Collapsed(bool),
     ActiveTerminal(String, String),
     ClearRecents,
+    NewGroup(String),
+    RenameGroup(String, String),
+    DeleteGroup(String),
+    SetGroup(String, Option<String>),
     /// Write the utility settings the caller already published.
     SaveSettings,
+    /// Close a project and move its folder (already checked) to the trash
+    /// once its terminals have stopped.
+    /// Its checks run here first, before anything stops.
+    Delete {
+        plan: connecto_core::project_files::DeletePlan,
+        /// The folder and its parent, held open since the confirmation.
+        held: project_files::Held,
+        task: Arc<project_files::Task>,
+        /// Counted in [`Inner::deleting`] until dropped: once the deletion
+        /// is refused, or its teardown (counted in `tearing`) has begun.
+        admitted: project_files::OnDrop,
+    },
+    /// A deleted project's folder is gone: out of the recents.
+    Forget {
+        id: String,
+        path: String,
+    },
 }
 
 /// The workspace the UI and the app hold.
@@ -169,6 +398,12 @@ pub fn save_connecto_home(
     disk.write(&saved)
         .map_err(|err| format!("the settings could not be saved: {err}"))
 }
+
+/// The folder in Connecto Home where Agentic Works opens its setup terminals.
+pub const AGENTIC_JOBS_FOLDER: &str = "agentic jobs";
+/// The sidebar group Connecto puts its own projects in (the Automations
+/// folder and the agentic jobs folder).
+pub const INTERNAL_GROUP: &str = "Connecto Internal";
 
 /// Why a setting is refused when the settings file could not be read.
 const SETTINGS_READ_ONLY: &str =
@@ -232,7 +467,21 @@ impl Workspace {
             settings_read_only,
             closing: AtomicBool::new(false),
             tearing: AtomicUsize::new(0),
+            deleting: AtomicUsize::new(0),
             setups: AtomicUsize::new(0),
+            stop_hooks: Mutex::new(Vec::new()),
+            directory: Arc::new(ProjectDirectory::default()),
+            layout: config.layout.clone(),
+            bin: Mutex::new(project_files::Bin::System),
+            linked: Mutex::default(),
+            reserved: Mutex::default(),
+            tx: Mutex::default(),
+            plans: Mutex::default(),
+            next_plan: std::sync::atomic::AtomicU64::new(1),
+            clones: Mutex::default(),
+            clone_hook: Mutex::default(),
+            delete_hook: Mutex::default(),
+            teardown_hook: Mutex::default(),
         });
         let disk = Disk::new(&config.layout.data_root);
         let (saved, warning, read_only) = match disk.load() {
@@ -249,6 +498,7 @@ impl Workspace {
             State::restored(saved, Arc::clone(&inner), config, disk, warning, read_only);
         state.publish();
         let (tx, rx) = bounded(QUEUE);
+        *inner.tx.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx.clone());
         thread::Builder::new()
             .name("workspace".into())
             .spawn(move || state.run(&rx))?;
@@ -261,6 +511,14 @@ impl Workspace {
 
     fn send(&self, command: Cmd) -> Result<(), String> {
         self.tx.try_send(command).map_err(|_| busy())
+    }
+
+    fn known_group(&self, group: &str) -> Result<(), String> {
+        if self.view().groups.iter().any(|g| g.id == group) {
+            Ok(())
+        } else {
+            Err("no such group".to_owned())
+        }
     }
 
     fn known(&self, project: &str) -> Result<(), String> {
@@ -281,6 +539,28 @@ impl Workspace {
             relay.begin_shutdown();
         }
         self.inner.pause.pause();
+        // A clone under way stops, and removes its staging folder.
+        for clone in self.inner.running_clones() {
+            clone.cancel();
+        }
+    }
+
+    /// The app quits for an update (ADR 0030): in every open project, the
+    /// terminals in a turn now are saved as cut by it, so the next launch
+    /// carries them on. Call it before [`Workspace::begin_shutdown`]. False
+    /// when a project's list could not be saved in `wait`.
+    pub fn mark_cut_by_update(&self, wait: Duration) -> bool {
+        // Every project at once, so none waits on another while its agents
+        // go on (a turn ending after its mark would be carried on for nothing).
+        let relays = self.inner.relays();
+        thread::scope(|scope| {
+            let marks: Vec<_> = relays
+                .iter()
+                .map(|relay| scope.spawn(move || relay.mark_cut_by_update(wait)))
+                .collect();
+            // The scope joins any mark `all` stops looking at: every one runs.
+            marks.into_iter().all(|mark| mark.join().unwrap_or(false))
+        })
     }
 
     /// Every pane of every open project.
@@ -302,6 +582,14 @@ impl Workspace {
         // A relay still being started is installed, then stopped by its own
         // setup (it sees the shutdown), before the open ones are looked at.
         let deadline = Instant::now() + timeout;
+        // Clones cancelled above: git stopped and its folder cleaned up.
+        while !self.inner.running_clones().is_empty() {
+            if Instant::now() >= deadline {
+                clean = false;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         while self.inner.setups.load(Ordering::SeqCst) > 0 {
             if Instant::now() >= deadline {
                 clean = false;
@@ -311,6 +599,15 @@ impl Workspace {
         }
         for relay in self.inner.relays() {
             clean &= relay.shut_down(timeout);
+        }
+        // A confirmed deletion still in its checks: refused once they end
+        // (it sees `closing`), or counted in `tearing` before it lets go.
+        while self.inner.deleting.load(Ordering::SeqCst) > 0 {
+            if Instant::now() >= deadline {
+                clean = false;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
         }
         // Closed projects still being torn down hold the app up too.
         while self.inner.tearing.load(Ordering::SeqCst) > 0 {
@@ -378,6 +675,79 @@ impl Workspace {
         self.set_folder(&self.inner.connecto_home, home)
     }
 
+    /// Have Stop Everything also run `hook`, after the pause and before the
+    /// terminals stop. It must return promptly.
+    pub fn on_stop_everything(&self, hook: StopHook) {
+        self.inner
+            .stop_hooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(hook);
+    }
+
+    /// Send deleted project folders to `bin` instead of the system's trash.
+    /// For tests, which must not fill the person's Trash.
+    #[doc(hidden)]
+    pub fn use_trash_folder(&self, bin: PathBuf) {
+        *self
+            .inner
+            .bin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = project_files::Bin::Folder(bin);
+    }
+
+    /// Run `hook` at the end of every closed project's teardown; it may hold
+    /// the teardown, and `false` makes it count as not stopped. For tests.
+    #[doc(hidden)]
+    pub fn on_teardown(&self, hook: TeardownHook) {
+        *self
+            .inner
+            .teardown_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Run `hook` at the start of each clone's disk work (registered, the
+    /// lock released, before its folders are looked at). For tests.
+    #[doc(hidden)]
+    pub fn on_clone_admission(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .clone_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Run `hook` on the worker before each deletion's checks (a stalled
+    /// volume). For tests.
+    #[doc(hidden)]
+    pub fn on_delete_check(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .delete_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// How many delete confirmations hold their folder open now. For tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn held_plans(&self) -> usize {
+        self.inner
+            .plans
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    fn bin(&self) -> project_files::Bin {
+        self.inner
+            .bin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// A project's relay, by id. For tests.
     #[doc(hidden)]
     #[must_use]
@@ -389,6 +759,18 @@ impl Workspace {
             .iter()
             .find(|(id, _)| id == project)
             .map(|(_, relay)| Arc::clone(relay))
+    }
+}
+
+impl Drop for Workspace {
+    /// The worker's own sender goes, so its queue closes once nothing else
+    /// holds one and the worker ends.
+    fn drop(&mut self) {
+        self.inner
+            .tx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
     }
 }
 
@@ -415,6 +797,145 @@ impl WorkspaceControl for Workspace {
         self.send(Cmd::Close(project.to_owned()))
     }
 
+    fn clone_project(
+        &self,
+        url: &str,
+        parent: &Path,
+    ) -> Result<connecto_core::project_files::Cloning, String> {
+        use connecto_core::project_files::TaskState;
+        // The address alone, at once (no disk work): a bad one is refused
+        // here, the rest is said by the task.
+        let name = project_files::repo_name(url)?;
+        // Registered under the registry's lock, with no disk work in it: a
+        // shutdown sets `closing` before it takes the lock, so a clone is
+        // either refused, or registered before the shutdown looks (and then
+        // cancelled and waited for, within the shutdown's time limit).
+        let task = project_files::Task::new("Checking the folder…", true);
+        {
+            let mut clones = self
+                .inner
+                .clones
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if self.inner.closing.load(Ordering::SeqCst) {
+                return Err("Connecto is closing".to_owned());
+            }
+            clones.retain(|clone| clone.state().is_running());
+            clones.push(Arc::clone(&task) as Arc<dyn connecto_core::project_files::ProjectTask>);
+        }
+        // The disk work (a slow or stalled volume included) runs on a thread
+        // of its own: the window gets the task at once, keeps drawing, and
+        // its Cancel reaches the task whatever the volume does.
+        let spawned = thread::Builder::new()
+            .name("clone-admission".into())
+            .spawn({
+                let inner = Arc::clone(&self.inner);
+                let (url, parent, task) = (url.to_owned(), parent.to_owned(), Arc::clone(&task));
+                move || {
+                    if let Err(why) = admit_clone(&inner, &url, &parent, &task) {
+                        task.set(if task.cancelled() {
+                            TaskState::Cancelled
+                        } else {
+                            TaskState::Failed(why)
+                        });
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            task.set(TaskState::Failed(format!(
+                "The clone could not start: {err}"
+            )));
+            return Err(format!("The clone could not start: {err}"));
+        }
+        Ok(connecto_core::project_files::Cloning {
+            target: parent.join(name),
+            task,
+        })
+    }
+
+    fn plan_delete(
+        &self,
+        project: &str,
+    ) -> Result<connecto_core::project_files::DeletePlan, String> {
+        let (path, guards) = self.inner.deletion_guards(project)?;
+        let checked = project_files::refusal(&path, &guards)?;
+        // Held open from now: its identity cannot pass to another folder
+        // while the confirmation shows it.
+        let held = project_files::Held::open(&checked.real)
+            .filter(|held| held.identity == checked.identity)
+            .ok_or("The project's folder changed while it was being looked at. Ask again.")?;
+        let token = self.inner.next_plan.fetch_add(1, Ordering::SeqCst);
+        let plan = project_files::plan(project, &checked, &self.bin(), token)?;
+        let mut plans = self
+            .inner
+            .plans
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A few confirmations at most; the oldest lets go first.
+        if plans.len() >= MAX_PLANS {
+            plans.remove(0);
+        }
+        plans.push((token, held));
+        Ok(plan)
+    }
+
+    fn release_delete_plan(&self, plan: &connecto_core::project_files::DeletePlan) {
+        self.inner
+            .plans
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(token, _)| *token != plan.token);
+    }
+
+    fn delete_project(
+        &self,
+        plan: &connecto_core::project_files::DeletePlan,
+    ) -> Result<Arc<dyn connecto_core::project_files::ProjectTask>, String> {
+        if self.inner.closing.load(Ordering::SeqCst) {
+            return Err("Connecto is closing".to_owned());
+        }
+        if !self
+            .view()
+            .projects
+            .iter()
+            .any(|open| open.id == plan.project)
+        {
+            return Err("no such project".to_owned());
+        }
+        // Taken from the confirmation, still open: the worker checks the
+        // folder against it. Nothing here touches the disk, so a stalled
+        // volume never holds the window.
+        let held = {
+            let mut plans = self
+                .inner
+                .plans
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let at = plans
+                .iter()
+                .position(|(token, _)| *token == plan.token)
+                .ok_or("This confirmation has expired. Ask again to see what is there now.")?;
+            plans.remove(at).1
+        };
+        let task = project_files::Task::new("Checking the folder…", false);
+        // Counted before it is queued: a shutdown from now on waits for it.
+        self.inner.deleting.fetch_add(1, Ordering::SeqCst);
+        let admitted = project_files::OnDrop::new({
+            let inner = Arc::clone(&self.inner);
+            move || {
+                inner.deleting.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+        let sent = self.send(Cmd::Delete {
+            plan: plan.clone(),
+            held,
+            task: Arc::clone(&task),
+            admitted,
+        });
+        sent?;
+        Ok(task)
+    }
+
     fn rename_project(&self, project: &str, name: Option<String>) -> Result<(), String> {
         let name = name.map_or(Ok(None), |name| clean_name(&name))?;
         self.known(project)?;
@@ -431,6 +952,33 @@ impl WorkspaceControl for Workspace {
 
     fn set_sidebar_collapsed(&self, collapsed: bool) {
         let _ = self.send(Cmd::Collapsed(collapsed));
+    }
+
+    fn create_group(&self, name: &str) -> Result<(), String> {
+        let name = clean_name(name)?.ok_or("a group needs a name")?;
+        if self.view().groups.len() >= saved::MAX_GROUPS {
+            return Err(format!("at most {} groups", saved::MAX_GROUPS));
+        }
+        self.send(Cmd::NewGroup(name))
+    }
+
+    fn rename_group(&self, group: &str, name: &str) -> Result<(), String> {
+        let name = clean_name(name)?.ok_or("a group needs a name")?;
+        self.known_group(group)?;
+        self.send(Cmd::RenameGroup(group.to_owned(), name))
+    }
+
+    fn delete_group(&self, group: &str) -> Result<(), String> {
+        self.known_group(group)?;
+        self.send(Cmd::DeleteGroup(group.to_owned()))
+    }
+
+    fn set_project_group(&self, project: &str, group: Option<&str>) -> Result<(), String> {
+        self.known(project)?;
+        if let Some(group) = group {
+            self.known_group(group)?;
+        }
+        self.send(Cmd::SetGroup(project.to_owned(), group.map(str::to_owned)))
     }
 
     fn set_active_terminal(&self, project: &str, terminal: &str) {
@@ -481,6 +1029,15 @@ impl WorkspaceControl for Workspace {
     /// stop, then stop every terminal of every project.
     fn stop_everything(&self) {
         self.inner.pause.pause();
+        let hooks = self
+            .inner
+            .stop_hooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        for hook in hooks {
+            hook();
+        }
         for relay in self.inner.relays() {
             relay.stop_terminals();
         }
@@ -497,6 +1054,9 @@ struct Project {
     error: Option<String>,
     expanded: bool,
     active_terminal: Option<String>,
+    group: Option<String>,
+    /// Opened through a link somewhere in its path: never deleted.
+    linked: bool,
 }
 
 impl Project {
@@ -522,6 +1082,9 @@ struct State {
     audit: Audit,
     wake: Wake,
     default_tools: Vec<Tool>,
+    /// Set while the projects saved at the update's quit are restored, then
+    /// dropped: see [`WorkspaceConfig::after_update`].
+    after_update: bool,
     disk: Disk,
     settings_disk: settings::Disk,
     projects: Vec<Project>,
@@ -529,10 +1092,13 @@ struct State {
     active: Option<String>,
     recents: Vec<RecentProject>,
     sidebar_collapsed: bool,
+    groups: Vec<ProjectGroup>,
     last_error: Option<String>,
     warning: Option<String>,
     /// The saved file could not be read, so it is never written this run.
     read_only: bool,
+    /// Recents that were open through a link, by path.
+    linked_recents: std::collections::HashSet<String>,
 }
 
 impl State {
@@ -549,6 +1115,7 @@ impl State {
             .iter()
             .map(|project| {
                 let path = PathBuf::from(&project.path);
+                let became_link = project_files::through_link(&path);
                 Project {
                     id: project_id(&path),
                     path,
@@ -557,6 +1124,10 @@ impl State {
                     error: None,
                     expanded: project.expanded,
                     active_terminal: project.active_terminal.clone(),
+                    group: project.group.clone(),
+                    // A saved folder that became a link while Connecto was
+                    // closed: seen before anything resolves it away.
+                    linked: project.linked || became_link,
                 }
             })
             .collect();
@@ -574,15 +1145,18 @@ impl State {
             audit: config.audit,
             wake: config.wake,
             default_tools: config.default_tools,
+            after_update: config.after_update,
             settings_disk,
             disk,
             projects,
             active,
             recents: saved.recents,
             sidebar_collapsed: saved.sidebar_collapsed,
+            groups: saved.groups,
             last_error: None,
             warning,
             read_only,
+            linked_recents: saved.linked_recents.into_iter().collect(),
         }
     }
 
@@ -603,8 +1177,21 @@ impl State {
             }
             self.publish();
         }
+        // Only the projects open at the update's quit: one opened, or set up
+        // again, from now on restores as usual.
+        self.after_update = false;
         for command in rx {
             if self.inner.closing.load(Ordering::SeqCst) {
+                // What is under way still gets an outcome.
+                match command {
+                    Cmd::Delete { task, .. } => {
+                        task.set(connecto_core::project_files::TaskState::Failed(
+                            "Connecto is closing, so nothing was deleted.".to_owned(),
+                        ))
+                    }
+                    Cmd::Forget { id, path } => self.forget(&id, &path),
+                    _ => {}
+                }
                 continue;
             }
             self.last_error = None;
@@ -655,7 +1242,33 @@ impl State {
                     self.save();
                 }
             }
-            Cmd::Close(id) => self.close(&id),
+            Cmd::Close(id) => self.close(&id, None),
+            Cmd::Delete {
+                plan,
+                held,
+                task,
+                admitted,
+            } => {
+                use connecto_core::project_files::TaskState;
+                match self.inner.confirm_delete(&plan, &held) {
+                    // Still counted in `deleting`: a shutdown that began
+                    // after this look waits until the teardown is counted.
+                    Ok(_) if self.inner.closing.load(Ordering::SeqCst) => {
+                        task.set(TaskState::Failed(
+                            "Connecto is closing, so nothing was deleted.".to_owned(),
+                        ))
+                    }
+                    Ok(checked) => {
+                        task.set(TaskState::Running(
+                            "Stopping the project's terminals…".to_owned(),
+                        ));
+                        self.delete(&plan.project, checked, held, task);
+                    }
+                    Err(why) => task.set(TaskState::Failed(why)),
+                }
+                drop(admitted);
+            }
+            Cmd::Forget { id, path } => self.forget(&id, &path),
             Cmd::Rename(id, name) => {
                 if let Some(project) = self.projects.iter_mut().find(|project| project.id == id) {
                     project.custom = name;
@@ -693,6 +1306,37 @@ impl State {
                 self.recents.clear();
                 self.save();
             }
+            Cmd::NewGroup(name) => {
+                if self.new_group(name).is_some() {
+                    self.save();
+                }
+            }
+            Cmd::RenameGroup(id, name) => {
+                if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                    group.name = name;
+                    self.save();
+                }
+            }
+            Cmd::DeleteGroup(id) => {
+                self.groups.retain(|g| g.id != id);
+                for project in &mut self.projects {
+                    if project.group.as_deref() == Some(id.as_str()) {
+                        project.group = None;
+                    }
+                }
+                self.save();
+            }
+            Cmd::SetGroup(id, group) => {
+                let known = group
+                    .as_ref()
+                    .is_none_or(|group| self.groups.iter().any(|g| g.id == *group));
+                if let Some(project) = self.projects.iter_mut().find(|project| project.id == id)
+                    && known
+                {
+                    project.group = group;
+                    self.save();
+                }
+            }
             Cmd::SaveSettings if self.inner.settings_read_only => {
                 self.last_error = Some(format!(
                     "The change is for this run only: {SETTINGS_READ_ONLY}."
@@ -721,7 +1365,62 @@ impl State {
 
     /// Open a folder, or show it if it is already open. A project whose setup
     /// failed earlier is tried again.
+    /// Add a group; its id, or None when there are already as many as allowed.
+    fn new_group(&mut self, name: String) -> Option<String> {
+        if self.groups.len() >= saved::MAX_GROUPS {
+            return None;
+        }
+        // One more than the highest in use, so an id is never given to two
+        // groups that are both remembered somewhere.
+        let next = self
+            .groups
+            .iter()
+            .filter_map(|g| g.id.strip_prefix("group-")?.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let id = format!("group-{next}");
+        self.groups.push(ProjectGroup {
+            id: id.clone(),
+            name,
+        });
+        Some(id)
+    }
+
+    /// Connecto's own folders (Automations, agentic jobs) go in the
+    /// Connecto Internal group when they have none, made if missing. A project
+    /// the user put in another group stays there.
+    fn place_internal(&mut self, index: usize) {
+        let Some(project) = self.projects.get(index) else {
+            return;
+        };
+        if project.group.is_some() {
+            return;
+        }
+        let internal = [
+            self.inner.root(),
+            self.inner.home().map(|home| home.join(AGENTIC_JOBS_FOLDER)),
+        ];
+        let is_internal = internal
+            .into_iter()
+            .flatten()
+            .filter_map(|dir| std::fs::canonicalize(dir).ok())
+            .any(|dir| dir == project.path);
+        if !is_internal {
+            return;
+        }
+        let group = match self.groups.iter().find(|g| g.name == INTERNAL_GROUP) {
+            Some(group) => Some(group.id.clone()),
+            None => self.new_group(INTERNAL_GROUP.to_owned()),
+        };
+        if let (Some(group), Some(project)) = (group, self.projects.get_mut(index)) {
+            project.group = Some(group);
+        }
+    }
+
     fn open(&mut self, path: PathBuf) {
+        // How it was opened, before the link is resolved away.
+        let linked = project_files::through_link(&path);
         let path = match validated(&self.layout, &path) {
             Ok(real) => real,
             Err(err) => {
@@ -729,9 +1428,19 @@ impl State {
                 return;
             }
         };
+        if let Some(folder) = self.inner.reserved_for(&path) {
+            self.last_error = Some(format!(
+                "{} is being deleted, so it cannot be opened now.",
+                folder.display()
+            ));
+            return;
+        }
+        // Opened from the recents after it was open through a link.
+        let linked = linked || self.linked_recents.contains(&platform::shown(&path));
         let id = project_id(&path);
         let index = match self.projects.iter().position(|project| project.id == id) {
             Some(index) => {
+                self.projects[index].linked |= linked;
                 if self.projects[index].relay.is_none() {
                     self.projects[index].path = path;
                     self.projects[index].error = None;
@@ -748,6 +1457,8 @@ impl State {
                     error: None,
                     expanded: true,
                     active_terminal: None,
+                    group: None,
+                    linked,
                 });
                 let index = self.projects.len() - 1;
                 // In the sidebar at once, while its terminals start.
@@ -756,6 +1467,7 @@ impl State {
                 index
             }
         };
+        self.place_internal(index);
         let Some(project) = self.projects.get(index) else {
             return;
         };
@@ -764,6 +1476,9 @@ impl State {
             path: platform::shown(&project.path),
             name: project.custom.clone().unwrap_or_else(|| project.folder()),
         };
+        if project.linked {
+            self.linked_recents.insert(recent.path.clone());
+        }
         self.recents.retain(|old| old.path != recent.path);
         self.recents.insert(0, recent);
         self.recents.truncate(MAX_RECENTS);
@@ -803,6 +1518,7 @@ impl State {
                 self.active = Some(id.clone());
             }
             self.projects[index].id.clone_from(&id);
+            self.projects[index].linked = true;
         }
         self.projects[index].path.clone_from(&real);
         if self.inner.closing.load(Ordering::SeqCst) {
@@ -819,9 +1535,11 @@ impl State {
             pause: Some(Arc::clone(&self.inner.pause)),
             utility_settings: Some(Arc::clone(&self.inner.utility)),
             auto_title: true,
+            after_update: self.after_update,
         });
         match started {
             Ok(relay) => {
+                relay.join_directory(&self.inner.directory);
                 let relay = Arc::new(relay);
                 let late = {
                     let mut relays = self
@@ -853,14 +1571,118 @@ impl State {
         self.inner.setups.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// Close a project, then, on the teardown's thread once its terminals,
+    /// their background work and its relay have all stopped, move its folder
+    /// to the trash (if it is still the folder confirmed) and remove what
+    /// Connecto kept for it. Until the outcome is known the folder is
+    /// reserved: nothing in it opens. On any failure the recents and
+    /// Connecto's data for it stay, and the task says what happened.
+    fn delete(
+        &mut self,
+        id: &str,
+        checked: project_files::Checked,
+        held: project_files::Held,
+        task: Arc<project_files::Task>,
+    ) {
+        use connecto_core::project_files::TaskState;
+        let Some(project) = self.projects.iter().find(|project| project.id == id) else {
+            task.set(TaskState::Failed(
+                "The project is no longer open, so nothing was deleted.".to_owned(),
+            ));
+            return;
+        };
+        // Checked again here: the project may have moved since the check.
+        if project.linked
+            || std::fs::canonicalize(&project.path).ok().as_ref() != Some(&checked.real)
+        {
+            task.set(TaskState::Failed(
+                "The project's folder changed since the confirmation, so nothing was deleted."
+                    .to_owned(),
+            ));
+            return;
+        }
+        let real = checked.real.clone();
+        // The live list, not the view the caller saw: a project opened since
+        // (queued before this) may be inside.
+        if let Some(inside) = self
+            .projects
+            .iter()
+            .find(|other| other.id != id && within_protected(&other.path, &real))
+        {
+            task.set(TaskState::Failed(format!(
+                "{} holds another open project, {}, so nothing was deleted. Close that project first.",
+                real.display(),
+                inside.path.display()
+            )));
+            return;
+        }
+        if let Err(why) = self.inner.reserve(&real, Hold::Delete) {
+            task.set(TaskState::Failed(format!("Nothing was deleted: {why}")));
+            return;
+        }
+        let bin = self
+            .inner
+            .bin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let data = self.layout.data_root.join("projects").join(id);
+        let inner = Arc::clone(&self.inner);
+        let tx = self.inner.sender();
+        let key = id.to_owned();
+        let finish: Box<dyn FnOnce(bool) + Send> = Box::new(move |stopped| {
+            let outcome = if stopped {
+                task.set(TaskState::Running(
+                    "Moving the folder to the Trash…".to_owned(),
+                ));
+                bin.remove(&real, &held)
+            } else {
+                Err("Its terminals or background work did not all stop, so its folder was not moved to the Trash. Delete it again once they have stopped, or remove it yourself.".to_owned())
+            };
+            let state = match outcome {
+                Ok(()) => {
+                    // Its terminal list, history and profiles.
+                    project_files::remove_all(&data);
+                    if let Some(tx) = tx {
+                        let _ = tx.send(Cmd::Forget {
+                            id: key,
+                            path: platform::shown(&real),
+                        });
+                    }
+                    TaskState::Done
+                }
+                Err(why) => TaskState::Failed(format!("The project was closed. {why}")),
+            };
+            inner.release(&real);
+            task.set(state);
+        });
+        self.close(id, Some(finish));
+    }
+
+    /// A deleted project's folder is gone: out of the recents.
+    fn forget(&mut self, id: &str, path: &str) {
+        self.recents
+            .retain(|recent| recent.path != path && canonical_id(Path::new(&recent.path)) != id);
+        self.linked_recents.remove(path);
+        self.save();
+    }
+
     /// Take a project out of the sidebar at once. Its terminals are stopped and
     /// its relay shut down on a thread of their own, so a slow process holds
-    /// nothing up. Its list and history stay on disk.
-    fn close(&mut self, id: &str) {
+    /// nothing up. Its list and history stay on disk. `then` runs on that
+    /// thread once that is over, told whether everything stopped (`false`
+    /// when the thread could not start either).
+    fn close(&mut self, id: &str, then: Option<Box<dyn FnOnce(bool) + Send>>) {
         let Some(index) = self.projects.iter().position(|project| project.id == id) else {
+            if let Some(then) = then {
+                then(false);
+            }
             return;
         };
         let project = self.projects.remove(index);
+        if project.linked {
+            self.linked_recents.insert(platform::shown(&project.path));
+        }
         if self.active.as_deref() == Some(id) {
             let next = index.min(self.projects.len().saturating_sub(1));
             self.active = self.projects.get(next).map(|project| project.id.clone());
@@ -870,23 +1692,44 @@ impl State {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(open, _)| open != id);
-        if let Some(relay) = project.relay {
+        if let Some(relay) = &project.relay {
             // Before anything is stopped, so the exits are not saved.
             relay.begin_shutdown();
-            self.inner.tearing.fetch_add(1, Ordering::SeqCst);
-            let inner = Arc::clone(&self.inner);
-            let spawned = thread::Builder::new()
-                .name("project-teardown".into())
-                .spawn({
-                    let relay = Arc::clone(&relay);
-                    move || {
-                        tear_down(&relay);
-                        inner.tearing.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.inner.tearing.fetch_add(1, Ordering::SeqCst);
+        let inner = Arc::clone(&self.inner);
+        let relay = project.relay.clone();
+        let then = Arc::new(Mutex::new(then));
+        let spawned = thread::Builder::new()
+            .name("project-teardown".into())
+            .spawn({
+                let then = Arc::clone(&then);
+                move || {
+                    let mut stopped = relay.as_deref().is_none_or(tear_down);
+                    let hook = inner
+                        .teardown_hook
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
+                    if let Some(hook) = hook {
+                        stopped &= hook();
                     }
-                });
-            if spawned.is_err() {
-                self.inner.tearing.fetch_sub(1, Ordering::SeqCst);
+                    let then = then.lock().unwrap_or_else(PoisonError::into_inner).take();
+                    if let Some(then) = then {
+                        then(stopped);
+                    }
+                    inner.tearing.fetch_sub(1, Ordering::SeqCst);
+                }
+            });
+        if spawned.is_err() {
+            self.inner.tearing.fetch_sub(1, Ordering::SeqCst);
+            if let Some(relay) = &project.relay {
                 relay.stop_terminals();
+            }
+            // Nothing is removed while its terminals may still run in it.
+            let then = then.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(then) = then {
+                then(false);
             }
         }
         self.save();
@@ -915,6 +1758,8 @@ impl State {
                     name: project.custom.clone(),
                     expanded: project.expanded,
                     active_terminal: project.active_terminal.clone(),
+                    group: project.group.clone(),
+                    linked: project.linked,
                 })
                 .collect(),
             active: self
@@ -923,7 +1768,14 @@ impl State {
                 .and_then(|id| self.projects.iter().find(|project| project.id == *id))
                 .map(|project| project.path.display().to_string()),
             recents: self.recents.clone(),
+            linked_recents: self
+                .recents
+                .iter()
+                .filter(|recent| self.linked_recents.contains(&recent.path))
+                .map(|recent| recent.path.clone())
+                .collect(),
             sidebar_collapsed: self.sidebar_collapsed,
+            groups: self.groups.clone(),
         };
         if let Err(err) = self.disk.write(&saved) {
             self.last_error = Some(format!(
@@ -967,10 +1819,23 @@ impl State {
                 error: project.error.clone(),
                 expanded: project.expanded,
                 active_terminal: project.active_terminal.clone(),
+                group: project.group.clone(),
             })
+            .collect();
+        self.publish_directory();
+        *self
+            .inner
+            .linked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = self
+            .projects
+            .iter()
+            .filter(|project| project.linked)
+            .map(|project| project.id.clone())
             .collect();
         self.inner.view.store(Arc::new(WorkspaceView {
             projects,
+            groups: self.groups.clone(),
             active: self.active.clone(),
             recents: self.recents.clone(),
             sidebar_collapsed: self.sidebar_collapsed,
@@ -981,9 +1846,86 @@ impl State {
     }
 }
 
+impl State {
+    /// What the bridges may reach across projects: each sidebar project by
+    /// the name it shows, with its bridge while it runs, then each recent one
+    /// not in the sidebar, closed.
+    fn publish_directory(&self) {
+        let names = self.display_names();
+        let mut entries: Vec<ProjectEntry> = self
+            .projects
+            .iter()
+            .zip(names)
+            .map(|(project, name)| ProjectEntry {
+                id: project.id.clone(),
+                name,
+                path: project.path.clone(),
+                link: project.relay.as_ref().and_then(|relay| relay.bridge_link()),
+            })
+            .collect();
+        for recent in &self.recents {
+            let path = PathBuf::from(&recent.path);
+            let id = canonical_id(&path);
+            if entries.iter().any(|entry| entry.id == id) {
+                continue;
+            }
+            entries.push(ProjectEntry {
+                id,
+                name: recent.name.clone(),
+                path,
+                link: None,
+            });
+        }
+        self.inner.directory.set(entries);
+    }
+}
+
+/// A project's id from the folder as shown, by its real path, as an open
+/// project's is: a shown path (`C:\work\app` on Windows, or a link) and the
+/// canonical one (`\\?\C:\work\app`) name the same project. A folder that is
+/// gone keeps the id of the path as shown.
+fn canonical_id(path: &Path) -> String {
+    std::fs::canonicalize(path).map_or_else(|_| project_id(path), |real| project_id(&real))
+}
+
+/// The disk work of starting a clone, after it is registered, on its own
+/// thread: its destination, its hold, its staging folder and git's thread. A
+/// clone cancelled meanwhile (Cancel, or Connecto closing) stops before git
+/// starts.
+fn admit_clone(
+    inner: &Arc<Inner>,
+    url: &str,
+    parent: &Path,
+    task: &Arc<project_files::Task>,
+) -> Result<(), String> {
+    let hook = inner
+        .clone_hook
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+    let target = project_files::clone_target(&inner.layout, url, parent)?;
+    // Held while git runs: no deletion of a folder it is in, nor a second
+    // clone to the same place. Released when the guard drops, however the
+    // clone ends (a thread that never started included).
+    inner.reserve(&target, Hold::Clone)?;
+    let held = target.clone();
+    let guard = project_files::OnDrop::new({
+        let inner = Arc::clone(inner);
+        move || inner.release(&held)
+    });
+    if task.cancelled() {
+        return Err("The clone was stopped before it started.".to_owned());
+    }
+    project_files::start_clone(&inner.layout, url, &target, guard, Arc::clone(task)).map(|_| ())
+}
+
 /// Stop every terminal of a closed project, wait for the processes and their
 /// descendants, and shut its relay down without touching the shared Pause.
-fn tear_down(relay: &Relay) {
+/// Whether all of it stopped in time.
+fn tear_down(relay: &Relay) -> bool {
     relay.stop_terminals();
     let panes = relay.panes();
     for pane in &panes {
@@ -991,24 +1933,169 @@ fn tear_down(relay: &Relay) {
     }
     let deadline = Instant::now() + SIGKILL_GRACE + REAP_MARGIN;
     let remaining = || deadline.saturating_duration_since(Instant::now());
+    let mut stopped = true;
     for pane in &panes {
         if !pane.wait_exit(remaining()) {
             eprintln!("a session did not end before the project's shutdown deadline");
+            stopped = false;
         }
     }
-    let _ = wait_for_sweeps(remaining());
+    stopped &= wait_for_sweeps(remaining());
     if !relay.close(AUDIT_FLUSH) {
         eprintln!("a project's relay did not shut down cleanly");
+        stopped = false;
     }
     for pane in &panes {
         pane.release();
     }
+    stopped
+}
+
+/// Connecto itself: the running app, and the source checkout it was built
+/// from when that is on this machine. A deletion never holds either.
+fn connecto_itself() -> Vec<PathBuf> {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = std::fs::canonicalize(source)
+        .ok()
+        .filter(|root| root.join("Cargo.toml").exists());
+    let app = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::canonicalize(exe).ok());
+    source.into_iter().chain(app).collect()
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// A recent project shown by another path to the same folder (here a
+    /// link; on Windows the shown `C:\` path against the canonical one) has
+    /// the id the open project has, so it is one project, not two.
+    #[cfg(unix)]
+    #[test]
+    fn a_recent_project_has_the_id_of_its_real_folder() {
+        let root = std::env::temp_dir().join(format!("mg-ws-recent-{}", std::process::id()));
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let open = project_id(&std::fs::canonicalize(&real).unwrap());
+        assert_eq!(super::canonical_id(&link), open);
+        assert_ne!(project_id(&link), open, "the shown path alone hashes apart");
+        let gone = root.join("gone");
+        assert_eq!(super::canonical_id(&gone), project_id(&gone));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
+
+    #[test]
+    fn stop_everything_pauses_then_runs_its_hooks() {
+        let (workspace, _rx) = stalled("stop-hooks", false);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        for n in 0..2 {
+            let (seen, pause) = (Arc::clone(&seen), workspace.pause_switch());
+            workspace.on_stop_everything(Arc::new(move || {
+                seen.lock().unwrap().push((n, pause.is_paused()));
+            }));
+        }
+        workspace.stop_everything();
+        assert_eq!(*seen.lock().unwrap(), [(0, true), (1, true)]);
+    }
+
+    /// A deletion still queued when Connecto starts closing ends with a
+    /// reason, never left running; a finished one's Forget still applies.
+    #[test]
+    fn queued_work_gets_an_outcome_while_closing() {
+        use connecto_core::project_files::{ProjectTask, TaskState};
+        let root = std::env::temp_dir().join(format!("mg-ws-closing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let (workspace, _stalled) = stalled("closing", false);
+        let inner = Arc::clone(&workspace.inner);
+        let layout = Layout {
+            data_root: root.join("data"),
+            home: root.join("home"),
+        };
+        let config = WorkspaceConfig {
+            layout: layout.clone(),
+            extras: LaunchExtras::default(),
+            audit: Audit::open(&root.join("audit.jsonl")).unwrap(),
+            wake: Arc::new(|| {}),
+            default_tools: Vec::new(),
+            after_update: false,
+        };
+        let saved = Saved {
+            recents: vec![RecentProject {
+                path: "/gone/app".into(),
+                name: "app".into(),
+            }],
+            ..Saved::default()
+        };
+        let mut state = State::restored(
+            saved,
+            Arc::clone(&inner),
+            config,
+            Disk::new(&layout.data_root),
+            None,
+            false,
+        );
+        inner.closing.store(true, Ordering::SeqCst);
+        let (tx, rx) = bounded(4);
+        let task = project_files::Task::new("waiting", false);
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        tx.send(Cmd::Delete {
+            plan: connecto_core::project_files::DeletePlan {
+                project: "p".into(),
+                name: "app".into(),
+                path: platform::shown(&root.join("app")),
+                contents: String::new(),
+                trash: String::new(),
+                warnings: Vec::new(),
+                identity: Vec::new(),
+                token: 1,
+            },
+            held: project_files::Held::open(&root.join("app")).unwrap(),
+            task: Arc::clone(&task),
+            admitted: project_files::OnDrop::new(|| {}),
+        })
+        .unwrap();
+        tx.send(Cmd::Forget {
+            id: "gone".into(),
+            path: "/gone/app".into(),
+        })
+        .unwrap();
+        drop(tx);
+        // Returns: the queue closed.
+        state.run(&rx);
+        assert!(
+            matches!(task.state(), TaskState::Failed(why) if why.contains("closing")),
+            "{:?}",
+            task.state()
+        );
+        assert!(state.recents.is_empty(), "the Forget applied");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A clone's hold is let go when its guard drops, whether or not the
+    /// clone's thread ever ran (a spawn failure drops it unrun).
+    #[test]
+    fn a_clone_hold_is_released_when_its_guard_drops() {
+        let (workspace, _rx) = stalled("hold-guard", false);
+        let inner = Arc::clone(&workspace.inner);
+        let target = PathBuf::from("/nowhere/app");
+        inner.reserve(&target, Hold::Clone).unwrap();
+        assert!(inner.reserve(&target, Hold::Delete).is_err());
+        let guard = {
+            let inner = Arc::clone(&inner);
+            let target = target.clone();
+            project_files::OnDrop::new(move || inner.release(&target))
+        };
+        // As in a thread closure that is dropped without running.
+        let closure = move || drop(guard);
+        drop(closure);
+        assert!(inner.reserve(&target, Hold::Delete).is_ok());
+    }
 
     /// A workspace whose worker never takes a command, with a full queue.
     fn stalled(name: &str, read_only: bool) -> (Workspace, Receiver<Cmd>) {
@@ -1026,7 +2113,24 @@ mod tests {
             settings_read_only: read_only,
             closing: AtomicBool::new(false),
             tearing: AtomicUsize::new(0),
+            deleting: AtomicUsize::new(0),
             setups: AtomicUsize::new(0),
+            stop_hooks: Mutex::new(Vec::new()),
+            directory: Arc::new(ProjectDirectory::default()),
+            layout: Layout {
+                data_root: PathBuf::from("/mg-ws-unit"),
+                home: PathBuf::from("/mg-ws-unit-home"),
+            },
+            bin: Mutex::new(project_files::Bin::System),
+            linked: Mutex::default(),
+            reserved: Mutex::default(),
+            tx: Mutex::default(),
+            plans: Mutex::default(),
+            next_plan: std::sync::atomic::AtomicU64::new(1),
+            clones: Mutex::default(),
+            clone_hook: Mutex::default(),
+            delete_hook: Mutex::default(),
+            teardown_hook: Mutex::default(),
         });
         let data_root = PathBuf::from(format!("/mg-ws-unit-{name}-{}", std::process::id()));
         connecto_session::project_folder::allow_root(&data_root, inner.allowed());

@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use connecto_core::{
     AuthState, GridSize, InputModes, InputRefused, Key, KeyPress, Mods, MouseButton, MouseEvent,
-    MouseKind, PaneControl, PaneStage, ResizeOutcome, SessionStatus, SnapshotOutcome, TermSnapshot,
-    TerminalEntry, TerminalSession, ToolKind, encode_key, encode_mouse,
+    MouseKind, PaneControl, PaneStage, ResizeOutcome, SelectOp, SelectionText, SessionStatus,
+    SnapshotOutcome, TermSnapshot, TerminalEntry, TerminalSession, ToolKind, encode_key,
+    encode_mouse,
 };
 use egui::{Align2, Color32, Event, EventFilter, FontId, Id, Pos2, Rect, Sense, Ui, Vec2, pos2};
 
@@ -18,14 +19,23 @@ use crate::keymap;
 use crate::links;
 use crate::metrics::PaneCounters;
 use crate::platform;
+use crate::preview;
 use crate::render::{self, CellMetrics};
-use crate::selection::Selection;
+use crate::selection::{self, Selection};
 use crate::theme;
+use crate::words;
 
 pub(crate) const PANE_PADDING: f32 = 8.0;
 pub(crate) const BUTTON_SIZE: Vec2 = Vec2::new(92.0, 24.0);
 const NOTICE_LIFETIME: Duration = Duration::from_secs(3);
+/// Shown while Connecto types into the terminal by itself.
+pub(crate) const INJECTING_TEXT: &str = "Connecto is sending a message…";
+/// Shown while a message waits for a draft Connecto cannot move aside.
+pub(crate) const WAITING_TEXT: &str = "Connecto has a message waiting: send or clear your line";
+const INJECTING_REPAINT: Duration = Duration::from_millis(100);
 const CONTENDED_RETRY: Duration = Duration::from_millis(16);
+/// How often a drag held past the top or bottom edge scrolls on.
+const EDGE_SCROLL_EVERY: Duration = Duration::from_millis(50);
 const WARNING_LINE_HEIGHT: f32 = 16.0;
 const HEADER_TEXT: Color32 = theme::TEXT_MUTED;
 const WARNING_TEXT: Color32 = theme::CORAL_SOFT;
@@ -58,14 +68,60 @@ pub(crate) struct Pane {
     pub(crate) tool: Option<ToolKind>,
     pub(crate) snapshot: TermSnapshot,
     pub(crate) selection: Option<Selection>,
+    /// A copy asked for while the emulator was busy, done on a later frame.
+    pending_copy: bool,
+    /// That copy is the clean one (`connecto_core::copy_text`), not the text
+    /// as shown.
+    pending_clean: bool,
+    /// Where the files named in the terminal are: on this computer, they are
+    /// looked up as the pointer rests on them; on a remote host, a path is
+    /// asked for when it is clicked.
+    pub(crate) files: Files,
+    /// The folder relative paths in the terminal are read from: the project's.
+    pub(crate) base_dir: Option<std::path::PathBuf>,
+    /// The last word looked up as a file, and the file it named, so the disk
+    /// is asked once per word the pointer rests on, not once per frame.
+    path_lookup: Option<(String, Option<std::path::PathBuf>)>,
+    /// Files clicked for a preview this frame, for the window to open.
+    preview_requests: Vec<PreviewRequest>,
+    /// A clear the session was too busy to take, sent again on a later frame.
+    unsent_clear: bool,
+    /// When a drag held past an edge last scrolled, so it scrolls at one pace
+    /// whatever the frame rate.
+    edge_scrolled: Option<Instant>,
     /// The first click on Log in happened: the next one confirms.
     pub(crate) login_armed: bool,
     /// The project's settings turned this terminal's tool off: it cannot be
     /// logged in or restarted.
     pub(crate) tool_off: bool,
+    /// A dialog or sheet over the window holds the pointer: no click, move
+    /// or wheel reaches the program, only the release of a gesture it saw
+    /// start.
+    pub(crate) pointer_blocked: bool,
     pub(crate) applied_size: Option<GridSize>,
     pub(crate) emulator_failed: bool,
     pub(crate) notice: Option<(String, Instant)>,
+    /// Images pasted this frame (no text was on the clipboard), for the window
+    /// to save and give back as paths ([`Pane::paste_saved`]).
+    pasted_images: Vec<Arc<egui::ColorImage>>,
+    /// Files copied in Finder and pasted here, asked about before they are
+    /// sent to a remote terminal's host.
+    #[cfg(target_os = "macos")]
+    pub(crate) file_paste: crate::clipboard_files::FilePaste,
+    /// Copied files whose upload was confirmed this frame, each paste's in
+    /// order, for the window to send to the terminal's host.
+    #[cfg(target_os = "macos")]
+    pasted_files: Vec<Vec<std::path::PathBuf>>,
+    /// The session and attachment the open question was asked in: Enter or
+    /// Esc may act only while the terminal still shows them.
+    #[cfg(target_os = "macos")]
+    file_paste_mark: Option<SessionMark>,
+    /// This frame's Enter or Esc at the question, acted on at its end.
+    #[cfg(target_os = "macos")]
+    file_answer: Option<crate::clipboard_files::Answer>,
+    /// Where the question's strip and its two lines were drawn, for tests.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) drew_strip: Option<(Rect, Vec<Rect>)>,
     scroll_lines: f32,
     /// The button held while mouse events go to the program, and the cell the
     /// pointer was last reported at.
@@ -76,8 +132,35 @@ pub(crate) struct Pane {
     /// Where the Log in / Start buttons were drawn, for tests.
     #[cfg(test)]
     pub(crate) command_hits: Vec<Rect>,
+    /// The last frame showed that Connecto is typing, for tests.
+    #[cfg(test)]
+    pub(crate) drew_injecting: bool,
+    /// The last frame showed that a message waits, for tests.
+    #[cfg(test)]
+    pub(crate) drew_waiting: bool,
     #[cfg(test)]
     pub(crate) command_ids: Vec<Id>,
+}
+
+/// A terminal session as it was when files were pasted or dropped on it.
+pub(crate) struct SessionMark {
+    session: std::sync::Weak<dyn TerminalSession>,
+    generation: u64,
+}
+
+impl SessionMark {
+    /// Whether the session still runs somewhere (its pane may be gone).
+    pub(crate) fn alive(&self) -> bool {
+        self.session.strong_count() > 0
+    }
+}
+
+/// Where pasted or dropped files were saved, to be typed as paths.
+pub(crate) enum Saved {
+    /// On this computer.
+    Here(Vec<std::path::PathBuf>),
+    /// On the remote host the terminal runs on, as it wrote the paths.
+    OnHost(Vec<String>),
 }
 
 impl Pane {
@@ -90,11 +173,31 @@ impl Pane {
             tool: config.tool,
             snapshot: TermSnapshot::default(),
             selection: None,
+            pending_copy: false,
+            pending_clean: false,
+            files: Files::Local,
+            base_dir: None,
+            path_lookup: None,
+            preview_requests: Vec::new(),
+            unsent_clear: false,
+            edge_scrolled: None,
             login_armed: false,
             tool_off: false,
+            pointer_blocked: false,
             applied_size: None,
             emulator_failed: false,
             notice: None,
+            pasted_images: Vec::new(),
+            #[cfg(target_os = "macos")]
+            file_paste: crate::clipboard_files::FilePaste::default(),
+            #[cfg(target_os = "macos")]
+            pasted_files: Vec::new(),
+            #[cfg(target_os = "macos")]
+            file_paste_mark: None,
+            #[cfg(target_os = "macos")]
+            file_answer: None,
+            #[cfg(all(target_os = "macos", test))]
+            drew_strip: None,
             scroll_lines: 0.0,
             mouse_down: None,
             mouse_cell: None,
@@ -102,6 +205,10 @@ impl Pane {
             counters: PaneCounters::default(),
             #[cfg(test)]
             command_hits: Vec::new(),
+            #[cfg(test)]
+            drew_injecting: false,
+            #[cfg(test)]
+            drew_waiting: false,
             #[cfg(test)]
             command_ids: Vec::new(),
         }
@@ -128,6 +235,8 @@ impl Pane {
             self.snapshot = TermSnapshot::default();
             self.applied_size = None;
             self.selection = None;
+            self.pending_copy = false;
+            self.unsent_clear = false;
             self.emulator_failed = false;
         }
     }
@@ -160,6 +269,16 @@ impl Pane {
         }
     }
 
+    /// A click makes this window's size the terminal's: on the host it takes
+    /// the size back from a remote peer; in a peer, the size is asked for
+    /// again, which takes it from the host.
+    fn claim_size(&mut self) {
+        if let Ok(session) = &self.session {
+            session.claim_local_size();
+        }
+        self.applied_size = None;
+    }
+
     fn apply_size(&mut self, size: GridSize, ctx: &egui::Context) {
         if self.applied_size == Some(size) {
             return;
@@ -176,8 +295,11 @@ impl Pane {
     }
 
     fn send(&mut self, bytes: Vec<u8>) {
+        if self.session.is_err() {
+            return;
+        }
+        self.clear_selection();
         let Ok(session) = &self.session else { return };
-        self.selection = None;
         // Typing returns the view to the live screen, as in other terminals.
         if self.snapshot.display_offset > 0 {
             let offset = i32::try_from(self.snapshot.display_offset).unwrap_or(i32::MAX);
@@ -192,6 +314,74 @@ impl Pane {
         self.notice = Some((refused.to_string(), Instant::now()));
     }
 
+    /// The files clicked for a preview since the last call.
+    pub(crate) fn take_preview_requests(&mut self) -> Vec<PreviewRequest> {
+        std::mem::take(&mut self.preview_requests)
+    }
+
+    /// The images pasted since the last call, to be saved by the window.
+    pub(crate) fn take_pasted_images(&mut self) -> Vec<Arc<egui::ColorImage>> {
+        std::mem::take(&mut self.pasted_images)
+    }
+
+    /// A pasted image was saved, or files dropped on a remote terminal reached
+    /// its host (their paths go in together, as dropped files' do, for every
+    /// kind of terminal), or why not (the pane's notice, and nothing typed).
+    /// They go only to the session and attachment `mark` was taken of,
+    /// checked again as they are queued.
+    pub(crate) fn paste_saved(&mut self, saved: Result<Saved, String>, mark: &SessionMark) {
+        const REPLACED: &str =
+            "The terminal restarted or reconnected before the files arrived: nothing was typed.";
+        let text = match saved {
+            Err(why) => return self.tell(why),
+            Ok(Saved::Here(paths)) => keymap::dropped_paths_text(&paths),
+            Ok(Saved::OnHost(paths)) => keymap::host_paths_text(&paths),
+        };
+        if !self.still_shows(mark) {
+            return self.tell(REPLACED.to_owned());
+        }
+        let Some(text) = text else { return };
+        let bytes = connecto_core::encode_paste(&text, self.snapshot.modes);
+        let Ok(session) = self.session.clone() else {
+            return;
+        };
+        self.clear_selection();
+        if self.snapshot.display_offset > 0 {
+            let offset = i32::try_from(self.snapshot.display_offset).unwrap_or(i32::MAX);
+            session.scroll(-offset);
+        }
+        match session.send_input_on(bytes, mark.generation) {
+            Ok(()) => {}
+            Err(_) if session.attachment_generation() != mark.generation => {
+                self.tell(REPLACED.to_owned());
+            }
+            Err(refused) => self.set_notice(refused),
+        }
+    }
+
+    /// The session the pane shows now, and its attachment, to tell later
+    /// whether it still does.
+    pub(crate) fn session_mark(&self) -> Option<SessionMark> {
+        self.session.as_ref().ok().map(|session| SessionMark {
+            session: Arc::downgrade(session),
+            generation: session.attachment_generation(),
+        })
+    }
+
+    /// Whether the pane still shows the session `mark` was taken of, over the
+    /// same attachment: no restart here, and no reattachment (as after a
+    /// restart on a remote host), replaced it.
+    pub(crate) fn still_shows(&self, mark: &SessionMark) -> bool {
+        matches!((&self.session, mark.session.upgrade()),
+            (Ok(now), Some(then)) if Arc::ptr_eq(now, &then)
+                && now.attachment_generation() == mark.generation)
+    }
+
+    /// Show `text` in the pane's notice.
+    pub(crate) fn tell(&mut self, text: String) {
+        self.notice = Some((text, Instant::now()));
+    }
+
     /// Files dropped on the terminal: their escaped paths go in as a paste, so
     /// a shell or an agent CLI takes them as typed input. Nothing is run.
     pub(crate) fn drop_files(&mut self, paths: &[std::path::PathBuf]) {
@@ -200,18 +390,203 @@ impl Pane {
             self.send(bytes);
         }
     }
+}
 
-    fn handle_input(&mut self, events: &[Event], ctx: &egui::Context) {
+/// Files copied in Finder and pasted on a remote terminal (macOS).
+#[cfg(target_os = "macos")]
+impl Pane {
+    /// The copied files whose upload was confirmed since the last call, a
+    /// list per paste.
+    pub(crate) fn take_pasted_files(&mut self) -> Vec<Vec<std::path::PathBuf>> {
+        std::mem::take(&mut self.pasted_files)
+    }
+
+    /// Close the question about pasted files unanswered: nothing is sent or
+    /// typed.
+    pub(crate) fn cancel_file_paste(&mut self) {
+        let answered = self.file_answer.take().is_some();
+        if self.file_paste.cancel() || answered {
+            self.tell(PASTE_CANCELLED.to_owned());
+        }
+    }
+
+    /// Whether the terminal still shows the session and attachment the open
+    /// question was asked in.
+    pub(crate) fn file_paste_session_holds(&self) -> bool {
+        self.file_paste_mark
+            .as_ref()
+            .is_some_and(|mark| self.still_shows(mark))
+    }
+
+    /// The open question about pasted files, over the bottom of the
+    /// terminal: the question, then the keys that answer it, each wrapped to
+    /// the terminal's width. Its own layer above the terminal, so no click,
+    /// drag or wheel over it reaches the program. Drawing it in this pass is
+    /// what lets an Enter in the next one answer it. False when none is open.
+    fn draw_file_paste(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        rect: Rect,
+    ) -> bool {
+        const PAD: f32 = 8.0;
+        const GAP: f32 = 4.0;
+        let pass = ctx.cumulative_pass_nr();
+        let Some(question) = self.file_paste.paint(pass).map(str::to_owned) else {
+            #[cfg(test)]
+            {
+                self.drew_strip = None;
+            }
+            return false;
+        };
+        let wrap = (rect.width() - 2.0 * PAD).max(1.0);
+        let question = painter.layout(question, FontId::proportional(13.0), theme::TEXT, wrap);
+        let hint = painter.layout(
+            crate::clipboard_files::HINT.to_owned(),
+            FontId::proportional(12.0),
+            HEADER_TEXT,
+            wrap,
+        );
+        let height = PAD + question.size().y + GAP + hint.size().y + PAD;
+        let strip = Rect::from_min_max(
+            pos2(rect.min.x, (rect.max.y - height).max(rect.min.y)),
+            rect.max,
+        );
+        let at_question = pos2(
+            strip.center().x - question.size().x / 2.0,
+            strip.min.y + PAD,
+        );
+        let at_hint = pos2(
+            strip.center().x - hint.size().x / 2.0,
+            at_question.y + question.size().y + GAP,
+        );
+        #[cfg(test)]
+        {
+            self.drew_strip = Some((
+                strip,
+                vec![
+                    Rect::from_min_size(at_question, question.size()),
+                    Rect::from_min_size(at_hint, hint.size()),
+                ],
+            ));
+        }
+        let seen = egui::Area::new(self.id.with("file-paste"))
+            .order(egui::Order::Middle)
+            .fixed_pos(strip.min)
+            .constrain(false)
+            .show(ctx, |ui| {
+                // Takes the pointer over the whole strip.
+                let (_, _) = ui.allocate_exact_size(strip.size(), Sense::click_and_drag());
+                let painter = ui.painter();
+                painter.rect_filled(strip, 0.0, theme::PANEL_BG);
+                painter.hline(
+                    strip.x_range(),
+                    strip.min.y,
+                    egui::Stroke::new(1.0, theme::BORDER),
+                );
+                painter.galley(at_question, question, theme::TEXT);
+                painter.galley(at_hint, hint, HEADER_TEXT);
+                // A new area's first pass sizes it, invisibly: the question
+                // is on screen only from a pass that is not that.
+                !ui.is_sizing_pass() && ui.is_visible() && strip.area() > 0.0
+            })
+            .inner;
+        if seen {
+            self.file_paste.mark_seen();
+        }
+        true
+    }
+
+    /// The frame's input, given to the open question about pasted files
+    /// before anything else sees it (see `App::draw`).
+    pub(crate) fn answer_file_paste(&mut self, events: &[Event]) {
+        let answer = self.file_paste.answer(events);
+        self.take_file_answer(answer);
+    }
+
+    /// An Enter or Esc is held until the end of the frame, when the window
+    /// checks again that the question still held the screen and keyboard
+    /// ([`Self::settle_file_answer`]): a dialog that arrived meanwhile ends
+    /// it. A cancel needs no such check.
+    fn take_file_answer(&mut self, answer: crate::clipboard_files::Answer) {
+        use crate::clipboard_files::Answer;
+        match answer {
+            Answer::Waiting => {}
+            Answer::Cancelled => self.tell(PASTE_CANCELLED.to_owned()),
+            answer => self.file_answer = Some(answer),
+        }
+    }
+
+    /// Act on this frame's Enter or Esc at the question when `holds` (the
+    /// window found, at the end of the frame, that it still held the screen
+    /// and keyboard), or else cancel it: nothing sent or typed.
+    pub(crate) fn settle_file_answer(&mut self, holds: bool) {
+        use crate::clipboard_files::Answer;
+        let Some(answer) = self.file_answer.take() else {
+            return;
+        };
+        match answer {
+            _ if !holds => self.tell(PASTE_CANCELLED.to_owned()),
+            Answer::Upload(paths) => self.pasted_files.push(paths),
+            Answer::PasteText(text) => {
+                if let Some(bytes) = keymap::translate(&Event::Paste(text), self.snapshot.modes) {
+                    self.send(bytes);
+                }
+            }
+            Answer::Waiting | Answer::Cancelled => {}
+        }
+    }
+
+    /// An Enter or Esc at the question waits for the end of the frame.
+    pub(crate) fn has_file_answer(&self) -> bool {
+        self.file_answer.is_some()
+    }
+}
+
+#[cfg(target_os = "macos")]
+const PASTE_CANCELLED: &str = "Paste cancelled: nothing was sent or typed.";
+
+impl Pane {
+    /// The frame's events, for a terminal that has the keyboard. `had_focus`:
+    /// it had it before this frame's click, so a paste was meant for it.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    fn handle_input(&mut self, events: &[Event], ctx: &egui::Context, had_focus: bool) {
         let modes = self.snapshot.modes;
-        for event in events {
-            if matches!(event, Event::Copy) {
-                // The only clipboard write there is. It follows a key press,
-                // and session output cannot reach it.
-                if let Some(selection) = self.selection {
-                    ctx.copy_text(selection.text(&self.snapshot));
-                    if platform::COPY_CLEARS_SELECTION {
-                        self.selection = None;
+        for (at, event) in events.iter().enumerate() {
+            #[cfg(target_os = "macos")]
+            if let Event::Paste(text) = event
+                && had_focus
+            {
+                use crate::clipboard_files::Pasted;
+                match self.file_paste.paste(text) {
+                    Pasted::Text => {}
+                    Pasted::Refused(why) => {
+                        self.tell(why);
+                        continue;
                     }
+                    Pasted::Asked => {
+                        self.file_paste_mark = self.session_mark();
+                        // Copied files, asked about before anything is sent
+                        // or typed. The rest of the frame's input came with
+                        // the paste, before the question was drawn: it can
+                        // cancel it (an Enter too), and reaches nothing.
+                        let answer = self.file_paste.answer(&events[at + 1..]);
+                        self.take_file_answer(answer);
+                        break;
+                    }
+                }
+            }
+            if let Event::PasteImage(image) = event {
+                // Saved and pasted as a path by the window, off this thread.
+                self.pasted_images.push(Arc::clone(image));
+            } else if self.selection.is_some() && is_copy_as_shown(event) {
+                // The text exactly as the screen shows it.
+                self.copy_selection(ctx, false);
+            } else if matches!(event, Event::Copy) {
+                // The clean copy: an agent's margins dropped and the rows it
+                // broke put back together.
+                if self.selection.is_some() && self.copy_selection(ctx, true) {
+                    // Copied, or to be copied once the emulator is free.
                 } else if let Some(bytes) = platform::clipboard_event_as_key(event)
                     .and_then(|key| keymap::translate(&key, modes))
                 {
@@ -223,12 +598,93 @@ impl Pane {
                 // Cut, off macOS: Ctrl+X, a key the shell's editors use.
                 self.send(bytes);
             } else if is_select_all(event) {
-                // The visible screen, as the snapshot holds nothing above it.
-                self.selection = Selection::all(&self.snapshot);
+                // The screen as shown.
+                self.selection = Some(Selection::new(SelectOp::All));
+                self.pending_copy = false;
+                self.send_unsent_selection();
             } else if let Some(bytes) = keymap::translate(event, modes) {
                 self.send(bytes);
             }
         }
+    }
+
+    /// Copy the selection. The only clipboard write there is: it follows a key
+    /// press, and session output cannot reach it. False when the selection
+    /// has gone (its text scrolled out of history or was rewritten), so the
+    /// key is taken as if nothing were selected.
+    fn copy_selection(&mut self, ctx: &egui::Context, clean: bool) -> bool {
+        let Ok(session) = self.session.clone() else {
+            return false;
+        };
+        self.pending_clean = clean;
+        let text = if !self.send_unsent_selection() {
+            SelectionText::Busy
+        } else if clean {
+            session.clean_selection_text()
+        } else {
+            session.selection_text()
+        };
+        match text {
+            SelectionText::Text(text) => {
+                self.pending_copy = false;
+                ctx.copy_text(text);
+                if platform::COPY_CLEARS_SELECTION {
+                    self.clear_selection();
+                }
+                true
+            }
+            SelectionText::Busy => {
+                self.pending_copy = true;
+                ctx.request_repaint_after(CONTENDED_RETRY);
+                true
+            }
+            SelectionText::Nothing => {
+                self.pending_copy = false;
+                self.selection = None;
+                false
+            }
+        }
+    }
+
+    /// Drop the selection, here and in the session.
+    fn clear_selection(&mut self) {
+        let had = self.selection.take().is_some();
+        self.pending_copy = false;
+        if had || self.unsent_clear {
+            self.unsent_clear = true;
+            self.send_unsent_selection();
+        }
+    }
+
+    /// Give the session what it was too busy to take: a clear, a start or
+    /// select-all, and the drag's last cell, in that order. True when nothing
+    /// is left to send.
+    fn send_unsent_selection(&mut self) -> bool {
+        let Ok(session) = &self.session else {
+            return true;
+        };
+        if self.unsent_clear {
+            if !session.select(SelectOp::Clear) {
+                return false;
+            }
+            self.unsent_clear = false;
+        }
+        let Some(selection) = &mut self.selection else {
+            return true;
+        };
+        if let Some(op) = selection.unsent {
+            if !session.select(op) {
+                return false;
+            }
+            selection.unsent = None;
+        }
+        if let Some((row, col)) = selection.unsent_extend {
+            if !session.select(SelectOp::Extend { row, col }) {
+                return false;
+            }
+            selection.unsent_extend = None;
+        }
+        true
     }
 
     /// Whether the mouse goes to the program: the terminal is a remote one, the
@@ -240,18 +696,29 @@ impl Pane {
             && self.session.as_ref().is_ok_and(|s| s.forwards_mouse())
     }
 
+    /// Whether wheel movement goes to the program as wheel reports: it turned
+    /// mouse reporting on, and neither Shift nor the link key is held, which
+    /// keep the wheel for the terminal's own scrolling.
+    fn wheel_to_program(&self, shift: bool, command: bool) -> bool {
+        !shift && !command && self.snapshot.modes.mouse_reporting()
+    }
+
     /// The bytes for this frame's pointer events, in order. `rect` is the
     /// terminal's area and `origin` the top-left of its grid.
+    /// `owns` says whether the terminal had the pointer at a point: nothing
+    /// drawn over it there. A gesture starts only where it does, and is then
+    /// followed through its release, outside the terminal too.
     fn mouse_bytes(
         &mut self,
         events: &[Event],
         rect: Rect,
         origin: Pos2,
         cell: CellMetrics,
+        owns: impl Fn(Pos2) -> bool,
     ) -> Vec<Vec<u8>> {
         let modes = self.snapshot.modes;
         let at = |pos: Pos2, snapshot: &TermSnapshot| {
-            Selection::cell_at(pos - origin, cell.width, cell.height, snapshot)
+            selection::cell_at(pos - origin, cell.width, cell.height, snapshot)
         };
         let mut out = Vec::new();
         for event in events {
@@ -269,8 +736,9 @@ impl Pane {
                         _ => continue,
                     };
                     if *pressed {
-                        // Only a press on the terminal starts a gesture.
-                        if !rect.contains(*pos) {
+                        // Only a press on the terminal, uncovered, starts
+                        // a gesture.
+                        if !rect.contains(*pos) || !owns(*pos) {
                             continue;
                         }
                         self.mouse_down = Some(button);
@@ -286,8 +754,11 @@ impl Pane {
                 }
                 Event::PointerMoved(pos) => {
                     let kind = match self.mouse_down {
+                        // A dialog opened mid-drag holds the pointer: the
+                        // program sees no motion under it, only the release.
+                        Some(_) if self.pointer_blocked => continue,
                         Some(button) => MouseKind::Drag(button),
-                        None if rect.contains(*pos) => MouseKind::Move,
+                        None if rect.contains(*pos) && owns(*pos) => MouseKind::Move,
                         None => continue,
                     };
                     (kind, *pos, egui::Modifiers::NONE)
@@ -333,7 +804,7 @@ impl Pane {
         self.scroll_lines += delta_y / cell.height;
         let lines = self.scroll_lines.trunc() as i32;
         self.scroll_lines -= lines as f32;
-        let (row, col) = Selection::cell_at(
+        let (row, col) = selection::cell_at(
             pos.unwrap_or(origin) - origin,
             cell.width,
             cell.height,
@@ -369,7 +840,9 @@ impl Pane {
         }
     }
 
-    /// Dragging selects, unless the mouse goes to the program.
+    /// Dragging selects, unless the mouse goes to the program. The session
+    /// holds the selection on the text, so a drag goes on across a scroll; held
+    /// past the top or bottom edge it scrolls the history itself.
     fn handle_selection(
         &mut self,
         response: &egui::Response,
@@ -377,26 +850,76 @@ impl Pane {
         cell: CellMetrics,
         ctx: &egui::Context,
     ) {
+        let Ok(session) = self.session.clone() else {
+            return;
+        };
         let locate =
-            |pos: Pos2| Selection::cell_at(pos - origin, cell.width, cell.height, &self.snapshot);
-        if response.drag_started() {
+            |pos: Pos2| selection::cell_at(pos - origin, cell.width, cell.height, &self.snapshot);
+        let command = ctx.input(|input| input.modifiers.command);
+        if response.double_clicked() && !command {
+            // The whole word, also when an agent broke it over rows.
+            let word = response
+                .interact_pointer_pos()
+                .map(locate)
+                .and_then(|at| words::word_at(&self.snapshot, at));
+            self.clear_selection();
+            if let Some(word) = word {
+                self.unsent_clear = false;
+                self.selection = Some(Selection {
+                    unsent: Some(SelectOp::Start {
+                        row: word.first.0,
+                        col: word.first.1,
+                    }),
+                    unsent_extend: Some(word.last),
+                });
+                if !self.send_unsent_selection() {
+                    ctx.request_repaint_after(CONTENDED_RETRY);
+                }
+            }
+        } else if response.drag_started() {
             let press = ctx.input(|input| input.pointer.press_origin());
-            self.selection = press.map(locate).map(Selection::at);
+            self.pending_copy = false;
+            // The new start replaces whatever the session holds.
+            self.unsent_clear = false;
+            self.selection = press
+                .map(locate)
+                .map(|(row, col)| Selection::new(SelectOp::Start { row, col }));
+            self.send_unsent_selection();
         } else if response.dragged() {
-            let head = response.interact_pointer_pos().map(locate);
-            if let (Some(selection), Some(head)) = (&mut self.selection, head) {
-                selection.head = head;
+            let Some(pos) = response.interact_pointer_pos() else {
+                return;
+            };
+            if self.selection.is_none() {
+                return;
+            }
+            let lines = selection::edge_scroll(pos.y - origin.y, cell.height, self.snapshot.rows);
+            if lines != 0 && !self.snapshot.modes.alt_screen {
+                // The alternate screen has no history to scroll into.
+                let due = self
+                    .edge_scrolled
+                    .is_none_or(|at| at.elapsed() >= EDGE_SCROLL_EVERY);
+                if due && session.scroll(lines) {
+                    self.edge_scrolled = Some(Instant::now());
+                }
+                ctx.request_repaint_after(EDGE_SCROLL_EVERY);
+            }
+            if let Some(selection) = &mut self.selection {
+                selection.unsent_extend = Some(locate(pos));
+            }
+            if !self.send_unsent_selection() {
+                ctx.request_repaint_after(CONTENDED_RETRY);
             }
         } else if response.clicked() {
-            self.selection = None;
+            self.clear_selection();
         }
     }
 
-    /// The link under the pointer is underlined; with the link key held it
-    /// shows a pointing hand and a click opens it. Only the line under the
-    /// pointer is read, and only while the pointer is over the screen.
+    /// The link or file under the pointer is underlined; with the link key
+    /// held it shows a pointing hand and a click opens the link in the browser,
+    /// or the file in the preview. Only the line under the pointer is read,
+    /// and only while the pointer is over the screen.
     fn handle_link(
-        &self,
+        &mut self,
         response: &egui::Response,
         painter: &egui::Painter,
         origin: Pos2,
@@ -417,12 +940,30 @@ impl Pane {
         if !inside {
             return;
         }
-        let at = Selection::cell_at(offset, cell.width, cell.height, &self.snapshot);
-        let Some(link) = links::link_at(&self.snapshot, at) else {
+        let at = selection::cell_at(offset, cell.width, cell.height, &self.snapshot);
+        let (spans, target) = if let Some(link) = links::link_at(&self.snapshot, at) {
+            // An agent may have broken the URL over rows itself: the whole word
+            // is the link when it is the longer URL.
+            match words::word_at(&self.snapshot, at)
+                .filter(|word| word.text.len() > link.url.len() && word.text.contains(&link.url))
+                .and_then(|word| {
+                    let start = word.text.find(&link.url)?;
+                    let url = links::openable(&word.text[start..])?.to_owned();
+                    Some((word.spans, url))
+                }) {
+                Some((spans, url)) => (spans, Target::Url(url)),
+                None => (link.spans, Target::Url(link.url)),
+            }
+        } else if let Some((word, file)) = self.file_at(at) {
+            (word.spans, Target::File(file))
+        } else if let Some(word) = command.then(|| self.remote_file_at(at)).flatten() {
+            let path = preview::clean_path(&word.text).to_owned();
+            (word.spans, Target::Remote(path))
+        } else {
             return;
         };
         let color = Color32::from_rgb(0x6c, 0xd5, 0xe6);
-        for (row, start, end) in &link.spans {
+        for (row, start, end) in &spans {
             let y = origin.y + (f32::from(*row) + 1.0) * cell.height - 1.5;
             painter.hline(
                 (origin.x + f32::from(*start) * cell.width)
@@ -434,12 +975,115 @@ impl Pane {
         if command {
             response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             if response.clicked() {
-                response.ctx.open_url(egui::OpenUrl::new_tab(link.url));
+                match target {
+                    Target::Url(url) => response.ctx.open_url(egui::OpenUrl::new_tab(url)),
+                    Target::File(file) => self.preview_requests.push(PreviewRequest::Local(file)),
+                    Target::Remote(path) => {
+                        self.preview_requests.push(PreviewRequest::Remote(path))
+                    }
+                }
             }
         } else {
+            let verb = match target {
+                Target::Url(_) => "open",
+                Target::File(_) | Target::Remote(_) => "preview",
+            };
             response
                 .clone()
-                .on_hover_text_at_pointer(format!("{}-click to open", platform::LINK_KEY));
+                .on_hover_text_at_pointer(format!("{}-click to {verb}", platform::LINK_KEY));
+        }
+    }
+
+    /// The word at `at` when it names a file on this computer, and the file.
+    fn file_at(&mut self, at: selection::CellPos) -> Option<(words::Word, std::path::PathBuf)> {
+        if self.files != Files::Local {
+            return None;
+        }
+        let word = words::word_at(&self.snapshot, at)?;
+        // A path has a separator or an extension; a bare word is not looked up.
+        if !word.text.contains(['/', '.', '\\']) {
+            return None;
+        }
+        let file = match &self.path_lookup {
+            Some((text, file)) if *text == word.text => file.clone(),
+            _ => {
+                let file = preview::resolve(&word.text, self.base_dir.as_deref());
+                self.path_lookup = Some((word.text.clone(), file.clone()));
+                file
+            }
+        }?;
+        Some((word, file))
+    }
+
+    /// The word at `at` when it reads as a path on a remote host: one with a
+    /// folder separator or a file extension. Whether it is a file there is
+    /// asked only when it is clicked.
+    fn remote_file_at(&self, at: selection::CellPos) -> Option<words::Word> {
+        if self.files != Files::Remote {
+            return None;
+        }
+        let word = words::word_at(&self.snapshot, at)?;
+        preview::looks_like_path(&word.text).then_some(word)
+    }
+
+    /// A small copy button at the end of a finished selection. It copies the
+    /// clean text, as the copy key does.
+    /// `dragging` is a selection drag on the terminal under way: the button
+    /// waits for it to end. A press on the button itself keeps it, so its
+    /// click completes.
+    fn draw_copy_button(
+        &mut self,
+        ui: &mut Ui,
+        rect: Rect,
+        origin: Pos2,
+        cell: CellMetrics,
+        dragging: bool,
+    ) {
+        let Some(range) = self.snapshot.selection else {
+            return;
+        };
+        if self.selection.is_none() || dragging {
+            return;
+        }
+        let Some(&(row, _, end)) = range.spans(self.snapshot.rows, self.snapshot.cols).last()
+        else {
+            return;
+        };
+        let size = Vec2::splat(22.0);
+        let x = (origin.x + f32::from(end) * cell.width + 6.0).min(rect.max.x - size.x - 4.0);
+        let y = (origin.y + f32::from(row) * cell.height + cell.height / 2.0 - size.y / 2.0)
+            .clamp(rect.min.y + 2.0, rect.max.y - size.y - 2.0);
+        let button = Rect::from_min_size(pos2(x, y), size);
+        let response = ui
+            .interact(button, self.id.with("copy-selection"), Sense::click())
+            .on_hover_text(format!(
+                "Copy, with wrapped lines joined and margins dropped\n{} copies as shown",
+                platform::COPY_AS_SHOWN_KEYS
+            ));
+        let fill = if response.hovered() {
+            theme::RAISED_BG
+        } else {
+            theme::POPOVER_BG
+        };
+        let painter = ui.painter();
+        painter.rect_filled(button, 5.0, fill);
+        painter.rect_stroke(
+            button,
+            5.0,
+            egui::Stroke::new(1.0, theme::POPOVER_BORDER),
+            egui::StrokeKind::Inside,
+        );
+        let color = if response.hovered() {
+            theme::CYAN
+        } else {
+            theme::TEXT_MUTED
+        };
+        crate::icons::copy(painter, button.center(), color, fill);
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response.clicked() && self.copy_selection(ui.ctx(), true) {
+            self.tell("Copied".to_owned());
         }
     }
 
@@ -523,6 +1167,44 @@ impl Pane {
     #[cfg(test)]
     pub(crate) fn warning_lines(&self) -> usize {
         self.warnings().len()
+    }
+
+    /// Connecto is typing into this terminal by itself, and holds the user's
+    /// keys until it is done.
+    pub(crate) fn injecting(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|control| control.injecting())
+    }
+
+    /// A message waits for the user to send or clear their line.
+    pub(crate) fn message_waiting(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|control| control.message_waiting())
+    }
+
+    /// A small tag at the top right: Connecto is typing (the keys typed now go
+    /// in after), or a message waits for the user's line.
+    fn draw_injecting(&self, painter: &egui::Painter, rect: Rect, text: &str) {
+        let font = FontId::proportional(12.0);
+        let galley = painter.layout_no_wrap(text.to_owned(), font, HEADER_TEXT);
+        let size = galley.size() + Vec2::new(16.0, 8.0);
+        let tag = Rect::from_min_size(
+            pos2(
+                rect.max.x - size.x - PANE_PADDING,
+                rect.min.y + PANE_PADDING,
+            ),
+            size,
+        );
+        painter.rect_filled(tag, 4.0, theme::PANEL_BG);
+        painter.rect_stroke(
+            tag,
+            4.0,
+            egui::Stroke::new(1.0, theme::BORDER),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(tag.min + Vec2::new(8.0, 4.0), galley, HEADER_TEXT);
     }
 
     pub(crate) fn live(&self) -> bool {
@@ -617,10 +1299,18 @@ impl Pane {
         let mut restarted = false;
         let ctx = ui.ctx().clone();
         let response = ui.interact(rect, self.id, Sense::click_and_drag());
+        let had_focus = ctx.memory(|memory| memory.has_focus(self.id));
         if response.clicked() || response.drag_started() {
             response.request_focus();
+            self.claim_size();
         }
         let focused = ctx.memory(|memory| memory.has_focus(self.id));
+        // A question about pasted files is for a paste made while the
+        // terminal had the keyboard: it goes with the keyboard.
+        #[cfg(target_os = "macos")]
+        if !focused {
+            self.cancel_file_paste();
+        }
         if focused {
             // Terminal apps need these keys; egui would use them to move focus.
             ctx.memory_mut(|memory| {
@@ -634,15 +1324,42 @@ impl Pane {
                     },
                 );
             });
-            self.handle_input(input, &ctx);
+            self.handle_input(input, &ctx, had_focus);
+        }
+        // What a busy emulator refused, also after the button is released.
+        if !self.send_unsent_selection() {
+            ctx.request_repaint_after(CONTENDED_RETRY);
+        }
+        if self.pending_copy && !self.copy_selection(&ctx, self.pending_clean) {
+            self.pending_copy = false;
         }
         // Cmd (Ctrl off macOS) is the key for links, so a plain click still
         // selects, and still reaches a program that asked for the mouse.
         let (shift, command) = ctx.input(|input| (input.modifiers.shift, input.modifiers.command));
         let forward = self.forwards_mouse(shift) && !command;
-        if response.hovered() && !forward {
+        // The pointer is the terminal's only when nothing is over it: not a
+        // dialog, a sheet, nor a card drawn on top of it.
+        let owns_pointer = !self.pointer_blocked && response.contains_pointer();
+        // Where an event happened, the same: decided for each press, not for
+        // the whole frame's events.
+        let blocked = self.pointer_blocked;
+        let layer = ui.layer_id();
+        let owns_at = |pos: Pos2| !blocked && ctx.layer_id_at(pos) == Some(layer);
+        // The wheel goes to a program that asked for the mouse even in a local
+        // terminal, where clicks still select: a full-screen app such as
+        // Claude scrolls its own history with it, while Up and Down would walk
+        // the prompt history instead.
+        let wheel_to_program = forward || self.wheel_to_program(shift, command);
+        if response.hovered() && owns_pointer && !forward {
             let delta = ui.input(|input| input.smooth_scroll_delta.y);
-            self.handle_scroll(delta, cell);
+            if wheel_to_program {
+                let at = ctx.input(|input| input.pointer.hover_pos());
+                let origin = rect.min + Vec2::splat(PANE_PADDING);
+                let chunks = self.wheel_bytes(delta, at, origin, cell);
+                self.send_mouse(chunks);
+            } else {
+                self.handle_scroll(delta, cell);
+            }
         }
 
         let painter = ui.painter_at(rect);
@@ -652,8 +1369,8 @@ impl Pane {
         let grid_area = rect.size() - Vec2::splat(PANE_PADDING * 2.0) - Vec2::new(0.0, strip);
         if forward {
             let events = ctx.input(|input| input.events.clone());
-            let mut chunks = self.mouse_bytes(&events, rect, grid_origin, cell);
-            if response.hovered() {
+            let mut chunks = self.mouse_bytes(&events, rect, grid_origin, cell, owns_at);
+            if response.hovered() && owns_pointer {
                 let delta = ui.input(|input| input.smooth_scroll_delta.y);
                 let at = ctx.input(|input| input.pointer.hover_pos());
                 chunks.extend(self.wheel_bytes(delta, at, grid_origin, cell));
@@ -694,8 +1411,8 @@ impl Pane {
                 if let Some(word) = restart {
                     restarted = self.draw_restart_bar(ui, rect, word);
                 }
-                if let Some(selection) = self.selection {
-                    for (row, start, end) in selection.spans(&self.snapshot) {
+                if let Some(range) = self.snapshot.selection {
+                    for (row, start, end) in range.spans(self.snapshot.rows, self.snapshot.cols) {
                         let min = grid_origin
                             + Vec2::new(
                                 f32::from(start) * cell.width,
@@ -705,6 +1422,7 @@ impl Pane {
                         painter.rect_filled(Rect::from_min_size(min, size), 0.0, SELECTION_FILL);
                     }
                 }
+                self.draw_copy_button(ui, rect, grid_origin, cell, response.dragged());
             }
             Err(reason) => {
                 painter.text(
@@ -732,7 +1450,35 @@ impl Pane {
             }
         }
 
-        if let Some((notice, since)) = &self.notice {
+        let injecting = self.live() && self.injecting();
+        #[cfg(test)]
+        {
+            self.drew_injecting = injecting;
+        }
+        let waiting = !injecting && self.live() && self.message_waiting();
+        #[cfg(test)]
+        {
+            self.drew_waiting = waiting;
+        }
+        if injecting || waiting {
+            let text = if injecting {
+                INJECTING_TEXT
+            } else {
+                WAITING_TEXT
+            };
+            self.draw_injecting(&painter, rect, text);
+            // Watched until it ends: the session wakes the UI at both ends, and
+            // this covers a frame drawn just before the end.
+            ctx.request_repaint_after(INJECTING_REPAINT);
+        }
+
+        #[cfg(target_os = "macos")]
+        let asking = self.draw_file_paste(&ctx, &painter, rect);
+        #[cfg(not(target_os = "macos"))]
+        let asking = false;
+        if asking {
+            // The question is over the notice's place.
+        } else if let Some((notice, since)) = &self.notice {
             let remaining = NOTICE_LIFETIME.saturating_sub(since.elapsed());
             if remaining.is_zero() {
                 self.notice = None;
@@ -815,6 +1561,45 @@ fn stage_message(stage: &PaneStage) -> Option<(String, Color32, bool)> {
         PaneStage::Failed { reason } => Some((reason.clone(), ERROR_TEXT, true)),
         PaneStage::LoggingIn | PaneStage::Running => None,
     }
+}
+
+/// What a click on underlined text opens.
+enum Target {
+    Url(String),
+    File(std::path::PathBuf),
+    /// A path on the remote host the terminal runs on, as printed.
+    Remote(String),
+}
+
+/// Where a terminal's files are, for a preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Files {
+    Local,
+    /// On the remote host the terminal runs on: read through it.
+    Remote,
+    /// Nowhere a preview can reach.
+    None,
+}
+
+/// A file clicked for a preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreviewRequest {
+    Local(std::path::PathBuf),
+    /// A path as the remote terminal printed it, read from its host.
+    Remote(String),
+}
+
+/// Copy as shown: Cmd+Shift+C (Ctrl+Shift+C off macOS), with a selection.
+fn is_copy_as_shown(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key {
+            key: egui::Key::C,
+            pressed: true,
+            modifiers,
+            ..
+        } if platform::is_copy_as_shown(modifiers)
+    )
 }
 
 pub(crate) fn scroll_keys(lines: i32, modes: InputModes) -> Vec<u8> {
@@ -903,6 +1688,27 @@ mod tests {
         }
     }
 
+    /// A local terminal: the default `forwards_mouse`, so clicks select.
+    struct Local;
+
+    impl TerminalSession for Local {
+        fn poll_snapshot(&self, _out: &mut TermSnapshot) -> SnapshotOutcome {
+            SnapshotOutcome::Unchanged
+        }
+        fn send_input(&self, _bytes: Vec<u8>) -> Result<(), InputRefused> {
+            Ok(())
+        }
+        fn resize(&self, _size: GridSize) -> ResizeOutcome {
+            ResizeOutcome::Applied
+        }
+        fn scroll(&self, _lines: i32) -> bool {
+            true
+        }
+        fn status(&self) -> SessionStatus {
+            SessionStatus::Running
+        }
+    }
+
     fn mouse_pane(modes: InputModes) -> Pane {
         let mut pane = Pane::new(
             "t",
@@ -955,6 +1761,7 @@ mod tests {
             rect,
             origin,
             cell(),
+            |_| true,
         );
         let text: Vec<String> = bytes
             .into_iter()
@@ -963,6 +1770,45 @@ mod tests {
         // Press at cell (3,2); the one-pixel move is the same cell and is not
         // reported; the drag to (7,4); then the release.
         assert_eq!(text, ["\x1b[<0;4;3M", "\x1b[<32;8;5M", "\x1b[<0;8;5m"]);
+    }
+
+    /// A dialog that opens while the button is held stops the drag's motion
+    /// reaching the program; the release still ends the gesture.
+    #[test]
+    fn a_dialog_opened_mid_drag_stops_its_motion_but_not_its_release() {
+        let mut pane = mouse_pane(InputModes {
+            mouse_drag: true,
+            mouse_sgr: true,
+            ..InputModes::default()
+        });
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 480.0));
+        let origin = pos2(0.0, 0.0);
+        let text = |bytes: Vec<Vec<u8>>| -> Vec<String> {
+            bytes
+                .into_iter()
+                .map(|b| String::from_utf8(b).unwrap())
+                .collect()
+        };
+        let pressed = pane.mouse_bytes(
+            &[press(pos2(35.0, 45.0), true)],
+            rect,
+            origin,
+            cell(),
+            |_| true,
+        );
+        assert_eq!(text(pressed), ["\x1b[<0;4;3M"]);
+        pane.pointer_blocked = true;
+        let rest = pane.mouse_bytes(
+            &[
+                Event::PointerMoved(pos2(75.0, 85.0)),
+                press(pos2(75.0, 85.0), false),
+            ],
+            rect,
+            origin,
+            cell(),
+            |_| false,
+        );
+        assert_eq!(text(rest), ["\x1b[<0;8;5m"], "only the release");
     }
 
     #[test]
@@ -982,6 +1828,7 @@ mod tests {
             rect,
             pos2(100.0, 100.0),
             cell(),
+            |_| true,
         );
         assert!(bytes.is_empty(), "{bytes:?}");
     }
@@ -1009,6 +1856,26 @@ mod tests {
         assert!(mouse_pane(on).forwards_mouse(false));
         assert!(!mouse_pane(on).forwards_mouse(true), "Shift selects");
         assert!(!mouse_pane(InputModes::default()).forwards_mouse(false));
+    }
+
+    #[test]
+    fn the_wheel_goes_to_a_program_that_asked_for_the_mouse_even_locally() {
+        let mut pane = mouse_pane(InputModes {
+            alt_screen: true,
+            mouse_click: true,
+            mouse_sgr: true,
+            ..InputModes::default()
+        });
+        pane.session = Ok(Arc::new(Local));
+        assert!(!pane.forwards_mouse(false), "clicks still select locally");
+        assert!(pane.wheel_to_program(false, false));
+        assert!(!pane.wheel_to_program(true, false), "Shift keeps the wheel");
+        assert!(!pane.wheel_to_program(false, true));
+        let plain = mouse_pane(InputModes {
+            alt_screen: true,
+            ..InputModes::default()
+        });
+        assert!(!plain.wheel_to_program(false, false), "no mouse: arrows");
     }
 
     #[test]

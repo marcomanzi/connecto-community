@@ -10,6 +10,10 @@ pub const VERSION: u32 = 2;
 
 const BEGIN: &str = "<!-- connecto-automations:begin v";
 const END: &str = "<!-- connecto-automations:end -->";
+/// The markers an install under the earlier name wrote. A block with them is
+/// replaced by the current one, never left beside it.
+const LEGACY_BEGIN: &str = "<!-- magneto-automations:begin v";
+const LEGACY_END: &str = "<!-- magneto-automations:end -->";
 
 fn wrap(body: &str) -> String {
     format!("{BEGIN}{VERSION} -->\n{}\n{END}\n", body.trim_end())
@@ -18,9 +22,14 @@ fn wrap(body: &str) -> String {
 /// A guide an earlier build wrote whole, with no markers.
 fn is_old_connecto_guide(text: &str) -> bool {
     let head = text.trim_start();
-    ["# Connecto automations folder", "# Connecto automation:"]
-        .iter()
-        .any(|h| head.starts_with(h))
+    [
+        "# Connecto automations folder",
+        "# Connecto automation:",
+        "# Magneto automations folder",
+        "# Magneto automation:",
+    ]
+    .iter()
+    .any(|h| head.starts_with(h))
 }
 
 /// What the file should hold so that it carries the current guide, or `None`
@@ -35,10 +44,14 @@ pub fn apply(existing: Option<&str>, body: &str) -> Option<String> {
     let Some(text) = existing else {
         return Some(block);
     };
-    if let (Some(begin), Some(end_at)) = (text.find(BEGIN), text.find(END))
-        && begin < end_at
-    {
-        let mut end = end_at + END.len();
+    for (open, close) in [(BEGIN, END), (LEGACY_BEGIN, LEGACY_END)] {
+        let (Some(begin), Some(end_at)) = (text.find(open), text.find(close)) else {
+            continue;
+        };
+        if begin >= end_at {
+            continue;
+        }
+        let mut end = end_at + close.len();
         if text[end..].starts_with('\n') {
             end += 1;
         }
@@ -255,6 +268,26 @@ pub fn text(name: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_block_written_under_the_earlier_name_is_replaced_not_kept_beside() {
+        let old = "mine\n\n<!-- magneto-automations:begin v1 -->\nold body\n<!-- magneto-automations:end -->\nafter\n";
+        let out = apply(Some(old), "new body").unwrap_or_default();
+        assert!(
+            out.starts_with("mine\n\n<!-- connecto-automations:begin v"),
+            "{out}"
+        );
+        assert!(out.contains("new body") && out.ends_with("after\n"));
+        assert!(
+            !out.contains("magneto") && !out.contains("old body"),
+            "{out}"
+        );
+        assert_eq!(
+            apply(Some(&out), "new body"),
+            None,
+            "a second run changes nothing"
+        );
+    }
 
     #[test]
     fn the_guide_names_every_field_the_check_enforces() {

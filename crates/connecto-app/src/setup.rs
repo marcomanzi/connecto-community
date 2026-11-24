@@ -37,21 +37,43 @@ use crate::platform::{OFFERS_POWERSHELL_7, THE_COMPUTER, THIS_COMPUTER};
 /// The PowerShell 7 card's key on the choice screen (Windows only).
 pub const POWERSHELL_KEY: &str = "powershell";
 
-/// The agents, in the order they are listed.
-pub const AGENTS: [Tool; 2] = [Tool::Claude, Tool::Codex];
+/// The agents, in the order the first launch and Settings list them. Each
+/// is optional; Pi, Antigravity and OpenCode are not chosen to begin with
+/// (Pi needs Node.js and a model provider of the user's choosing).
+pub const AGENTS: [Tool; 5] = [
+    Tool::Claude,
+    Tool::Codex,
+    Tool::Pi,
+    Tool::Antigravity,
+    Tool::OpenCode,
+];
+
+/// The agents Settings lists: the same five.
+pub const SETTINGS_AGENTS: [Tool; 5] = AGENTS;
+
+/// What the first launch chooses to begin with, in the order of [`AGENTS`].
+const FIRST_CHOICE: [bool; 5] = [true, true, false, false, false];
+
+/// The agents a later launch sets up by itself when it finds them on this
+/// computer and not in Connecto: the two Connecto keeps a copy of. Pi and
+/// Antigravity run where they are installed, and are set up when chosen.
+pub const COPIED_AGENTS: [Tool; 2] = [Tool::Claude, Tool::Codex];
 
 /// Written in the data root when the first-launch setup has been completed.
 pub const ONBOARDED: &str = ".onboarded";
 
-/// The agents the user chose at the first launch, comma separated (`claude,codex`;
-/// empty for none). A project's first terminals are these. Absent: both.
+/// The agents the user chose at the first launch, comma separated
+/// (`claude,codex,pi,antigravity`; empty for none). Absent: Claude and Codex.
 pub const AGENTS_FILE: &str = ".agents";
 
-/// The agents a new project starts with, from the choice made at the first launch.
+/// The agents chosen at the first launch. A new project no longer starts
+/// with them (it opens its Tools settings instead); the tests read the choice
+/// back through this.
+#[cfg(test)]
 #[must_use]
 pub fn chosen_agents(data_root: &Path) -> Vec<Tool> {
     let Ok(text) = std::fs::read_to_string(data_root.join(AGENTS_FILE)) else {
-        return AGENTS.to_vec();
+        return COPIED_AGENTS.to_vec();
     };
     let off = crate::agents_host::inactive_agents(data_root);
     AGENTS
@@ -117,6 +139,11 @@ fn page_of(tool: Tool) -> (&'static str, &'static str) {
             "https://docs.claude.com/en/docs/claude-code/setup",
         ),
         Tool::Codex => ("Codex", "https://github.com/openai/codex"),
+        Tool::Pi => ("Pi", "https://pi.dev"),
+        Tool::Antigravity => ("Antigravity CLI", "https://antigravity.google/docs/cli"),
+        // The 1.x line Connecto's plugin is for: opencode.ai's own pages
+        // describe OpenCode 2 now.
+        Tool::OpenCode => ("OpenCode", "https://github.com/anomalyco/opencode"),
         Tool::Shell => ("Shell", "https://connecto.studio"),
     }
 }
@@ -151,7 +178,7 @@ fn has_existing_data(data_root: &Path) -> bool {
 /// The agents that are on this computer and not yet set up, leaving out those
 /// the user chose to skip.
 fn to_set_up(store: &Store, home: &Path, skipped: &[Tool]) -> Vec<Tool> {
-    AGENTS
+    COPIED_AGENTS
         .into_iter()
         .filter(|tool| {
             !skipped.contains(tool)
@@ -283,6 +310,9 @@ fn explain(tool: Tool, err: &StoreError) -> SetupProblem {
             format!("Connecto could not read how {name} is installed."),
             format!("Reinstall {name}, then try again."),
         ),
+        // A version Connecto cannot work with (OpenCode 2): it says which,
+        // and how to install one that works.
+        StoreError::Unsupported(why) => (why.clone(), "Then press Try again.".to_owned()),
         _ => (
             format!("Something went wrong while getting {name} ready."),
             "Try again. If it keeps happening, quit and reopen Connecto.".to_owned(),
@@ -301,7 +331,7 @@ fn explain(tool: Tool, err: &StoreError) -> SetupProblem {
 fn nothing_installed() -> SetupProblem {
     SetupProblem {
         what: format!(
-            "Connecto works with Claude Code and Codex, and neither is on {THIS_COMPUTER} yet."
+            "Connecto works with Claude Code, Codex, Pi, Antigravity and OpenCode, and none of them is on {THIS_COMPUTER} yet."
         ),
         next: "Install one of them, then press Try again. You can also continue now and use a plain terminal."
             .to_owned(),
@@ -314,6 +344,18 @@ fn nothing_installed() -> SetupProblem {
             ProblemAction::OpenPage {
                 label: "Get Codex".to_owned(),
                 url: page_of(Tool::Codex).1.to_owned(),
+            },
+            ProblemAction::OpenPage {
+                label: "Get Pi".to_owned(),
+                url: page_of(Tool::Pi).1.to_owned(),
+            },
+            ProblemAction::OpenPage {
+                label: "Get Antigravity CLI".to_owned(),
+                url: page_of(Tool::Antigravity).1.to_owned(),
+            },
+            ProblemAction::OpenPage {
+                label: "Get OpenCode".to_owned(),
+                url: page_of(Tool::OpenCode).1.to_owned(),
             },
             ProblemAction::ContinueWithout {
                 label: "Continue with a plain terminal".to_owned(),
@@ -345,7 +387,7 @@ pub struct Outcome2 {
     pub open: Option<PathBuf>,
     /// Open Connecto Home, where the chosen agents sign in.
     pub open_home: bool,
-    /// The agents the user chose (`claude`, `codex`); empty means both.
+    /// The agents the user chose (`claude`, `codex`, `pi`, `antigravity`).
     pub agents: Vec<String>,
     /// A first message to send in it (the sample project's).
     pub first_prompt: Option<String>,
@@ -560,6 +602,18 @@ pub fn stored_entry(store: &Store, tool: Tool) -> Option<PathBuf> {
 /// and setup both use this, so they agree on what is checked. The second value
 /// says what is wrong with the stored copy, when it was changed or does not match.
 #[must_use]
+/// Why the `tool` at `entry` cannot be used now, asked of the program itself
+/// and not of the store's record: OpenCode upgrades itself in place, and an
+/// OpenCode 2 cannot load Connecto's plugin. `None` for the other tools, and
+/// when the version cannot be read.
+pub fn live_unsupported(tool: Tool, entry: &Path, home: &Path) -> Option<String> {
+    if tool != Tool::OpenCode {
+        return None;
+    }
+    let version = crate::agent_install::version_of_install(tool, entry, home)?;
+    connecto_store::opencode_unsupported(&version)
+}
+
 pub fn runnable_entry(
     data_root: &Path,
     home: &Path,
@@ -586,8 +640,24 @@ fn ready_agents(plan: &Plan, layout: &Layout) -> Vec<ReadyAgent> {
         .into_iter()
         .map(|tool| {
             let name = nice_name(tool).to_owned();
-            if let Some(entry) = stored_entry(&store, tool) {
+            let entry = stored_entry(&store, tool);
+            if let Some(why) = entry
+                .as_deref()
+                .and_then(|entry| live_unsupported(tool, entry, &plan.home))
+            {
+                return ReadyAgent {
+                    name,
+                    status: why,
+                    ready: false,
+                    signed_in: None,
+                };
+            }
+            if let Some(entry) = entry {
                 let signed_in = match system_signin(layout, tool, &entry) {
+                    // Antigravity's and OpenCode's answers only say that it
+                    // runs: the sign-in is not asked (the adapters'
+                    // `parse_status`).
+                    _ if matches!(tool, Tool::Antigravity | Tool::OpenCode) => None,
                     connecto_core::AuthState::LoggedIn { .. } => Some(true),
                     connecto_core::AuthState::LoggedOut => Some(false),
                     connecto_core::AuthState::Unknown => None,
@@ -652,14 +722,20 @@ pub fn run<S: Signature>(
     };
     let store = Store::new(&plan.data_root);
     let first = plan.mode == Mode::FirstRun;
-    // Which agents are wanted; a launch that is not the first wants both.
-    let mut selected = [true, true];
+    // Which agents are wanted; a launch that is not the first wants the
+    // copied ones, and Pi, Antigravity and OpenCode when they are set up
+    // already.
+    let mut selected = [true; AGENTS.len()];
     if !first {
         // Not again what the user left out, unless it is set up already (and
         // so may need repairing).
         let skipped = skipped_tools(&plan.data_root);
         for (tool, on) in AGENTS.into_iter().zip(&mut selected) {
-            *on = !skipped.contains(&tool) || store.newest(tool).is_ok();
+            *on = if COPIED_AGENTS.contains(&tool) {
+                !skipped.contains(&tool) || store.newest(tool).is_ok()
+            } else {
+                store.newest(tool).is_ok()
+            };
         }
     }
     // Windows: PowerShell 7 for the terminals, offered at the first launch when
@@ -679,27 +755,35 @@ pub fn run<S: Signature>(
             });
             return;
         }
-        // Which agents: both chosen to begin with; a tap changes one.
-        let cards = |chosen: &[bool; 2], pwsh: bool| -> Vec<AgentChoice> {
+        // Which agents: Claude Code and Codex chosen to begin with; a tap
+        // changes one. What is on this computer is looked up once.
+        let found: Vec<Option<PathBuf>> = AGENTS
+            .into_iter()
+            .map(|tool| Store::find_installed(tool, &plan.home))
+            .collect();
+        let pi_note = if found[2].is_none() {
+            first_launch_note(Tool::Pi, &installer.node_for_pi(&plan.home))
+        } else {
+            None
+        };
+        let cards = |chosen: &[bool; AGENTS.len()], pwsh: bool| -> Vec<AgentChoice> {
             let mut cards: Vec<AgentChoice> = AGENTS
                 .into_iter()
                 .zip(chosen)
-                .map(|(tool, selected)| {
-                    let found_at = Store::find_installed(tool, &plan.home);
+                .zip(&found)
+                .map(|((tool, selected), found_at)| {
                     let found = found_at.is_some();
                     AgentChoice {
                         key: tool.name().to_owned(),
                         name: nice_name(tool).to_owned(),
-                        about: match tool {
-                            Tool::Claude => "Anthropic's coding agent. A good all-rounder.",
-                            _ => "OpenAI's coding agent. A good second opinion.",
-                        }
-                        .to_owned(),
+                        about: about(tool).to_owned(),
                         selected: *selected,
                         found,
-                        found_at,
+                        found_at: found_at.clone(),
                         install_note: if found {
                             None
+                        } else if tool == Tool::Pi {
+                            pi_note.clone()
                         } else {
                             crate::agent_install::announcement(tool)
                         },
@@ -711,7 +795,7 @@ pub fn run<S: Signature>(
             }
             cards
         };
-        let mut chosen = [true, true];
+        let mut chosen = FIRST_CHOICE;
         runner.update(|view| {
             view.screen = Screen::Choose;
             view.choices = cards(&chosen, want_pwsh);
@@ -811,9 +895,13 @@ pub fn run<S: Signature>(
     for (index, tool) in wanted.iter().copied().enumerate() {
         let at = index;
         loop {
+            // A record of a 1.x OpenCode that has since upgraded itself to 2
+            // is not "set up": it goes on below, where recording it again
+            // refuses it with what to do.
             if let Ok(version) = store.newest(tool)
-                && store.verify(tool, &version).is_ok()
+                && let Ok(installed) = store.verify(tool, &version)
                 && !store.repair_wanted()
+                && live_unsupported(tool, &installed.entry, &plan.home).is_none()
             {
                 set_step(runner, at, StepState::Done, Some("Already set up"));
                 forget_skipped(&plan.data_root, tool);
@@ -868,7 +956,16 @@ pub fn run<S: Signature>(
                     );
                     progress(runner, at, 0.1);
                     let say = |line: &str| set_step(runner, at, StepState::Working, Some(line));
-                    match installer.install(tool, &plan.home, &say) {
+                    // Pi's installer needs Node.js: chosen on the card, which
+                    // said so, it is installed first, as Settings does.
+                    let node = if tool == Tool::Pi
+                        && installer.node_for_pi(&plan.home) != crate::node_setup::NodeCheck::Ready
+                    {
+                        installer.install_node(&plan.home, &say)
+                    } else {
+                        Ok(())
+                    };
+                    match node.and_then(|()| installer.install(tool, &plan.home, &say)) {
                         Ok(done) => {
                             installed_now.push((tool, done.version));
                             // Around again: it is found now, and gets set up.
@@ -949,13 +1046,16 @@ pub fn run<S: Signature>(
                     any_ready = true;
                     break;
                 }
-                // Another start finished it first: that copy is as good.
-                Err(_)
-                    if store
-                        .newest(tool)
-                        .ok()
-                        .and_then(|v| store.verify(tool, &v).ok())
-                        .is_some() =>
+                // Another start finished it first: that copy is as good. Not
+                // for a version Connecto cannot use: the record is of the one
+                // that was there before (an OpenCode that upgraded itself).
+                Err(ref err)
+                    if !matches!(err, StoreError::Unsupported(_))
+                        && store
+                            .newest(tool)
+                            .ok()
+                            .and_then(|v| store.verify(tool, &v).ok())
+                            .is_some() =>
                 {
                     set_step(runner, at, StepState::Done, None);
                     forget_skipped(&plan.data_root, tool);
@@ -999,10 +1099,9 @@ pub fn run<S: Signature>(
     }
     if !wanted.is_empty()
         && !any_ready
-        && store.newest(Tool::Claude).is_err()
-        && store.newest(Tool::Codex).is_err()
+        && AGENTS.into_iter().all(|tool| store.newest(tool).is_err())
     {
-        // Neither agent is here: say so, and what to do.
+        // No agent is here: say so, and what to do.
         loop {
             runner.update(|view| {
                 view.screen = Screen::Problem;
@@ -1132,6 +1231,45 @@ pub fn run<S: Signature>(
     runner.finish(outcome);
 }
 
+/// What an agent's card says it is.
+const fn about(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Claude => "Anthropic's coding agent. A good all-rounder.",
+        Tool::Codex => "OpenAI's coding agent. A good second opinion.",
+        Tool::Pi => {
+            "An open coding agent on the models you pick: OpenRouter, Together AI or LM Studio."
+        }
+        Tool::Antigravity => "Google's coding agent, on Gemini. Signs in with your Google account.",
+        Tool::OpenCode => {
+            "An open coding agent on any provider's models. Signs in with /connect, and has free models too."
+        }
+        Tool::Shell => "Your own shell.",
+    }
+}
+
+/// What the card of an agent that is not here says will happen when it is
+/// chosen. For Pi, also what happens about Node.js, by what `node` is here:
+/// the first launch installs it when Pi is chosen, as Settings does when
+/// asked.
+fn first_launch_note(tool: Tool, node: &crate::node_setup::NodeCheck) -> Option<String> {
+    let announced = crate::agent_install::announcement(tool)?;
+    if tool != Tool::Pi {
+        return Some(announced);
+    }
+    let source = crate::agent_install::source_of(tool)?;
+    let (major, minor, _) = crate::node_setup::NEEDED;
+    let base = format!(
+        "Not on {THIS_COMPUTER} yet. Connecto will install {} for you from {}'s official installer at {}. It goes in your own folder and needs no password.",
+        source.name, source.vendor, source.host
+    );
+    Some(match node {
+        crate::node_setup::NodeCheck::Ready => base,
+        _ => format!(
+            "{base} Pi runs on Node.js {major}.{minor} or newer, which {THIS_COMPUTER} does not have: Connecto installs the official Node.js {major} from nodejs.org first, in your own folder. Any Node.js you already have stays as it is. You then set up Pi's model providers in Settings > Agents."
+        ),
+    })
+}
+
 /// The choice screen's PowerShell 7 card (Windows, when it is missing).
 fn powershell_card(selected: bool) -> AgentChoice {
     AgentChoice {
@@ -1171,7 +1309,7 @@ pub fn provision_all<S: Signature>(
 ) -> Result<(), String> {
     let store = Store::new(data_root);
     let mut failed = false;
-    for tool in AGENTS {
+    for tool in COPIED_AGENTS {
         if Store::find_installed(tool, home).is_none() {
             report(format!("{}: not installed", tool.name()));
             failed = true;
@@ -1706,7 +1844,7 @@ mod tests {
         let view = wait_for_screen(&runner, Screen::Problem);
         let problem = view.problem.clone().unwrap();
         assert!(
-            problem.what.contains("neither is on this Mac"),
+            problem.what.contains("none of them is on this Mac"),
             "{problem:?}"
         );
         assert!(
@@ -1791,13 +1929,12 @@ mod tests {
         wait_for_screen(&runner, Screen::Welcome);
         runner.start();
         let view = wait_for_screen(&runner, Screen::Choose);
-        // Both are offered, chosen to begin with, described for a newcomer.
-        assert_eq!(view.choices.len(), 2);
-        assert!(
-            view.choices
-                .iter()
-                .all(|c| c.selected && !c.about.is_empty())
-        );
+        // All five are offered, described for a newcomer; Claude Code and
+        // Codex are chosen to begin with.
+        assert_eq!(view.choices.len(), 5);
+        assert!(view.choices.iter().all(|c| !c.about.is_empty()));
+        let chosen: Vec<bool> = view.choices.iter().map(|c| c.selected).collect();
+        assert_eq!(chosen, [true, true, false, false, false]);
         assert!(view.choices[0].found && !view.choices[1].found);
         // Tap Claude off: nothing is chosen but Codex, which is not on this Mac.
         runner.toggle_agent("claude");
@@ -1944,9 +2081,15 @@ mod tests {
                     details: "curl exit Some(6)".to_owned(),
                 });
             }
-            let bin = home.join(".local/bin");
+            // Where each installer puts its program: OpenCode's in its own
+            // folder, the others in `~/.local/bin`.
+            let bin = if tool == Tool::OpenCode {
+                home.join(".opencode/bin")
+            } else {
+                home.join(".local/bin")
+            };
             std::fs::create_dir_all(&bin).unwrap();
-            let path = bin.join(tool.name());
+            let path = bin.join(tool.program());
             let program = if tool == Tool::Codex {
                 // Codex's own installer: a release folder under ~/.codex and a link in ~/.local/bin.
                 let release = home.join(".codex/packages/standalone/current");
@@ -1958,13 +2101,19 @@ mod tests {
             } else {
                 path.clone()
             };
-            crate::test_support::link_fake("#!/bin/sh\necho '7.7.7 (Fake)'\n", &program);
+            // OpenCode's installer gives the 1.x line, the one Connecto takes.
+            let version = if tool == Tool::OpenCode {
+                "1.7.7 (Fake)"
+            } else {
+                "7.7.7 (Fake)"
+            };
+            crate::test_support::link_fake(&format!("#!/bin/sh\necho '{version}'\n"), &program);
             if program != path {
                 std::os::unix::fs::symlink(&program, &path).unwrap();
             }
             Ok(crate::agent_install::Installed {
                 path,
-                version: "7.7.7 (Fake)".to_owned(),
+                version: version.to_owned(),
             })
         }
     }
@@ -2023,6 +2172,317 @@ mod tests {
         // Found where the isolated copy is made from, so Isolated and System both have it.
         assert!(Store::find_installed(Tool::Codex, &dir.home()).is_some());
         assert!(Store::new(&dir.data()).newest(Tool::Codex).is_ok());
+        runner.skip();
+        worker.join().unwrap();
+    }
+
+    // The fake agents are shell scripts: Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_launch_offers_all_five_agents_by_their_names_and_installers() {
+        let dir = Dir::new("five");
+        let plan = plan_for(&dir, Mode::FirstRun);
+        fake_claude(&dir.home());
+        let runner = Runner::new();
+        let worker = drive_with(&plan, &runner, AnySignature, Fixing::new(0));
+        wait_for_screen(&runner, Screen::Welcome);
+        runner.start();
+        let view = wait_for_screen(&runner, Screen::Choose);
+        let names: Vec<&str> = view.choices.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Claude Code", "Codex", "Pi", "Antigravity CLI", "OpenCode"]
+        );
+        let keys: Vec<&str> = view.choices.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["claude", "codex", "pi", "antigravity", "opencode"]);
+        let note = |key: &str| {
+            view.choices
+                .iter()
+                .find(|c| c.key == key)
+                .and_then(|c| c.install_note.clone())
+                .unwrap()
+        };
+        assert!(note("pi").contains("pi.dev"), "{}", note("pi"));
+        assert!(
+            note("antigravity").contains("antigravity.google")
+                && note("antigravity").contains("Google"),
+            "{}",
+            note("antigravity")
+        );
+        assert!(
+            note("opencode").contains("opencode.ai"),
+            "{}",
+            note("opencode")
+        );
+        runner.closed();
+        worker.join().unwrap();
+    }
+
+    // The fake agents are shell scripts: Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn choosing_antigravity_installs_it_and_runs_it_where_it_is() {
+        let dir = Dir::new("agy");
+        let plan = plan_for(&dir, Mode::FirstRun);
+        fake_claude(&dir.home());
+        let installer = Fixing::new(0);
+        let runner = Runner::new();
+        let worker = drive_with(&plan, &runner, AnySignature, installer.clone());
+        wait_for_screen(&runner, Screen::Welcome);
+        runner.start();
+        wait_for_screen(&runner, Screen::Choose);
+        runner.toggle_agent("codex");
+        runner.toggle_agent("antigravity");
+        wait_for_choices(&runner, |c| c.key != "antigravity" || c.selected);
+        runner.confirm_choice();
+        let view = wait_for_screen(&runner, Screen::Ready);
+        assert_eq!(installer.calls(), [Tool::Antigravity]);
+        let step = view
+            .steps
+            .iter()
+            .find(|s| s.label == "Getting Antigravity CLI ready")
+            .unwrap();
+        assert_eq!(step.state, StepState::Done);
+        let entry = Store::new(&dir.data())
+            .verify(
+                Tool::Antigravity,
+                &Store::new(&dir.data()).newest(Tool::Antigravity).unwrap(),
+            )
+            .unwrap()
+            .entry;
+        assert_eq!(entry, dir.home().join(".local/bin/agy"), "not copied");
+        let agy = view
+            .agents
+            .iter()
+            .find(|a| a.name == "Antigravity CLI")
+            .unwrap();
+        // Ready, and its sign-in is not claimed.
+        assert!(agy.ready && agy.signed_in.is_none(), "{agy:?}");
+        runner.skip();
+        worker.join().unwrap();
+        assert_eq!(
+            chosen_agents(&dir.data()),
+            [Tool::Claude, Tool::Antigravity]
+        );
+    }
+
+    /// OpenCode's installer puts it in `~/.opencode/bin`, a folder no shell
+    /// search path has (the installer is told to leave the startup file
+    /// alone): Connecto finds it there, and runs it where it is.
+    #[cfg(unix)]
+    #[test]
+    fn choosing_opencode_installs_it_in_its_own_folder_and_runs_it_where_it_is() {
+        let dir = Dir::new("opencode");
+        let plan = plan_for(&dir, Mode::FirstRun);
+        fake_claude(&dir.home());
+        let installer = Fixing::new(0);
+        let runner = Runner::new();
+        let worker = drive_with(&plan, &runner, AnySignature, installer.clone());
+        wait_for_screen(&runner, Screen::Welcome);
+        runner.start();
+        wait_for_screen(&runner, Screen::Choose);
+        runner.toggle_agent("codex");
+        runner.toggle_agent("opencode");
+        wait_for_choices(&runner, |c| c.key != "opencode" || c.selected);
+        runner.confirm_choice();
+        let view = wait_for_screen(&runner, Screen::Ready);
+        assert_eq!(installer.calls(), [Tool::OpenCode]);
+        let step = view
+            .steps
+            .iter()
+            .find(|s| s.label == "Getting OpenCode ready")
+            .unwrap();
+        assert_eq!(step.state, StepState::Done, "{step:?}");
+        let store = Store::new(&dir.data());
+        let entry = store
+            .verify(Tool::OpenCode, &store.newest(Tool::OpenCode).unwrap())
+            .unwrap()
+            .entry;
+        assert_eq!(
+            entry,
+            dir.home().join(".opencode/bin/opencode"),
+            "not copied"
+        );
+        let opencode = view.agents.iter().find(|a| a.name == "OpenCode").unwrap();
+        // Ready, and its sign-in is not claimed: `--version` says nothing of it.
+        assert!(
+            opencode.ready && opencode.signed_in.is_none(),
+            "{opencode:?}"
+        );
+        runner.skip();
+        worker.join().unwrap();
+        assert_eq!(chosen_agents(&dir.data()), [Tool::Claude, Tool::OpenCode]);
+    }
+
+    /// An OpenCode 2 already on this Mac is not taken: the setup says it is
+    /// not supported yet and how to install the 1.x line, and nothing is
+    /// installed over it.
+    #[cfg(unix)]
+    #[test]
+    fn an_opencode_2_on_this_mac_is_refused_with_what_to_do() {
+        let dir = Dir::new("opencode2");
+        let plan = plan_for(&dir, Mode::FirstRun);
+        fake_claude(&dir.home());
+        crate::test_support::link_fake(
+            "#!/bin/sh\necho '2.3.2'\n",
+            &dir.home().join(".opencode/bin/opencode"),
+        );
+        let installer = Fixing::new(0);
+        let runner = Runner::new();
+        let worker = drive_with(&plan, &runner, AnySignature, installer.clone());
+        wait_for_screen(&runner, Screen::Welcome);
+        runner.start();
+        wait_for_screen(&runner, Screen::Choose);
+        runner.toggle_agent("codex");
+        runner.toggle_agent("opencode");
+        wait_for_choices(&runner, |c| c.key != "opencode" || c.selected);
+        runner.confirm_choice();
+        let view = wait_for_screen(&runner, Screen::Problem);
+        let problem = view.problem.clone().unwrap();
+        assert!(
+            problem.what.contains("OpenCode 2.3.2 is not supported yet")
+                && problem.what.contains("--version 1."),
+            "{problem:?}"
+        );
+        assert!(installer.calls().is_empty(), "installed over it");
+        runner.closed();
+        worker.join().unwrap();
+    }
+
+    /// Recorded as 1.x, upgraded in place to 2 since: the setup does not call
+    /// it "Already set up" from the record, but says it is not supported.
+    #[cfg(unix)]
+    #[test]
+    fn an_opencode_recorded_as_1_and_upgraded_to_2_is_not_already_set_up() {
+        recorded_1_then_2_is_refused("opencode-upgraded", "#!/bin/sh\necho '2.3.2'\n");
+    }
+
+    /// The same when the 2 prints its version on stderr alone.
+    #[cfg(unix)]
+    #[test]
+    fn an_opencode_upgraded_to_a_2_that_prints_on_stderr_is_not_already_set_up() {
+        recorded_1_then_2_is_refused("opencode-upgraded-err", "#!/bin/sh\necho '2.3.2' >&2\n");
+    }
+
+    #[cfg(unix)]
+    fn recorded_1_then_2_is_refused(name: &str, two: &str) {
+        let dir = Dir::new(name);
+        let plan = plan_for(&dir, Mode::FirstRun);
+        fake_claude(&dir.home());
+        let entry = dir.home().join(".opencode/bin/opencode");
+        crate::test_support::link_fake("#!/bin/sh\necho '1.19.6'\n", &entry);
+        Store::new(&dir.data())
+            .provision(Tool::OpenCode, &entry, &AnySignature)
+            .unwrap();
+        crate::test_support::link_fake(two, &entry);
+        let installer = Fixing::new(0);
+        let runner = Runner::new();
+        let worker = drive_with(&plan, &runner, AnySignature, installer.clone());
+        wait_for_screen(&runner, Screen::Welcome);
+        runner.start();
+        wait_for_screen(&runner, Screen::Choose);
+        runner.toggle_agent("codex");
+        runner.toggle_agent("opencode");
+        wait_for_choices(&runner, |c| c.key != "opencode" || c.selected);
+        runner.confirm_choice();
+        let view = wait_for_screen(&runner, Screen::Problem);
+        let problem = view.problem.clone().unwrap();
+        assert!(
+            problem.what.contains("OpenCode 2.3.2 is not supported yet"),
+            "{problem:?}"
+        );
+        assert!(
+            !view.steps.iter().any(
+                |s| s.note.as_deref() == Some("Already set up") && s.label.contains("OpenCode")
+            ),
+            "{view:?}"
+        );
+        runner.closed();
+        worker.join().unwrap();
+    }
+
+    /// [`Fixing`], on a computer without Node.js: installing it is recorded.
+    #[cfg(unix)]
+    struct NoNode {
+        inner: Arc<Fixing>,
+        node_installed: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(unix)]
+    impl crate::agent_install::AgentInstaller for NoNode {
+        fn install(
+            &self,
+            tool: Tool,
+            home: &Path,
+            say: &dyn Fn(&str),
+        ) -> Result<crate::agent_install::Installed, crate::agent_install::Failure> {
+            assert!(
+                tool != Tool::Pi
+                    || self
+                        .node_installed
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                "Pi's installer ran before Node.js was there"
+            );
+            self.inner.install(tool, home, say)
+        }
+
+        fn node_for_pi(&self, _home: &Path) -> crate::node_setup::NodeCheck {
+            if self
+                .node_installed
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                crate::node_setup::NodeCheck::Ready
+            } else {
+                crate::node_setup::NodeCheck::Missing
+            }
+        }
+
+        fn install_node(
+            &self,
+            _home: &Path,
+            say: &dyn Fn(&str),
+        ) -> Result<(), crate::agent_install::Failure> {
+            say("Installing Node.js…");
+            self.node_installed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    // The fake agents are shell scripts: Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn choosing_pi_without_node_says_so_and_installs_node_first() {
+        let dir = Dir::new("pi");
+        let plan = plan_for(&dir, Mode::FirstRun);
+        fake_claude(&dir.home());
+        let installer = Arc::new(NoNode {
+            inner: Fixing::new(0),
+            node_installed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let runner = Runner::new();
+        let worker = drive_with(&plan, &runner, AnySignature, installer.clone());
+        wait_for_screen(&runner, Screen::Welcome);
+        runner.start();
+        let view = wait_for_screen(&runner, Screen::Choose);
+        let pi = view.choices.iter().find(|c| c.key == "pi").unwrap();
+        let note = pi.install_note.as_deref().unwrap();
+        assert!(
+            note.contains("nodejs.org") && note.contains("Node.js 22"),
+            "{note}"
+        );
+        runner.toggle_agent("codex");
+        runner.toggle_agent("pi");
+        wait_for_choices(&runner, |c| c.key != "pi" || c.selected);
+        runner.confirm_choice();
+        let view = wait_for_screen(&runner, Screen::Ready);
+        assert!(
+            installer
+                .node_installed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(installer.inner.calls(), [Tool::Pi]);
+        assert!(view.agents.iter().any(|a| a.name == "Pi" && a.ready));
         runner.skip();
         worker.join().unwrap();
     }
@@ -2214,7 +2674,6 @@ mod tests {
     }
 
     /// Wait until every choice satisfies `done`.
-    #[cfg(windows)]
     fn wait_for_choices(runner: &Runner, done: impl Fn(&AgentChoice) -> bool) {
         for _ in 0..200 {
             if runner.view().choices.iter().all(&done) {
@@ -2256,9 +2715,14 @@ mod tests {
             .iter()
             .filter(|c| c.key != POWERSHELL_KEY)
             .collect();
-        assert_eq!(agents.len(), 2);
+        assert_eq!(agents.len(), 4);
         for choice in &agents {
-            assert!(choice.selected, "{choice:?}");
+            // Claude Code and Codex are chosen to begin with.
+            assert_eq!(
+                choice.selected,
+                matches!(choice.key.as_str(), "claude" | "codex"),
+                "{choice:?}"
+            );
             assert!(choice.about.contains("coding agent"), "{choice:?}");
             // Not in this test's home: the official installer is announced.
             assert!(!choice.found, "{choice:?}");

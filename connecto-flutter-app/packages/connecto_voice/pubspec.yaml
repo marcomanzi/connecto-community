@@ -1,0 +1,19 @@
+name: connecto_voice
+description: On-device speech recognition, speech and reply condensing for the call mode of Connecto Chat.
+publish_to: none
+version: 0.1.0
+environment:
+  sdk: ^3.13.0
+  flutter: ">=3.47.0"
+dependencies:
+  flutter:
+    sdk: flutter
+flutter:
+  plugin:
+    platforms:
+      ios:
+        pluginClass: VoiceCallPlugin
+        sharedDarwinSource: true
+      macos:
+        pluginClass: VoiceCallPlugin
+        sharedDarwinSource: true

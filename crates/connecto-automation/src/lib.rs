@@ -136,7 +136,13 @@ impl Drop for Automations {
 
 fn agent_of(tool: ToolKind) -> Agent {
     match tool {
-        ToolKind::Claude | ToolKind::Shell => Agent::Claude,
+        // Automations answer the screens of Claude and Codex only: there is
+        // none for Pi, Antigravity or OpenCode, and a shell is never an agent.
+        ToolKind::Claude
+        | ToolKind::Pi
+        | ToolKind::Antigravity
+        | ToolKind::OpenCode
+        | ToolKind::Shell => Agent::Claude,
         ToolKind::Codex => Agent::Codex,
     }
 }

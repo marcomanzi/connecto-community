@@ -84,13 +84,40 @@ pub fn is_launcher(program: &Path) -> bool {
 /// `%SystemRoot%`).
 #[must_use]
 pub fn run_path(program: &Path, home: &Path) -> OsString {
-    let mut dirs = if is_launcher(program) {
-        ambient_path(home)
+    if is_launcher(program) {
+        return launcher_path(home);
+    }
+    std::env::join_paths(os::system_dirs()).unwrap_or_else(|_| OsString::from(os::SYSTEM_PATH))
+}
+
+/// The `PATH` a launcher script is run with ([`run_path`]): for the user's
+/// real home, the folders installers use (Homebrew, the node version
+/// managers) after the shell's, so the interpreter is found even when the
+/// login shell could not be asked; then the system folders.
+#[must_use]
+pub fn launcher_path(home: &Path) -> OsString {
+    let real_home = crate::platform::home_dir().is_some_and(|real| real == home);
+    let mut dirs = if real_home {
+        search_dirs(home, &ambient_path(home))
     } else {
         Vec::new()
     };
-    dirs.extend(os::system_dirs());
+    for dir in os::system_dirs() {
+        push_absolute_unique(&mut dirs, dir);
+    }
     std::env::join_paths(dirs).unwrap_or_else(|_| OsString::from(os::SYSTEM_PATH))
+}
+
+/// The `PATH` an agent terminal works with, so the tools the user installed
+/// (Homebrew, `~/.local/bin`, npm globals ...) are found by its shell commands
+/// even when Connecto was started from Finder, whose `PATH` is only the
+/// system folders: [`launcher_path`], for the user's real home. `None` for any
+/// other `home` (a test, a trial build), where the process's `PATH` stands.
+#[must_use]
+pub fn user_path(home: &Path) -> Option<OsString> {
+    crate::platform::home_dir()
+        .is_some_and(|real| real == home)
+        .then(|| launcher_path(home))
 }
 
 /// The subfolders of `dir`, newest version first.
@@ -163,6 +190,20 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
+
+    /// A terminal's `PATH` is the user's own only for the real home: a test's
+    /// home leaves the process's `PATH` as it is.
+    #[test]
+    fn the_users_path_is_given_only_for_the_real_home() {
+        assert_eq!(user_path(&tree("user-path")), None);
+        if let Some(home) = crate::platform::home_dir() {
+            let path = user_path(&home).unwrap();
+            let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+            for dir in os::system_dirs() {
+                assert!(dirs.contains(&dir), "{dir:?} in {path:?}");
+            }
+        }
+    }
 
     fn tree(name: &str) -> PathBuf {
         let root =

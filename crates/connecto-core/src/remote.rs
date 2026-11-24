@@ -68,6 +68,11 @@ pub trait RemoteGuard: Send + Sync {
     ) -> Result<(), GuardDenied>;
     /// A peer's stream ended; write out anything held back.
     fn detach(&self, peer: &RemotePeer, terminal: &str, attempt: u64);
+    /// Whether Pause is on now, for work already allowed that goes on (a
+    /// file being sent) and must stop when it is.
+    fn paused(&self) -> bool {
+        false
+    }
 }
 
 /// How this Connecto stands with one saved host.
@@ -338,7 +343,117 @@ pub trait RemoteControl: Send + Sync {
     /// The host's terminals, as a registry the window can draw like a
     /// project's. `None` for an unknown host.
     fn terminals(&self, name: &str) -> Option<Arc<dyn TerminalsControl>>;
+
+    /// The projects a connected host lists, in its order. Empty for an unknown
+    /// host, and for a host that has listed no terminals yet.
+    fn projects(&self, name: &str) -> Vec<RemoteProject> {
+        let _ = name;
+        Vec::new()
+    }
+
+    /// One of the host's projects, drawn like a local project: its terminals,
+    /// with nesting as the host gave it, and an `add` that goes to that project.
+    /// `None` for an unknown host.
+    fn project_terminals(&self, name: &str, project: &str) -> Option<Arc<dyn TerminalsControl>> {
+        let _ = (name, project);
+        None
+    }
+
+    /// The files connected hosts offer to download (an agent there ran
+    /// `connecto send-file`), oldest first. Never blocks.
+    fn file_offers(&self) -> Vec<RemoteOffer> {
+        Vec::new()
+    }
+
+    /// The project groups of host `name`, as its sidebar has them: `None`
+    /// for an unknown host, one not connected, or one from before groups
+    /// were shared (its projects are listed flat). Never blocks.
+    fn project_groups(&self, name: &str) -> Option<RemoteGroups> {
+        let _ = name;
+        None
+    }
+
+    /// The requests for a secret that terminals of connected hosts' shared
+    /// projects wait on (`connecto secret request` there), oldest first.
+    /// Never blocks.
+    fn secret_asks(&self) -> Vec<RemoteSecretAsk> {
+        Vec::new()
+    }
+
+    /// The secrets of project `project` of host `name`, kept on that
+    /// machine, shown under `shown_as` (the id the window knows the project
+    /// by). `None` for an unknown host or a project it does not list.
+    fn project_vault(
+        &self,
+        name: &str,
+        project: &str,
+        shown_as: &str,
+    ) -> Option<Arc<dyn crate::VaultControl>> {
+        let _ = (name, project, shown_as);
+        None
+    }
+
+    /// The file of offer `id` of host `name`: its name and bytes. It waits
+    /// for the whole file: never call it from the UI thread.
+    ///
+    /// # Errors
+    /// Why not, as the window shows it.
+    fn download_offer(&self, name: &str, id: u64) -> Result<(String, Vec<u8>), String> {
+        let _ = (name, id);
+        Err("that file is no longer offered".to_owned())
+    }
 }
+
+/// A file a connected host offers to download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteOffer {
+    /// The host's display name.
+    pub host: String,
+    pub id: u64,
+    /// The project it was offered in, as the window names it.
+    pub project: String,
+    /// The terminal that offered it.
+    pub terminal: String,
+    /// Its file name, cleaned for display and for saving.
+    pub name: String,
+    pub bytes: u64,
+}
+
+/// A host's project groups, as its sidebar shows them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteGroups {
+    /// In the order the host shows them; ids are the host's.
+    pub groups: Vec<crate::ProjectGroup>,
+    /// The group of each listed project that is in one: (project, group),
+    /// both the host's ids. A project not here is ungrouped.
+    pub of: Vec<(String, String)>,
+}
+
+/// A terminal of a connected host's project asks for a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSecretAsk {
+    /// The host's display name.
+    pub host: String,
+    /// The project's id on the host, and its name, as the host lists it.
+    pub project: String,
+    pub project_name: String,
+    /// The request, its project the host's id. Its words are the terminal's
+    /// (untrusted).
+    pub ask: crate::SecretAsk,
+}
+
+/// A project on a connected host. Its id is the host's, and only meaningful to
+/// that host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProject {
+    pub id: String,
+    /// Sanitised for display: no control characters or line separators, and at
+    /// most [`MAX_REMOTE_NAME_CHARS`] characters.
+    pub name: String,
+}
+
+/// The most characters a remote name shows.
+pub const MAX_REMOTE_NAME_CHARS: usize = 120;
 
 /// A build without remote sessions.
 pub struct NoRemote;

@@ -4,9 +4,10 @@
 //!   feed naming the newest release and, per platform, its archive with size
 //!   and SHA-256. The app holds the public key (`update-public-key.txt`, built
 //!   in); the release tool holds the private one.
-//! - [`service`]: checks at launch and daily (or when asked), downloads and
-//!   checks a newer release in the background, then waits for the person:
-//!   "Update and restart" or "Later".
+//! - [`service`]: checks at launch and every minute (or when asked), downloads
+//!   and checks a newer release in the background, then installs it by itself
+//!   as soon as nothing blocks a restart (ADR 0030), or, with that off, waits
+//!   for the person: "Update and restart" or "Later".
 //! - [`install`]: download, SHA-256, unpack; on macOS the new bundle must be
 //!   intact, signed by the same Developer ID team and accepted by Gatekeeper
 //!   (notarized). On Windows the install folder is fixed,
@@ -26,7 +27,7 @@ pub mod version;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use service::{Config, Updater};
+pub use service::{AutoInstall, Config, Updater};
 pub use version::Version;
 
 /// Where the feed is published.
@@ -46,12 +47,21 @@ pub fn built_in_key() -> Option<ed25519_dalek::VerifyingKey> {
     feed::public_key_from_text(text).ok()
 }
 
+/// What app start found about an update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppStart {
+    /// A notice for the person, if there is one.
+    pub notice: Option<String>,
+    /// What this launch is: the new version started by the hand-over, say.
+    pub launch: state::Launch,
+}
+
 /// What to do at app start, before the window: settle an update that may be
 /// under way. A new version that has just been installed tells the hand-over
 /// it started once it has been up a while (on a thread of its own). Returns a
-/// notice for the person, if there is one.
+/// notice for the person, if there is one, and what the launch is.
 #[must_use]
-pub fn start_of_app(data_dir: &Path, current: Version) -> Option<String> {
+pub fn start_of_app(data_dir: &Path, current: Version) -> AppStart {
     let launch = state::on_launch(state::Pending::load(data_dir), current);
     let notice = state::settle_launch(data_dir, launch);
     if let state::Launch::Updated { to, .. } = launch {
@@ -63,7 +73,7 @@ pub fn start_of_app(data_dir: &Path, current: Version) -> Option<String> {
                 state::mark_healthy(&dir, &to);
             });
     }
-    notice
+    AppStart { notice, launch }
 }
 
 /// Start the updater for the app.

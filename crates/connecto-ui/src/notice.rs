@@ -11,7 +11,7 @@ use crate::theme;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Notice {
     pub(crate) title: &'static str,
-    pub(crate) message: &'static str,
+    pub(crate) message: std::borrow::Cow<'static, str>,
 }
 
 impl Notice {
@@ -19,7 +19,25 @@ impl Notice {
     pub(crate) fn remote_project() -> Self {
         Self {
             title: "NEW PROJECT",
-            message: "Project creation on remote machines is still in development",
+            message: "Project creation on remote machines is still in development".into(),
+        }
+    }
+
+    /// Paired machines changed secrets here: what each did, never a value.
+    pub(crate) fn remote_secret_changes(lines: &[String]) -> Self {
+        Self {
+            title: "SECRETS CHANGED FROM A PAIRED MACHINE",
+            // Every one, however many: the notice scrolls.
+            message: lines.join("\n").into(),
+        }
+    }
+
+    /// A command about this machine's projects (history, settings, names,
+    /// closing), asked while a remote host is shown.
+    pub(crate) fn remote_local_only() -> Self {
+        Self {
+            title: "REMOTE PROJECT",
+            message: "This works on this machine's projects. A remote project is kept on its own machine.".into(),
         }
     }
 }
@@ -40,13 +58,20 @@ pub(crate) fn dialog(ctx: &Context, state: &Notice, esc: bool, out: &mut Out<Not
 
 fn body(ui: &mut Ui, state: &Notice, out: &mut Out<NoticeAction>) {
     out.say(ui, heading(state.title));
-    out.say(
-        ui,
-        RichText::new(state.message)
-            .size(15.0)
-            .strong()
-            .color(theme::TEXT),
-    );
+    // A long message (many changes from a paired machine) scrolls, so
+    // every line stays readable and the OK button stays in reach.
+    egui::ScrollArea::vertical()
+        .max_height(ui.ctx().content_rect().height() * 0.6)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            out.say(
+                ui,
+                RichText::new(state.message.as_ref())
+                    .size(15.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+        });
     ui.add_space(12.0);
     if out.button(ui, "notice-ok", "OK", true) {
         out.actions.push(NoticeAction::Ok);

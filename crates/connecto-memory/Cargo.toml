@@ -1,0 +1,29 @@
+[package]
+name = "connecto-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+connecto-core.workspace = true
+connecto-redact.workspace = true
+crossbeam-channel.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Link-proof deletion of a project's memory files (`openat`/`unlinkat`).
+nix = { workspace = true, features = ["fs", "dir"] }
+
+[dev-dependencies]
+# Temporary folders that are removed by the library, never by a computed
+# delete in a test. Already in Cargo.lock through other crates.
+tempfile = "3"

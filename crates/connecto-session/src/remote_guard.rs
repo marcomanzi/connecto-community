@@ -101,6 +101,10 @@ impl RemoteGuard for RemoteGate {
         self.enabled.load(Ordering::SeqCst)
     }
 
+    fn paused(&self) -> bool {
+        self.gate.is_paused()
+    }
+
     fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::SeqCst);
     }
@@ -128,6 +132,10 @@ impl RemoteGuard for RemoteGate {
         attempt: u64,
         bytes: &[u8],
     ) -> Result<(), GuardDenied> {
+        // Project memory: every pane write from this (the peer's reader)
+        // thread is the peer's, foreign to the composer. Marked before any
+        // refusal, so the mark never depends on the outcome.
+        crate::input_ledger::mark_remote_input();
         if self.gate.is_paused() {
             // Recorded as a denial, then refused.
             let request = Self::request(
@@ -244,6 +252,83 @@ mod tests {
         assert!(!guard.enabled());
         guard.set_enabled(true);
         assert!(guard.enabled());
+    }
+
+    /// Project memory: once a peer's input passed the guard on a thread,
+    /// every pane write from that thread is remote; other threads (the
+    /// window's) are untouched.
+    #[test]
+    fn the_guard_marks_the_peer_thread_as_remote() {
+        use crate::input_ledger::{InputSource, pane_source};
+        let (guard, ..) = guard();
+        let peer_thread = std::thread::spawn(move || {
+            assert_eq!(pane_source(), InputSource::Window);
+            guard.input(&peer(), "claude-1", 1, b"draft").unwrap();
+            [pane_source(), pane_source(), pane_source()]
+        });
+        assert_eq!(peer_thread.join().unwrap(), [InputSource::Remote; 3]);
+        // The test's own thread stands for the window.
+        assert_eq!(pane_source(), InputSource::Window);
+    }
+
+    /// Two peers on their own reader threads, the window on a third: each
+    /// peer's writes are remote, interleaved however, and the window's stay
+    /// the window's.
+    #[test]
+    fn two_peers_and_the_window_keep_their_sources() {
+        use crate::input_ledger::{InputSource, pane_source};
+        let (guard, ..) = guard();
+        let guard = Arc::new(guard);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let peers: Vec<_> = [1u8, 2]
+            .into_iter()
+            .map(|n| {
+                let (guard, barrier) = (Arc::clone(&guard), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    let who = RemotePeer {
+                        fingerprint: format!("SHA256:peer{n}"),
+                        endpoint: [n; 32],
+                    };
+                    let mut seen = Vec::new();
+                    for _ in 0..50 {
+                        guard.input(&who, "claude-1", 1, b"x").unwrap();
+                        seen.push(pane_source());
+                        barrier.wait();
+                    }
+                    seen
+                })
+            })
+            .collect();
+        let mut window = Vec::new();
+        for _ in 0..50 {
+            window.push(pane_source());
+            barrier.wait();
+        }
+        for p in peers {
+            assert!(p.join().unwrap().iter().all(|s| *s == InputSource::Remote));
+        }
+        assert!(window.iter().all(|s| *s == InputSource::Window));
+    }
+
+    /// A refused peer input (Pause) still marks the thread: a later write
+    /// from it, refused or not, is never taken for the window's.
+    #[test]
+    fn a_refused_peer_input_still_marks_its_thread() {
+        use crate::input_ledger::{InputSource, pane_source};
+        let (guard, _lines, pause, _gate) = guard();
+        pause.pause();
+        let peer_thread = std::thread::spawn(move || {
+            assert_eq!(
+                guard.input(&peer(), "claude-1", 1, b"x"),
+                Err(GuardDenied::Paused)
+            );
+            let refused = pane_source();
+            pause.resume();
+            guard.input(&peer(), "claude-1", 1, b"y").unwrap();
+            [refused, pane_source()]
+        });
+        assert_eq!(peer_thread.join().unwrap(), [InputSource::Remote; 2]);
+        assert_eq!(pane_source(), InputSource::Window);
     }
 
     #[test]

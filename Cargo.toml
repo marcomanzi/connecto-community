@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.9"
+version = "0.3.11"
 edition = "2024"
 rust-version = "1.95"
 publish = false
@@ -17,7 +17,9 @@ connecto-audit = { path = "crates/connecto-audit" }
 connecto-core = { path = "crates/connecto-core" }
 connecto-gate = { path = "crates/connecto-gate" }
 connecto-hook = { path = "crates/connecto-hook" }
+connecto-memory = { path = "crates/connecto-memory" }
 connecto-net = { path = "crates/connecto-net" }
+connecto-ops = { path = "crates/connecto-ops" }
 connecto-packages = { path = "crates/connecto-packages" }
 connecto-pty = { path = "crates/connecto-pty" }
 connecto-redact = { path = "crates/connecto-redact" }
@@ -27,6 +29,7 @@ connecto-store = { path = "crates/connecto-store" }
 connecto-term = { path = "crates/connecto-term" }
 connecto-ui = { path = "crates/connecto-ui" }
 connecto-update = { path = "crates/connecto-update" }
+connecto-vault = { path = "crates/connecto-vault" }
 connecto-workspace = { path = "crates/connecto-workspace" }
 alacritty_terminal = "0.26"
 arc-swap = "1.9"
@@ -37,6 +40,9 @@ interprocess = { version = "2.4", default-features = false }
 libproc = "0.14"
 nix = { version = "0.28", default-features = false }
 portable-pty = "0.9"
+# SQLite compiled from the bundled source, so every platform gets the same
+# version with FTS5 (ADR 0024). No system library, no wasm backend.
+rusqlite = { version = "0.42", default-features = false, features = ["bundled"] }
 serde_json = "1"
 sha2 = "0.11"
 sysinfo = { version = "0.40", default-features = false }
@@ -49,3 +55,10 @@ unsafe_code = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+
+# RSA key generation (Agentic Works' Cloud SQL client key) takes seconds
+# unoptimised; these two crates are built optimised in debug builds too.
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.num-bigint-dig]
+opt-level = 3

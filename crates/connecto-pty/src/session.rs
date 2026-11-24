@@ -108,6 +108,26 @@ struct Shared {
     status: ArcSwap<SessionStatus>,
     /// Dropped by the waiter, which disconnects `exit_rx`.
     exit_rx: Receiver<()>,
+    /// Whether a reader owns the output: see [`Reading`].
+    reading: Arc<AtomicBool>,
+}
+
+/// Marks the output as read by the session's reader for as long as it lives.
+/// It moves into the reader thread's body, so it ends when that body returns
+/// or is dropped without running (the thread could not start).
+struct Reading(Arc<AtomicBool>);
+
+impl Reading {
+    fn new(flag: &Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(Arc::clone(flag))
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Shared {
@@ -122,6 +142,44 @@ impl Shared {
         }
         self.killer.stop(self.pid, &self.master, stop);
     }
+}
+
+/// Closing a pseudoconsole, which dropping the master does, makes conhost
+/// write its last output. Before Windows 11 24H2 (so on Windows 10 and Server
+/// 2022), `ClosePseudoConsole` waits until that output is read, and
+/// portable-pty keeps its own read handle open until after the close. When no
+/// reader thread runs, because it never started or already ended, nothing
+/// reads and the close blocks forever. So a thread reads and discards the
+/// output until conhost closes the pipe. A reader that still runs reads it
+/// itself, and keeps all of it.
+#[cfg(windows)]
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if self.reading.load(Ordering::Acquire) {
+            return;
+        }
+        let reader = self
+            .master
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .try_clone_reader();
+        if let Ok(reader) = reader {
+            // If this thread cannot start either, the close may block, but
+            // nothing else could read the pipe.
+            let _ = thread::Builder::new()
+                .name("pty-drain".into())
+                .spawn(move || read_until_eof(reader, Discard));
+        }
+    }
+}
+
+/// An output sink that throws everything away.
+#[cfg(windows)]
+struct Discard;
+
+#[cfg(windows)]
+impl OutputSink for Discard {
+    fn feed(&mut self, _: &[u8]) {}
 }
 
 /// The body of one of a session's threads.
@@ -225,6 +283,7 @@ impl PtySession {
             reaped: AtomicBool::new(false),
             status: ArcSwap::from_pointee(SessionStatus::Running),
             exit_rx,
+            reading: Arc::new(AtomicBool::new(false)),
         });
 
         // The child runs from here on. Every error below ends it and reaps it
@@ -242,6 +301,7 @@ impl PtySession {
                 return Err(PtyError::Open(err.to_string()));
             }
         };
+        let reading = Reading::new(&shared.reading);
 
         // The waiter first, and the child handed to it only once it runs: if
         // it cannot start, the child is still here to be reaped.
@@ -264,7 +324,13 @@ impl PtySession {
         }
 
         let threads: [(&'static str, ThreadBody); 2] = [
-            ("pty-reader", Box::new(move || read_until_eof(reader, sink))),
+            (
+                "pty-reader",
+                Box::new(move || {
+                    let _reading = reading;
+                    read_until_eof(reader, sink);
+                }),
+            ),
             (
                 "pty-writer",
                 Box::new(move || write_until_closed(writer, &input_rx)),
@@ -632,27 +698,82 @@ mod tests {
         (result.err().unwrap(), pid.load(Ordering::SeqCst))
     }
 
+    /// Runs `body`, failing the test if it has not finished within `limit`.
+    /// A start or a close that blocks (on Windows, a pseudoconsole that waits
+    /// for an answer or for its output to be drained) then fails with a
+    /// reason instead of holding the whole test run until CI gives up.
+    #[allow(clippy::panic)]
+    fn within(limit: Duration, what: &str, body: impl FnOnce() + Send + 'static) {
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<std::thread::Result<()>>(1);
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            let _ = done_tx.send(result);
+        });
+        match done_rx.recv_timeout(limit) {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => {
+                panic!("{what} did not finish within {limit:?}: a PTY start or close blocked")
+            }
+        }
+    }
+
+    /// On Windows a closing console is drained by a thread of its own only
+    /// when no reader owns the output: the reader thread's body holds the
+    /// mark, and gives it up when it ends or is dropped without running.
+    #[test]
+    fn the_output_counts_as_read_only_while_a_reader_body_lives() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let ran: ThreadBody = {
+            let reading = Reading::new(&flag);
+            Box::new(move || drop(reading))
+        };
+        assert!(flag.load(Ordering::Acquire));
+        ran();
+        assert!(!flag.load(Ordering::Acquire), "ended");
+        let never_ran: ThreadBody = {
+            let reading = Reading::new(&flag);
+            Box::new(move || drop(reading))
+        };
+        assert!(flag.load(Ordering::Acquire));
+        drop(never_ran);
+        assert!(!flag.load(Ordering::Acquire), "could not start");
+    }
+
     #[test]
     fn a_child_is_killed_and_reaped_when_any_session_thread_cannot_start() {
         for failing in ["pty-waiter", "pty-reader", "pty-writer"] {
-            let (err, pid) = spawn_with_a_thread_that_fails(failing);
-            assert!(matches!(err, PtyError::Thread(_)), "{failing}: {err}");
-            assert!(pid > 0, "{failing}: the child was started");
-            assert!(gone(pid), "{failing}: pid {pid} is still there");
+            within(
+                Duration::from_secs(60),
+                &format!("the start with {failing} failing"),
+                move || {
+                    let (err, pid) = spawn_with_a_thread_that_fails(failing);
+                    assert!(matches!(err, PtyError::Thread(_)), "{failing}: {err}");
+                    assert!(pid > 0, "{failing}: the child was started");
+                    assert!(gone(pid), "{failing}: pid {pid} is still there");
+                },
+            );
         }
     }
 
     #[test]
     fn a_session_whose_threads_all_start_runs_and_ends_as_before() {
-        let wake: Wake = Arc::new(|| {});
-        let session = PtySession::spawn(sleeper(), Discard, input_channel(), wake).unwrap();
-        let pid = session.pid().unwrap();
-        assert!(!gone(pid));
-        assert!(matches!(session.status(), SessionStatus::Running));
-        session.terminate();
-        assert!(session.wait_exit(Duration::from_secs(10)));
-        assert!(gone(pid));
-        assert!(matches!(session.status(), SessionStatus::Exited { .. }));
+        within(Duration::from_secs(60), "the session", || {
+            let wake: Wake = Arc::new(|| {});
+            let session = PtySession::spawn(sleeper(), Discard, input_channel(), wake).unwrap();
+            // ConPTY first asks the terminal where the cursor is and holds the
+            // console until it gets an answer, which the emulator gives in the
+            // app.
+            #[cfg(windows)]
+            session.input().try_send(b"\x1b[1;1R".to_vec()).unwrap();
+            let pid = session.pid().unwrap();
+            assert!(!gone(pid));
+            assert!(matches!(session.status(), SessionStatus::Running));
+            session.terminate();
+            assert!(session.wait_exit(Duration::from_secs(10)));
+            assert!(gone(pid));
+            assert!(matches!(session.status(), SessionStatus::Exited { .. }));
+        });
     }
 
     /// ConPTY has no process groups: killing the child leaves its own

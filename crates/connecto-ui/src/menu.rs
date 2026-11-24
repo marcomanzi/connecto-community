@@ -263,6 +263,7 @@ pub(crate) fn menus() -> Vec<Menu> {
             title: "File",
             role: Role::Plain,
             entries: vec![
+                item("New Project…", Command::NewProject, None),
                 item("Open Project…", Command::OpenProject, Some(Cmd(Key::O))),
                 Entry::Recent {
                     label: "Open Recent",
@@ -274,6 +275,7 @@ pub(crate) fn menus() -> Vec<Menu> {
                     Command::CloseProject,
                     Some(CmdShift(Key::W)),
                 ),
+                item("Delete Project…", Command::DeleteProject, None),
             ],
         },
         Menu {
@@ -296,6 +298,21 @@ pub(crate) fn menus() -> Vec<Menu> {
                     Command::NewTool(ToolKind::Shell),
                     Some(CmdAlt(Key::Num3)),
                 ),
+                item(
+                    "New Pi",
+                    Command::NewTool(ToolKind::Pi),
+                    Some(CmdAlt(Key::Num4)),
+                ),
+                item(
+                    "New Antigravity",
+                    Command::NewTool(ToolKind::Antigravity),
+                    Some(CmdAlt(Key::Num5)),
+                ),
+                item(
+                    "New OpenCode",
+                    Command::NewTool(ToolKind::OpenCode),
+                    Some(CmdAlt(Key::Num6)),
+                ),
                 Separator,
                 item(
                     "Rename Terminal",
@@ -313,6 +330,7 @@ pub(crate) fn menus() -> Vec<Menu> {
                 item("Restart Terminal", Command::RestartTerminal, None),
                 Separator,
                 item("Automations…", Command::Automations, None),
+                item("Agentic Works…", Command::AgenticWorks, None),
                 item("Skills & Plugins…", Command::SkillsPlugins, None),
             ],
         },
@@ -508,11 +526,11 @@ mod tests {
         moved.drain(0..2);
         let after_file = moved
             .iter()
-            .position(|c| *c == Command::CloseProject)
+            .position(|c| *c == Command::DeleteProject)
             .map(|at| at + 1);
-        assert_eq!(after_file, Some(4));
-        moved.insert(4, Command::Settings);
-        moved.insert(5, Command::CheckForUpdates);
+        assert_eq!(after_file, Some(6));
+        moved.insert(6, Command::Settings);
+        moved.insert(7, Command::CheckForUpdates);
         assert_eq!(bar, moved);
         for command in [
             Command::ClearRecents,
@@ -573,8 +591,8 @@ mod tests {
         assert_eq!(RecentEntry::Empty.command(), None);
         let recents = [
             RecentProject {
-                name: "orbit".into(),
-                path: "/work/orbit".into(),
+                name: "quill".into(),
+                path: "/work/quill".into(),
             },
             RecentProject {
                 name: "connecto".into(),
@@ -587,7 +605,7 @@ mod tests {
             [
                 RecentEntry::Project {
                     index: 0,
-                    name: "orbit"
+                    name: "quill"
                 },
                 RecentEntry::Project {
                     index: 1,
@@ -692,7 +710,8 @@ mod tests {
                 seen += 1;
             }
         }
-        assert_eq!(seen, 25);
+        // 26 with Pi's New terminal shortcut (Ctrl+Shift+Alt+4).
+        assert_eq!(seen, 26);
         assert_eq!(
             in_window_shortcut(Chord::Cmd(Key::O)),
             crate::platform::kbd!("O")

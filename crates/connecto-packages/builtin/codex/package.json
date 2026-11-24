@@ -1,5 +1,5 @@
 {
   "name": "Connecto",
-  "description": "Connecto's team workflows for Codex only: reviewers and critics run as Codex terminals.",
-  "version": 1
+  "description": "Connecto's team workflows and a second opinion for one agent (Codex, Antigravity, Pi or OpenCode): every role runs in its own terminal of that agent. Also how to set up a project's Agentic Works.",
+  "version": 10
 }

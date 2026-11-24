@@ -71,6 +71,82 @@ pub fn fetch(url: &str, user_agent: &str) -> Result<Vec<u8>, String> {
     Ok(output.stdout)
 }
 
+/// What a conditional fetch of the feed found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetched {
+    /// The feed, and the `ETag` to ask with next time, if the server gave one.
+    Fresh { body: Vec<u8>, etag: Option<String> },
+    /// `304`: the feed is the one fetched with that `ETag`.
+    NotModified,
+}
+
+/// Fetch the feed over https, with `If-None-Match` when an `ETag` from the
+/// last fetch is known, so an unchanged feed costs a `304` and no body.
+///
+/// # Errors
+/// When it cannot be fetched.
+pub fn fetch_conditional(
+    url: &str,
+    user_agent: &str,
+    etag: Option<&str>,
+) -> Result<Fetched, String> {
+    let mut command = curl();
+    // `-i`: the headers come first on stdout, for the status and the ETag.
+    command
+        .args(["-fsSLi", "--proto", "=https", "--max-time", "30", "-A"])
+        .arg(user_agent);
+    if let Some(etag) = etag.filter(|tag| usable_etag(tag)) {
+        command.arg("-H").arg(format!("If-None-Match: {etag}"));
+    }
+    let output = run(command.arg(url), "the update check")?;
+    read_response(&output.stdout)
+}
+
+/// An `ETag` worth sending back: short, printable, one line.
+fn usable_etag(tag: &str) -> bool {
+    !tag.is_empty() && tag.len() <= 200 && tag.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+}
+
+/// Split what `curl -i` printed: one header block per response (a redirect
+/// adds one), then the body of the last.
+pub(crate) fn read_response(out: &[u8]) -> Result<Fetched, String> {
+    let mut rest = out;
+    let mut last: Option<(u16, Option<String>)> = None;
+    while rest.starts_with(b"HTTP/") {
+        let end = rest
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|at| (at, 4))
+            .or_else(|| rest.windows(2).position(|w| w == b"\n\n").map(|at| (at, 2)))
+            .ok_or("the update check got a cut-off answer")?;
+        let head = String::from_utf8_lossy(&rest[..end.0]);
+        let mut lines = head.lines();
+        let status = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .ok_or("the update check got an answer it cannot read")?;
+        let etag = lines.find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("etag")
+                .then(|| value.trim().to_owned())
+                .filter(|tag| usable_etag(tag))
+        });
+        last = Some((status, etag));
+        rest = &rest[end.0 + end.1..];
+    }
+    match last {
+        Some((304, _)) => Ok(Fetched::NotModified),
+        Some((200, etag)) => Ok(Fetched::Fresh {
+            body: rest.to_vec(),
+            etag,
+        }),
+        Some((status, _)) => Err(format!("the update check got HTTP {status}")),
+        None => Err("the update check got an answer it cannot read".to_owned()),
+    }
+}
+
 /// Download `artifact` into `dir` and check its size and SHA-256 against the
 /// signed feed. A file that does not match is removed.
 ///
@@ -313,6 +389,31 @@ pub fn start_hand_over(script: &str, dir: &Path) -> Result<(), String> {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conditional_fetch_reads_the_status_the_etag_and_the_body_after_redirects() {
+        let out = b"HTTP/1.1 301 Moved\r\nLocation: https://x/update.json\r\n\r\nHTTP/2 200 \r\ncontent-type: application/json\r\nETag: \"abc\"\r\n\r\n{\"a\":1}";
+        assert_eq!(
+            read_response(out).unwrap(),
+            Fetched::Fresh {
+                body: b"{\"a\":1}".to_vec(),
+                etag: Some("\"abc\"".to_owned())
+            }
+        );
+        let out = b"HTTP/2 304 \r\netag: \"abc\"\r\n\r\n";
+        assert_eq!(read_response(out).unwrap(), Fetched::NotModified);
+        let out = b"HTTP/2 200 \r\n\r\nbody";
+        assert_eq!(
+            read_response(out).unwrap(),
+            Fetched::Fresh {
+                body: b"body".to_vec(),
+                etag: None
+            }
+        );
+        assert!(read_response(b"HTTP/2 200 \r\nno end").is_err());
+        assert!(read_response(b"garbage").is_err());
+        assert!(!usable_etag("a\r\nX-Evil: 1"));
+    }
 
     #[test]
     fn the_bundle_is_found_from_the_program_inside_it() {

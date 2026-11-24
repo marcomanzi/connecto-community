@@ -14,8 +14,14 @@
 //! again, so one slow start does not turn hooks off for every later terminal.
 //! The read has no project input, so there is no "not trusted yet" state here:
 //! every failure is a read that could not be made (see `read`).
+//!
+//! Trusted hooks are not enough on their own: the Codex hook hands the model
+//! its instructions (ADR 0046), so preflight also checks, per launch, that the
+//! stored helper does ([`helper_hands_over_bridge_text`]) and that the
+//! terminal's configuration leaves Codex's hooks on ([`hooks_feature`]).
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -264,6 +270,131 @@ fn trust_state_in(
     })
 }
 
+/// How long one of the checks below may take.
+const CHECK_LIMIT: Duration = Duration::from_secs(10);
+
+/// Run `command` to its end with stdin closed, and hand back what it printed
+/// when it ended well within [`CHECK_LIMIT`].
+fn printed(command: &mut Command) -> Option<Vec<u8>> {
+    let mut child = crate::platform::no_console(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .spawn()
+    .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
+        out
+    });
+    let deadline = Instant::now() + CHECK_LIMIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = reader.join().ok()?;
+                return status.success().then_some(out);
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// The marker the helper check hands over.
+const PROBE_TEXT: &str = "connecto-helper-probe";
+
+/// Whether `helper` hands Codex the bridge text at `SessionStart` (ADR
+/// 0046): run as Codex runs the hook, with a probe text and no hook channel,
+/// it must answer with that text. A helper from an earlier build of
+/// Connecto (left in the store when the one beside the app is missing or
+/// could not replace it) prints nothing, and its terminals would silently get
+/// no bridge text. The reason, when it does not.
+pub fn helper_hands_over_bridge_text(helper: &Path) -> Result<(), String> {
+    let mut command = Command::new(helper);
+    command
+        .args(["codex-hook", "--event", "SessionStart"])
+        .env_clear()
+        .env(connecto_hook::codex::BRIDGE_TEXT_ENV, PROBE_TEXT);
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", root);
+    }
+    let out = printed(&mut command).unwrap_or_default();
+    let context = serde_json::from_slice::<Value>(&out)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/hookSpecificOutput/additionalContext")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    if context.as_deref() == Some(PROBE_TEXT) {
+        Ok(())
+    } else {
+        Err(
+            "Connecto's hook helper is from another build of Connecto and would not hand Codex \
+             its instructions; restarting Connecto puts this build's helper in place"
+                .to_owned(),
+        )
+    }
+}
+
+/// The `hooks` feature's state in what `codex features list` printed: the
+/// row named `hooks`, whose last column is `true` or `false`.
+fn hooks_row(listing: &str) -> Option<bool> {
+    listing.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        (words.next() == Some("hooks"))
+            .then(|| words.last())
+            .flatten()
+            .and_then(|state| state.parse().ok())
+    })
+}
+
+/// Whether Codex's hooks run for a terminal started with `env` in `project`:
+/// `codex features list` reads the same configuration (the profile, a
+/// trusted project's `.codex/config.toml`) and starts nothing. With the
+/// feature off Codex runs no hook, so the terminal would get no bridge text
+/// and Connecto would not see it. `None` when it could not be read.
+pub fn hooks_feature(codex: &Path, env: &[(OsString, OsString)], project: &Path) -> Option<bool> {
+    let mut command = Command::new(codex);
+    command
+        .args(["features", "list"])
+        .env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .current_dir(project);
+    hooks_row(&String::from_utf8_lossy(&printed(&mut command)?))
+}
+
+/// Preflight's checks, after the trust read, of what a Codex terminal needs
+/// to get its instructions from the hook: the reason to turn the bridge off,
+/// if any. `env` is the terminal's configuration environment, when it could
+/// be named; a feature state that cannot be read does not turn it off.
+pub fn hook_handover(
+    helper: &Path,
+    codex: &Path,
+    env: Option<&[(OsString, OsString)]>,
+    project: &Path,
+) -> Result<(), String> {
+    helper_hands_over_bridge_text(helper)?;
+    if env.and_then(|env| hooks_feature(codex, env, project)) == Some(false) {
+        return Err(
+            "Codex's settings turn its hooks off (`features.hooks = false`), so Connecto cannot \
+             see this terminal or hand it its instructions"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// The fake `codex` is a `/bin/sh` script, so the tests that run it are Unix
 /// only; the shared-read tests run everywhere.
 #[cfg(test)]
@@ -435,6 +566,146 @@ sleep 1
             &root.join("run"),
         );
         assert!(answer.unwrap_err().contains("did not list"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    fn script(root: &Path, name: &str, body: &str) -> PathBuf {
+        fs::create_dir_all(root).unwrap();
+        let path = root.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A helper that hands the probe text back passes; one from an earlier
+    /// build, which ignores the variable and prints nothing (or only the
+    /// recap), or one that does not run, turns the bridge off with a reason.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_helper_that_hands_over_the_bridge_text_passes() {
+        let root = scratch("helper");
+        let current = script(
+            &root,
+            "current",
+            &format!(
+                r#"cat > /dev/null
+printf '{{"hookSpecificOutput":{{"hookEventName":"SessionStart","additionalContext":"%s"}}}}' "${}""#,
+                connecto_hook::codex::BRIDGE_TEXT_ENV
+            ),
+        );
+        assert_eq!(helper_hands_over_bridge_text(&current), Ok(()));
+        let earlier = script(&root, "earlier", "cat > /dev/null");
+        let recap_only = script(
+            &root,
+            "recap",
+            r#"cat > /dev/null; echo '{"hookSpecificOutput":{"additionalContext":"recap"}}'"#,
+        );
+        for helper in [earlier, recap_only, root.join("missing")] {
+            let why = helper_hands_over_bridge_text(&helper).unwrap_err();
+            assert!(why.contains("another build of Connecto"), "{why}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_hooks_row_of_codexs_feature_list_is_read() {
+        let listing = "apps                                     stable             true\n\
+                       hooks                                    stable             false\n\
+                       plugin_hooks                             removed            true\n";
+        assert_eq!(hooks_row(listing), Some(false));
+        assert_eq!(hooks_row(&listing.replace("false", "true")), Some(true));
+        assert_eq!(hooks_row("plugin_hooks  removed  false\n"), None);
+        assert_eq!(hooks_row(""), None);
+    }
+
+    /// `codex features list` runs with the terminal's configuration (its
+    /// `CODEX_HOME`, in the project): a stand-in Codex that answers from them
+    /// shows the feature off, on, or unreadable.
+    #[cfg(unix)]
+    #[test]
+    fn the_hooks_feature_is_read_with_the_terminals_configuration() {
+        let root = scratch("features");
+        let project = root.join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let codex = script(
+            &root,
+            "codex",
+            r#"[ "$1 $2" = "features list" ] || exit 2
+state=$(cat "$CODEX_HOME/hooks" 2>/dev/null || echo true)
+[ -f .codex-off ] && state=false
+echo "apps      stable  true"
+echo "hooks     stable  $state""#,
+        );
+        let profile = root.join("profile");
+        fs::create_dir_all(&profile).unwrap();
+        let env: Vec<(OsString, OsString)> = vec![("CODEX_HOME".into(), profile.clone().into())];
+        assert_eq!(hooks_feature(&codex, &env, &project), Some(true));
+        fs::write(profile.join("hooks"), "false").unwrap();
+        assert_eq!(hooks_feature(&codex, &env, &project), Some(false));
+        fs::remove_file(profile.join("hooks")).unwrap();
+        fs::write(project.join(".codex-off"), "").unwrap();
+        assert_eq!(hooks_feature(&codex, &env, &project), Some(false));
+        let broken = script(&root, "broken", "exit 1");
+        assert_eq!(hooks_feature(&broken, &env, &project), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// What preflight decides after the trust read: the bridge stays on only
+    /// with a helper that hands the text over and hooks the configuration
+    /// leaves on (an unreadable state does not turn it off).
+    #[cfg(unix)]
+    #[test]
+    fn the_bridge_goes_off_with_an_earlier_helper_or_codex_hooks_off() {
+        let root = scratch("handover");
+        let project = root.join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let current = script(
+            &root,
+            "current",
+            &format!(
+                r#"cat > /dev/null
+printf '{{"hookSpecificOutput":{{"additionalContext":"%s"}}}}' "${}""#,
+                connecto_hook::codex::BRIDGE_TEXT_ENV
+            ),
+        );
+        let earlier = script(&root, "earlier", "cat > /dev/null");
+        let on = script(&root, "codex-on", "echo 'hooks  stable  true'");
+        let off = script(&root, "codex-off", "echo 'hooks  stable  false'");
+        let broken = script(&root, "codex-broken", "exit 1");
+        let env: Vec<(OsString, OsString)> = Vec::new();
+        let env = Some(env.as_slice());
+        assert_eq!(hook_handover(&current, &on, env, &project), Ok(()));
+        assert_eq!(hook_handover(&current, &broken, env, &project), Ok(()));
+        assert_eq!(hook_handover(&current, &off, None, &project), Ok(()));
+        let why = hook_handover(&current, &off, env, &project).unwrap_err();
+        assert!(why.contains("features.hooks = false"), "{why}");
+        let why = hook_handover(&earlier, &on, env, &project).unwrap_err();
+        assert!(why.contains("another build of Connecto"), "{why}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The installed Codex (checked with 0.167.0) reports the feature from a
+    /// profile's `config.toml`. Run with `cargo test -p connecto-session
+    /// --lib -- --ignored installed_codex`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs the installed codex"]
+    fn the_installed_codex_reports_a_profile_that_turns_hooks_off() {
+        let root = scratch("installed-features");
+        let project = root.join("proj");
+        let profile = root.join("profile");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&profile).unwrap();
+        let env: Vec<(OsString, OsString)> = vec![
+            ("CODEX_HOME".into(), profile.clone().into()),
+            ("HOME".into(), root.clone().into()),
+            ("PATH".into(), std::env::var_os("PATH").unwrap()),
+        ];
+        let codex = Path::new("codex");
+        assert_eq!(hooks_feature(codex, &env, &project), Some(true));
+        fs::write(profile.join("config.toml"), "[features]\nhooks = false\n").unwrap();
+        assert_eq!(hooks_feature(codex, &env, &project), Some(false));
         let _ = fs::remove_dir_all(&root);
     }
 }

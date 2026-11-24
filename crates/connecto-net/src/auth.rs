@@ -385,6 +385,14 @@ impl AuthorizedKeySet {
         self.keys.iter().any(|k| k.key_data() == key.key_data())
     }
 
+    /// Whether a key with this `SHA256:` fingerprint is in the set.
+    #[must_use]
+    pub fn has_fingerprint(&self, fingerprint: &str) -> bool {
+        self.keys
+            .iter()
+            .any(|k| k.fingerprint(HashAlg::Sha256).to_string() == fingerprint)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.keys.len()
@@ -705,6 +713,14 @@ pub(crate) mod tests {
             Err(DenyReason::Version)
         );
         assert_eq!(auth.on_hello(PROTOCOL_VERSION), Err(DenyReason::Protocol));
+    }
+
+    #[test]
+    fn a_version_one_peer_is_refused_by_a_version_two_host() {
+        let key = new_key();
+        let mut auth = host(allow(&[&key]));
+        assert_eq!(auth.on_hello(1), Err(DenyReason::Version));
+        assert!(!auth.is_done());
     }
 
     #[test]

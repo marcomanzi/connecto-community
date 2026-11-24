@@ -18,3 +18,12 @@ connecto-hook.workspace = true
 connecto-session.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+# Tool detection reads the PATH saved in the registry, which an installer
+# changes after Connecto started (ADR 0037).
+[target.'cfg(windows)'.dependencies]
+winreg = "0.10"
+
+# Version probes end the process group they start (ADR 0037).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal"] }

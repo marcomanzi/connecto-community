@@ -9,14 +9,29 @@ use egui::{Event, Key, Modifiers};
 
 use crate::settings::SettingsTab;
 
+/// Which projects the sidebar lists, when there are groups.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum GroupFilter {
+    #[default]
+    All,
+    Group(String),
+    /// The projects in no group.
+    Ungrouped,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
     // File
+    /// The New Project dialog: a folder, and optionally a git repository to
+    /// clone into it.
+    NewProject,
     OpenProject,
     OpenRecent(usize),
     ClearRecents,
     RenameProject,
     CloseProject,
+    /// Ask before closing the project shown and deleting its folder.
+    DeleteProject,
     // Terminal
     NewTerminal,
     NewTool(ToolKind),
@@ -32,6 +47,7 @@ pub(crate) enum Command {
     ToggleSidebar,
     UtilitySessions,
     Automations,
+    AgenticWorks,
     SkillsPlugins,
     Settings,
     /// Check for a newer Connecto now.
@@ -65,15 +81,36 @@ pub(crate) enum Command {
         project: String,
         terminal: String,
     },
+    /// Stop the background shells a terminal's agent left running, or only
+    /// the task `task`.
+    StopBackgroundAt {
+        project: String,
+        terminal: String,
+        task: Option<String>,
+    },
     RenameTerminalAt {
         project: String,
         terminal: String,
     },
     RenameProjectAt(String),
     CloseProjectAt(String),
+    DeleteProjectAt(String),
     NewTerminalIn(String),
     HistoryOf(String),
     ProjectSettingsAt(String),
+    /// The project's Operations dialog.
+    OperationsOf(String),
+    // Project groups in the sidebar
+    /// The name field of a new group.
+    NewGroup,
+    RenameGroupAt(String),
+    DeleteGroupAt(String),
+    /// Put a project in a group, or take it out (`None`).
+    SetProjectGroup(String, Option<String>),
+    /// Show only some projects in the sidebar.
+    FilterGroups(GroupFilter),
+    /// Fold or unfold a group's projects.
+    ToggleGroup(String),
     // Hosts
     AddHost,
     /// `None` is this machine.
@@ -97,6 +134,9 @@ pub(crate) fn from_key(key: Key, m: Modifiers) -> Option<Command> {
             Key::Num1 => Some(Command::NewTool(ToolKind::Claude)),
             Key::Num2 => Some(Command::NewTool(ToolKind::Codex)),
             Key::Num3 => Some(Command::NewTool(ToolKind::Shell)),
+            Key::Num4 => Some(Command::NewTool(ToolKind::Pi)),
+            Key::Num5 => Some(Command::NewTool(ToolKind::Antigravity)),
+            Key::Num6 => Some(Command::NewTool(ToolKind::OpenCode)),
             _ => None,
         };
     }
@@ -205,6 +245,13 @@ mod tests {
             (Key::Num1, alt(cmd()), Command::NewTool(ToolKind::Claude)),
             (Key::Num2, alt(cmd()), Command::NewTool(ToolKind::Codex)),
             (Key::Num3, alt(cmd()), Command::NewTool(ToolKind::Shell)),
+            (Key::Num4, alt(cmd()), Command::NewTool(ToolKind::Pi)),
+            (
+                Key::Num5,
+                alt(cmd()),
+                Command::NewTool(ToolKind::Antigravity),
+            ),
+            (Key::Num6, alt(cmd()), Command::NewTool(ToolKind::OpenCode)),
             (Key::R, cmd(), Command::RenameTerminal),
             (Key::W, cmd(), Command::CloseTerminal),
             (Key::K, shift(cmd()), Command::CloseFinishedChildren),

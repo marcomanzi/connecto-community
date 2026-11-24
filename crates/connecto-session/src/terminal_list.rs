@@ -34,6 +34,9 @@ pub(crate) struct Entry {
     /// The model it was added with (`connecto add --model`), kept so a later
     /// start uses it too. Only a checked value.
     pub model: Option<String>,
+    /// The effort it was added with (`connecto add --effort`), kept like the
+    /// model. Only a value its tool takes.
+    pub effort: Option<String>,
     /// Whether it was in the middle of a turn when last seen. Such a terminal
     /// starts with its project at the next launch; the others wait until
     /// they are asked for.
@@ -41,6 +44,34 @@ pub(crate) struct Entry {
     /// The app closed on it in the middle of a turn, and it has not started
     /// another since. Kept across launches until it does.
     pub interrupted: bool,
+    /// The turn it was in was cut by a restart for an update (ADR 0030): the
+    /// next launch resumes its conversation with "continua". Saved as
+    /// `"cut_by": "update"`; taken, and dropped, by the launch that does it.
+    pub cut_by_update: bool,
+    /// The `--ask` replies this terminal owed when an update cut the app: the
+    /// asker waits for them across the restart (ADR 0030). Saved as
+    /// `"owes": [{"request": "r13", "to": "claude-31"}]`; taken, and dropped,
+    /// by the launch that restores them.
+    pub owes: Vec<OwedReply>,
+    /// It runs an Agentic Works job, or a terminal that ran one started it
+    /// (at any depth). Set when it is created, never cleared: a close, a
+    /// restart or a new parent leaves it. Saved as `"job": true`.
+    pub job: bool,
+}
+
+/// An `--ask` reply a terminal still owed when an update cut the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwedReply {
+    /// The request id the asker was given (`r13`).
+    pub request: String,
+    /// The terminal that asked and waits for the reply.
+    pub to: String,
+}
+
+/// A request id as the bridge gives one out: `r` and a number.
+pub(crate) fn valid_request(id: &str) -> bool {
+    id.strip_prefix('r')
+        .is_some_and(|n| (1..=20).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 impl Entry {
@@ -55,11 +86,32 @@ impl Entry {
             asked_by: None,
             session: None,
             model: None,
+            effort: None,
             working: false,
             interrupted: false,
+            cut_by_update: false,
+            owes: Vec::new(),
+            job: false,
         }
     }
+
+    /// The effort it launches with: its own, or, for the app session (which
+    /// the phone starts with none), [`APP_SESSION_EFFORT`] where its tool
+    /// takes it, so its analyses go deeper. Never saved: an app session made
+    /// before this launches with it too.
+    pub(crate) fn launch_effort(&self) -> Option<String> {
+        self.effort.clone().or_else(|| {
+            (self.name.as_deref() == Some(connecto_core::session::APP_SESSION)
+                && self.parent.is_none()
+                && connecto_core::ToolKind::from_name(self.tool.name())
+                    .is_some_and(|kind| valid_effort(kind, APP_SESSION_EFFORT)))
+            .then(|| APP_SESSION_EFFORT.to_owned())
+        })
+    }
 }
+
+/// The effort an app session launches with when it was given none.
+pub(crate) const APP_SESSION_EFFORT: &str = "high";
 
 /// A name as a person or an agent gave it, or why it is refused. Blank means
 /// no name. Too long is refused, never cut.
@@ -89,13 +141,32 @@ pub(crate) fn valid_session(id: &str) -> bool {
 }
 
 /// A model name is passed on a command line, so only plain name characters,
-/// and never a leading `-` that could be read as an option.
+/// and never a leading `-` that could be read as an option. `/` and `:` are
+/// for Pi, which names a model with its provider and a thinking level
+/// (`lmstudio/google/gemma-4-e2b`, `openrouter/openai/gpt-5:high`).
 pub(crate) fn valid_model(model: &str) -> bool {
     (1..=64).contains(&model.len())
         && model.as_bytes()[0].is_ascii_alphanumeric()
         && model.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'[' | b']')
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.' | b'[' | b']' | b'/' | b':')
         })
+}
+
+/// Whether `tool`'s command line takes `effort` as its reasoning effort.
+pub(crate) fn valid_effort(tool: connecto_core::ToolKind, effort: &str) -> bool {
+    use connecto_core::ToolKind;
+    let levels: &[&str] = match tool {
+        ToolKind::Claude | ToolKind::Antigravity => &["low", "medium", "high", "xhigh", "max"],
+        // Codex 0.167 offers `max` and `ultra` on its newest models.
+        ToolKind::Codex => &[
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ],
+        ToolKind::Pi => &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        // OpenCode's TUI takes no effort: a model's variant is chosen in it.
+        ToolKind::OpenCode | ToolKind::Shell => &[],
+    };
+    levels.contains(&effort)
 }
 
 /// The saved list. Ids are never reused: `next` only moves forward.
@@ -113,9 +184,16 @@ pub(crate) fn valid_id(id: &str) -> bool {
 }
 
 fn tool_from(name: &str) -> Option<Tool> {
-    [Tool::Claude, Tool::Codex, Tool::Shell]
-        .into_iter()
-        .find(|tool| tool.name() == name)
+    [
+        Tool::Claude,
+        Tool::Codex,
+        Tool::Pi,
+        Tool::Antigravity,
+        Tool::OpenCode,
+        Tool::Shell,
+    ]
+    .into_iter()
+    .find(|tool| tool.name() == name)
 }
 
 impl List {
@@ -168,6 +246,7 @@ impl List {
                     ("asked_by", &entry.asked_by),
                     ("session", &entry.session),
                     ("model", &entry.model),
+                    ("effort", &entry.effort),
                 ] {
                     if let Some(text) = text {
                         value[field] = json!(text);
@@ -180,6 +259,19 @@ impl List {
                     if on {
                         value[field] = json!(true);
                     }
+                }
+                if entry.cut_by_update {
+                    value["cut_by"] = json!("update");
+                }
+                if entry.job {
+                    value["job"] = json!(true);
+                }
+                if !entry.owes.is_empty() {
+                    value["owes"] = entry
+                        .owes
+                        .iter()
+                        .map(|owed| json!({"request": owed.request, "to": owed.to}))
+                        .collect();
                 }
                 value
             })
@@ -233,8 +325,32 @@ impl List {
             entry.asked_by = text("asked_by").filter(|by| valid_id(by) && by != id);
             entry.session = text("session").filter(|session| valid_session(session));
             entry.model = text("model").filter(|model| valid_model(model));
+            entry.effort = text("effort").filter(|effort| {
+                connecto_core::ToolKind::from_name(tool.name())
+                    .is_some_and(|kind| valid_effort(kind, effort))
+            });
             entry.working = item["working"].as_bool().unwrap_or(false);
             entry.interrupted = item["interrupted"].as_bool().unwrap_or(false);
+            entry.cut_by_update = item["cut_by"].as_str() == Some("update");
+            entry.job = item["job"].as_bool() == Some(true);
+            entry.owes = item["owes"]
+                .as_array()
+                .map(|owes| {
+                    owes.iter()
+                        .filter_map(|owed| {
+                            let request = owed["request"].as_str()?;
+                            let to = owed["to"].as_str()?;
+                            (valid_request(request) && valid_id(to) && to != id).then(|| {
+                                OwedReply {
+                                    request: request.to_owned(),
+                                    to: to.to_owned(),
+                                }
+                            })
+                        })
+                        .take(MAX_TERMINALS * 4)
+                        .collect()
+                })
+                .unwrap_or_default();
             terminals.push(entry);
         }
         // A parent that is not in the list, or that has a parent itself, would
@@ -387,6 +503,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_replies_a_terminal_owes_are_saved_and_bad_ones_dropped() {
+        let mut list = List::defaults(&[Tool::Claude, Tool::Codex]);
+        let owed = OwedReply {
+            request: "r13".to_owned(),
+            to: "codex".to_owned(),
+        };
+        list.terminals[0].owes = vec![owed.clone()];
+        let back = List::parse(&list.to_json()).unwrap();
+        assert_eq!(back.terminals[0].owes, vec![owed]);
+        assert!(back.terminals[1].owes.is_empty());
+        let text = list.to_json().replace("\"r13\"", "\"x13\"");
+        assert!(List::parse(&text).unwrap().terminals[0].owes.is_empty());
+        assert!(valid_request("r1") && !valid_request("r") && !valid_request("r1a"));
+    }
+
+    #[test]
     fn a_shell_is_saved_and_loaded_under_its_own_name() {
         let mut list = List::defaults(&[Tool::Claude]);
         assert_eq!(list.mint(Tool::Shell).as_deref(), Some("shell"));
@@ -415,6 +547,41 @@ mod tests {
         assert_eq!(again, list);
         assert_eq!(list.to_json().matches("working").count(), 1);
         assert_eq!(list.to_json().matches("interrupted").count(), 1);
+    }
+
+    /// The job mark is saved and read back; a list from before it has none.
+    #[test]
+    fn the_job_mark_is_kept_and_older_lists_have_none() {
+        let text = r#"{"version":1,"terminals":[
+            {"id":"claude","tool":"claude","desired":"running","job":true},
+            {"id":"codex","tool":"codex","desired":"running"},
+            {"id":"pi","tool":"pi","desired":"running","job":"yes"},
+            {"id":"claude-2","tool":"claude","desired":"running","parent":"gone","job":true}]}"#;
+        let list = List::parse(text).unwrap();
+        let marks: Vec<bool> = list.terminals.iter().map(|e| e.job).collect();
+        assert_eq!(marks, [true, false, false, true]);
+        // A parent no longer listed is dropped; the mark is not.
+        assert_eq!(list.terminals[3].parent, None);
+        let saved = list.to_json();
+        assert_eq!(saved.matches("\"job\"").count(), 2, "{saved}");
+        let again = List::parse(&saved).unwrap();
+        assert_eq!(
+            again.terminals.iter().map(|e| e.job).collect::<Vec<_>>(),
+            marks
+        );
+    }
+
+    #[test]
+    fn a_turn_cut_by_an_update_is_kept_and_nothing_else_reads_as_one() {
+        let text = r#"{"version":1,"next":{},"terminals":[
+            {"id":"claude","tool":"claude","desired":"running","working":true,"cut_by":"update"},
+            {"id":"codex","tool":"codex","desired":"running","working":true,"cut_by":"crash"}]}"#;
+        let list = List::parse(text).unwrap();
+        assert!(list.terminals[0].cut_by_update);
+        assert!(!list.terminals[1].cut_by_update);
+        let again = List::parse(&list.to_json()).unwrap();
+        assert_eq!(again, list);
+        assert_eq!(list.to_json().matches("cut_by").count(), 1);
     }
 
     #[test]
@@ -449,11 +616,63 @@ mod tests {
         ] {
             assert!(valid_model(good), "{good}");
         }
+        for tool in connecto_core::ToolKind::ALL {
+            for suggested in tool.suggested_models() {
+                assert!(valid_model(suggested), "{tool:?} offers {suggested}");
+            }
+        }
         let mut list = List::defaults(&both());
         list.terminals[0].model = Some("opus".to_owned());
         let back = List::parse(&list.to_json()).unwrap();
         assert_eq!(back.terminals[0].model.as_deref(), Some("opus"));
         assert_eq!(back.terminals[1].model, None);
+    }
+
+    /// A top-level app session with no effort of its own launches on high;
+    /// one it was given, a child of that name and other terminals keep theirs.
+    #[test]
+    fn the_app_session_launches_on_high_unless_given_an_effort() {
+        let app = |tool, effort: Option<&str>, parent: Option<&str>| {
+            let mut entry = Entry::new("t-1".into(), tool, true);
+            entry.name = Some(connecto_core::session::APP_SESSION.into());
+            entry.effort = effort.map(str::to_owned);
+            entry.parent = parent.map(str::to_owned);
+            entry.launch_effort()
+        };
+        assert_eq!(app(Tool::Claude, None, None).as_deref(), Some("high"));
+        assert_eq!(app(Tool::Codex, None, None).as_deref(), Some("high"));
+        assert_eq!(app(Tool::Claude, Some("low"), None).as_deref(), Some("low"));
+        assert_eq!(app(Tool::Claude, None, Some("claude")), None);
+        let plain = Entry::new("claude".into(), Tool::Claude, true);
+        assert_eq!(plain.launch_effort(), None);
+    }
+
+    /// `connecto add --effort` is kept with its terminal, so a later start,
+    /// and the next launch of the app, use it too. A word its tool doesn't
+    /// take is dropped on reading.
+    #[test]
+    fn an_effort_is_kept_with_its_terminal_and_checked_against_its_tool() {
+        use connecto_core::ToolKind;
+        for tool in [
+            ToolKind::Claude,
+            ToolKind::Codex,
+            ToolKind::Antigravity,
+            ToolKind::Pi,
+        ] {
+            assert!(valid_effort(tool, "medium"), "{tool:?}");
+            assert!(!valid_effort(tool, "Medium"), "{tool:?}");
+            assert!(!valid_effort(tool, "--model"), "{tool:?}");
+        }
+        assert!(valid_effort(ToolKind::Claude, "max"));
+        assert!(valid_effort(ToolKind::Codex, "ultra"));
+        assert!(!valid_effort(ToolKind::Claude, "ultra"));
+        assert!(!valid_effort(ToolKind::Shell, "medium"));
+        let mut list = List::defaults(&both());
+        list.terminals[0].effort = Some("medium".to_owned());
+        list.terminals[1].effort = Some("bogus".to_owned());
+        let back = List::parse(&list.to_json()).unwrap();
+        assert_eq!(back.terminals[0].effort.as_deref(), Some("medium"));
+        assert_eq!(back.terminals[1].effort, None);
     }
 
     #[test]

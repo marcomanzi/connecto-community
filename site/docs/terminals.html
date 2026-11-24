@@ -48,6 +48,16 @@
 </table>
 <p><kbd>⌘</kbd> <kbd>J</kbd> jumps to the next terminal that needs you.</p>
 
+<h3 id="background">Background work</h3>
+<p>An agent can leave work running after its turn ends: a Claude background shell such as a dev server or a test watcher, a subagent, a monitor or a workflow. Until all of it ends, the terminal's turn is not finished, its dot stays <em>working</em>, and an agent waiting on it keeps waiting.</p>
+<ul>
+  <li>The line under the name says what is running: with one task, what the agent said it is for (such as <em>Start the dev server · 12 h</em>), or its command; with several, how many (<em>2 in background · 12 h</em>). The age is the oldest task's. After 15 minutes the line turns amber.</li>
+  <li>With several tasks, the <strong>▸</strong> arrow opens a list under the row: each task, how long it has run, and its command on hover.</li>
+  <li>The <strong>■</strong> button stops background shells: on the row, the only task or all of the terminal's shells; in the list, that one task. A shell gets a polite stop, then a forced one after three seconds. Claude tells the agent the shell failed, and the turn can end.</li>
+  <li>Subagents, monitors and workflows have no ■: Connecto cannot stop them, and they end on their own.</li>
+</ul>
+<p>Agents see the same with <code>connecto tasks &lt;id&gt;</code> and stop shells with <code>connecto tasks &lt;id&gt; --stop [task]</code> (see <a href="agents.html">Agents using other terminals</a>).</p>
+
 <h3>Nested terminals</h3>
 <h3 id="names">Names</h3>
 <p>The id (<code>claude-3</code>, <code>codex-2</code>, <code>shell</code>) never changes: agents address terminals by it, and the row always shows it under the name. A name is only a label. Giving a Claude terminal a name also gives it to Claude as its session name: it is passed as <code>--name</code> whenever the terminal starts, and a name set on a terminal that is already running is typed to Claude as <code>/rename</code> once it sits at a quiet prompt (not in a turn, not at a permission prompt, and not while you are typing; the last name wins). That write is in the audit log like any other, and Pause stops it. A Codex terminal and a plain shell are only labelled in Connecto: Codex has a <code>/rename</code> command, but it is not used yet. The same happens when an agent's first <code>--ask</code> names a child, or a remote user renames a terminal.</p>

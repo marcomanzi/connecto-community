@@ -6,9 +6,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use connecto_core::{
-    MAX_TERMINALS, ProjectView, TermActivity, TerminalEntry, TerminalsView, ToolKind,
+    BackgroundWork, LONG_RUNNING, MAX_TERMINALS, ProjectView, TermActivity, TerminalEntry,
+    TerminalsView, ToolKind, short_age,
 };
 use egui::epaint::text::TextWrapping;
 use egui::text::LayoutJob;
@@ -18,7 +20,7 @@ use egui::{
 };
 
 use crate::app::Snapshot;
-use crate::commands::Command;
+use crate::commands::{Command, GroupFilter};
 use crate::dots::Dot;
 use crate::header;
 use crate::icons;
@@ -29,13 +31,20 @@ pub(crate) const SIDEBAR_WIDTH: f32 = 286.0;
 pub(crate) const RAIL_WIDTH: f32 = 60.0;
 /// The band the macOS traffic lights sit in; none off macOS.
 pub(crate) const LIGHTS_BAND: f32 = crate::platform::LIGHTS_BAND;
-const HEAD_ROW: f32 = 36.0;
 const FOOT_HEIGHT: f32 = 46.0;
 const PROJECT_ROW: f32 = 32.0;
 const TERMINAL_ROW: f32 = 40.0;
 const CHILD_ROW: f32 = 38.0;
+/// One task of an open background list.
+const BACKGROUND_ROW: f32 = 20.0;
 const NEW_ROW: f32 = 28.0;
+const GROUP_ROW: f32 = 26.0;
+/// How far right a project sits under its group's header.
+const GROUP_INDENT: f32 = 14.0;
+const FILTER_ROW: f32 = 28.0;
 const SIDE_PAD: f32 = 8.0;
+/// Room left of the group filter and the group headers.
+const LEFT_INSET: f32 = crate::hosts::LEFT_INSET;
 const ICON_BUTTON: f32 = 24.0;
 
 /// A control, named so tests can find where it was drawn.
@@ -45,13 +54,30 @@ pub(crate) enum Hit {
     Twisty(String),
     Clock(String),
     Gear(String),
+    Ops(String),
     Terminal(String, String),
     Close(String, String),
     Robot(String, String),
     Kids(String, String),
+    /// A terminal's stop button for its background shells, or one task's.
+    StopBackground(String, String, Option<String>),
+    /// The arrow that opens a terminal's list of background tasks.
+    BackgroundList(String, String),
     NewRow(String),
     HeaderHistory,
     HeaderPlus,
+    /// The items of the + menu.
+    PlusOpenProject,
+    PlusNewProject,
+    PlusNewGroup,
+    /// The group filter above the projects, and each of its choices: `all`,
+    /// `ungrouped` or a group id.
+    GroupFilter,
+    GroupFilterItem(String),
+    /// A group's header row, by id.
+    Group(String),
+    /// The drop zone that takes a dragged project out of its group.
+    Ungrouped,
     Collapse,
     Pause,
     Tile(String),
@@ -104,6 +130,53 @@ pub(crate) struct TreeInput<'a> {
     pub(crate) hosts: &'a [connecto_core::HostRow],
     /// The remote host shown; `None` is this machine.
     pub(crate) host: Option<&'a str>,
+    /// Which projects are listed when there are groups.
+    pub(crate) group_filter: &'a GroupFilter,
+    /// Groups whose projects are folded away.
+    pub(crate) folded_groups: &'a HashSet<String>,
+    /// Projects with operations, by id: whether something waits for the
+    /// person (proposals, or the weekly suggestion).
+    pub(crate) ops: &'a HashMap<String, bool>,
+}
+
+impl TreeInput<'_> {
+    /// Groups apply: a group made, on this machine or on the host shown.
+    fn grouping(&self) -> bool {
+        !self.snap.ws.groups.is_empty()
+    }
+
+    /// Groups can be changed here: this machine's. A host's groups are its
+    /// own, shown as it has them.
+    fn regrouping(&self) -> bool {
+        self.grouping() && !self.snap.is_remote()
+    }
+
+    /// The group a project counts as in: none when its group is gone.
+    fn group_of<'p>(&self, project: &'p ProjectView) -> Option<&'p str> {
+        project
+            .group
+            .as_deref()
+            .filter(|id| self.snap.ws.groups.iter().any(|g| g.id == *id))
+    }
+
+    /// Whether the filter lists a project.
+    fn listed(&self, project: &ProjectView) -> bool {
+        if !self.grouping() {
+            return true;
+        }
+        match self.group_filter {
+            GroupFilter::All => true,
+            GroupFilter::Group(id) => self.group_of(project) == Some(id.as_str()),
+            GroupFilter::Ungrouped => self.group_of(project).is_none(),
+        }
+    }
+}
+
+/// What dragging a project row carries.
+#[derive(Debug, Clone)]
+struct ProjectDrag {
+    id: String,
+    group: Option<String>,
 }
 
 /// A terminal in the order the tree draws it.
@@ -174,7 +247,7 @@ pub(crate) fn project_dot(
 
 /// The display name of a terminal.
 pub(crate) fn title(entry: &TerminalEntry) -> &str {
-    entry.name.as_deref().unwrap_or(&entry.id)
+    entry.name.as_deref().unwrap_or_else(|| entry.display_id())
 }
 
 /// Fit one line of text to `width`, ending in an ellipsis if it is cut.
@@ -267,13 +340,11 @@ pub(crate) fn sidebar(
 
     // The header is the window's drag area. It is registered first, so the
     // buttons on it stay on top and keep their clicks.
-    // The host switcher sits above the PROJECTS row, not inside the scrolling
-    // list, so "PROJECTS" and its buttons head the projects and nothing else.
-    let hosts_height = crate::hosts::section_height(input.hosts.len());
-    let header_rect = Rect::from_min_size(
-        rect.min,
-        vec2(rect.width(), LIGHTS_BAND + hosts_height + HEAD_ROW),
-    );
+    // History, + and the host switcher share one row above the scrolling
+    // list. The switcher names what the list shows, so the list needs no
+    // heading of its own.
+    let hosts_height = crate::hosts::section_height();
+    let header_rect = Rect::from_min_size(rect.min, vec2(rect.width(), LIGHTS_BAND + hosts_height));
     let drag = ui.interact(
         header_rect,
         Id::unique("sidebar-drag"),
@@ -281,14 +352,18 @@ pub(crate) fn sidebar(
     );
     out.note(|| Hit::Header, header_rect);
 
-    let row_y = rect.min.y + LIGHTS_BAND + hosts_height + HEAD_ROW / 2.0 - 2.0;
+    let row_y = rect.min.y + LIGHTS_BAND + crate::hosts::DROPDOWN_HEIGHT / 2.0;
     let last_x = rect.max.x - 12.0 - ICON_BUTTON / 2.0;
+    // The buttons left of the switcher, from the list's left edge.
+    let mut next_x = rect.min.x + SIDE_PAD + LEFT_INSET + ICON_BUTTON / 2.0;
     // Without a band for the traffic lights (off macOS), the collapse button
-    // joins the PROJECTS row, left of History.
+    // joins the row too, first.
     let collapse_at = if LIGHTS_BAND > 0.0 {
         pos2(last_x, rect.min.y + LIGHTS_BAND / 2.0)
     } else {
-        pos2(last_x - 2.0 * (ICON_BUTTON + 2.0), row_y)
+        let at = pos2(next_x, row_y);
+        next_x += ICON_BUTTON + 2.0;
+        at
     };
     let collapse = icon_button(
         ui,
@@ -298,28 +373,21 @@ pub(crate) fn sidebar(
         false,
         icons::sidebar,
     );
-    painter.text(
-        pos2(rect.min.x + 16.0, row_y),
-        Align2::LEFT_CENTER,
-        "PROJECTS",
-        FontId::monospace(10.5),
-        theme::FAINT,
-    );
-    let plus = icon_button(
-        ui,
-        pos2(last_x, row_y),
-        "sidebar-open",
-        concat!("Open project  ", crate::platform::kbd!("O")),
-        false,
-        |p, c, col| icons::plus(p, c, 5.0, col),
-    );
     let clock = icon_button(
         ui,
-        pos2(plus.rect.center().x - ICON_BUTTON - 2.0, row_y),
+        pos2(next_x, row_y),
         "sidebar-history",
         concat!("History  ", crate::platform::kbd!("Y")),
         input.history_open,
         icons::clock,
+    );
+    let plus = icon_button(
+        ui,
+        pos2(next_x + ICON_BUTTON + 2.0, row_y),
+        "sidebar-open",
+        "Open project or new group",
+        false,
+        |p, c, col| icons::plus(p, c, 5.0, col),
     );
     out.note(|| Hit::Collapse, collapse.rect);
     out.note(|| Hit::HeaderPlus, plus.rect);
@@ -327,16 +395,35 @@ pub(crate) fn sidebar(
     if collapse.clicked() {
         out.commands.push(Command::ToggleSidebar);
     }
-    if plus.clicked() {
-        out.commands.push(Command::OpenProject);
-    }
+    let plus_rect = plus.rect;
+    egui::Popup::menu(&plus).show(|ui| {
+        let open = ui.button(concat!("Open project…  ", crate::platform::kbd!("O")));
+        out.note(|| Hit::PlusOpenProject, open.rect);
+        if open.clicked() {
+            out.commands.push(Command::OpenProject);
+        }
+        let new = ui.button("New project…");
+        out.note(|| Hit::PlusNewProject, new.rect);
+        if new.clicked() {
+            out.commands.push(Command::NewProject);
+        }
+        let group = ui.button("New group…");
+        out.note(|| Hit::PlusNewGroup, group.rect);
+        if group.clicked() {
+            out.commands.push(Command::NewGroup);
+        }
+    });
     if clock.clicked() {
         out.commands.push(Command::History);
     }
-    header::window_gestures(ui, &drag, &[collapse.rect, plus.rect, clock.rect]);
-    let hosts_rect = Rect::from_min_size(
-        pos2(rect.min.x + SIDE_PAD, rect.min.y + LIGHTS_BAND),
-        vec2(rect.width() - SIDE_PAD * 2.0 - 1.0, hosts_height),
+    header::window_gestures(ui, &drag, &[collapse.rect, plus_rect, clock.rect]);
+    // The switcher keeps its own inset as the gap after +.
+    let hosts_rect = Rect::from_min_max(
+        pos2(plus_rect.max.x + 2.0, rect.min.y + LIGHTS_BAND),
+        pos2(
+            rect.max.x - SIDE_PAD - 1.0,
+            rect.min.y + LIGHTS_BAND + hosts_height,
+        ),
     );
     ui.scope_builder(egui::UiBuilder::new().max_rect(hosts_rect), |ui| {
         ui.spacing_mut().item_spacing.y = 1.0;
@@ -360,10 +447,18 @@ pub(crate) fn sidebar(
             .id_salt("project-tree")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                ui.set_width(body.width() - SIDE_PAD * 2.0);
-                ui.add_space(0.0);
-                tree.body(ui);
+                // The same margin on both sides, so the list lines up with the
+                // host switcher above it.
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin {
+                        left: SIDE_PAD as i8,
+                        ..egui::Margin::ZERO
+                    })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.set_width(body.width() - SIDE_PAD * 2.0);
+                        tree.body(ui);
+                    });
             });
     });
 
@@ -439,6 +534,10 @@ impl Tree<'_, '_> {
     fn body(&mut self, ui: &mut Ui) {
         let snap = self.input.snap;
 
+        let new_group = self
+            .rename
+            .as_deref()
+            .is_some_and(|rename| rename.target == RenameTarget::NewGroup);
         if snap.ws.projects.is_empty() {
             ui.add_space(8.0);
             let (rect, _) =
@@ -457,25 +556,348 @@ impl Tree<'_, '_> {
                 FontId::proportional(12.0),
                 theme::FAINT,
             );
+            // Groups can be made before any project is open.
+            if !new_group && !self.input.grouping() {
+                return;
+            }
+        }
+        if !self.input.grouping() {
+            if new_group {
+                self.new_group_row(ui);
+            }
+            for index in 0..snap.ws.projects.len() {
+                self.entry(ui, index);
+            }
+            ui.add_space(8.0);
             return;
         }
-        for (index, project) in snap.ws.projects.iter().enumerate() {
-            if index > 0 {
-                ui.add_space(5.0);
+        self.filter_row(ui);
+        match self.input.group_filter {
+            GroupFilter::All => {
+                if new_group {
+                    self.new_group_row(ui);
+                }
+                for group in &snap.ws.groups {
+                    let members: Vec<usize> = (0..snap.ws.projects.len())
+                        .filter(|i| self.input.group_of(&snap.ws.projects[*i]) == Some(&group.id))
+                        .collect();
+                    let folded = self.input.folded_groups.contains(&group.id);
+                    self.group_row(ui, Some(group), members.len(), folded);
+                    if !folded {
+                        for index in members {
+                            self.grouped_entry(ui, index);
+                        }
+                    }
+                }
+                let loose: Vec<usize> = (0..snap.ws.projects.len())
+                    .filter(|i| self.input.group_of(&snap.ws.projects[*i]).is_none())
+                    .collect();
+                // The projects in no group follow without a header. While a
+                // project in a group is dragged, a drop zone is the way out.
+                let leaving = egui::DragAndDrop::payload::<ProjectDrag>(ui.ctx())
+                    .is_some_and(|drag| drag.group.is_some());
+                if leaving {
+                    self.group_row(ui, None, loose.len(), false);
+                }
+                for index in loose {
+                    self.entry(ui, index);
+                }
             }
-            let view = snap.views.get(index).and_then(|view| view.as_deref());
-            self.project(ui, index, project, view);
-            // Only the selected project lists its terminals.
-            if !project.expanded || self.input.active != Some(index) {
-                continue;
-            }
-            if let Some(error) = &project.error {
-                self.error_line(ui, error);
-            } else if let Some(view) = view {
-                self.terminals(ui, index, project, view);
+            GroupFilter::Group(_) | GroupFilter::Ungrouped => {
+                let mut any = false;
+                for (index, project) in snap.ws.projects.iter().enumerate() {
+                    if self.input.listed(project) {
+                        any = true;
+                        self.entry(ui, index);
+                    }
+                }
+                if !any {
+                    ui.add_space(6.0);
+                    let (rect, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+                    ui.painter().text(
+                        rect.left_center() + vec2(8.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        "No project here.",
+                        FontId::proportional(12.0),
+                        theme::FAINT,
+                    );
+                }
             }
         }
         ui.add_space(8.0);
+    }
+
+    /// A project under its group's header: drawn a step to the right, so it
+    /// reads as part of the group.
+    fn grouped_entry(&mut self, ui: &mut Ui, index: usize) {
+        ui.scope(|ui| {
+            ui.spacing_mut().indent = GROUP_INDENT;
+            ui.indent(("group-member", index), |ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                self.entry(ui, index);
+            });
+        });
+    }
+
+    /// One project and, when it is the open one, its terminals.
+    fn entry(&mut self, ui: &mut Ui, index: usize) {
+        let snap = self.input.snap;
+        let project = &snap.ws.projects[index];
+        ui.add_space(5.0);
+        let view = snap.views.get(index).and_then(|view| view.as_deref());
+        self.project(ui, index, project, view);
+        // Only the selected project lists its terminals.
+        if !project.expanded || self.input.active != Some(index) {
+            return;
+        }
+        if let Some(error) = &project.error {
+            self.error_line(ui, error);
+        } else if let Some(view) = view {
+            self.terminals(ui, index, project, view);
+        }
+    }
+
+    /// The group filter: All projects, each group, No group.
+    fn filter_row(&mut self, ui: &mut Ui) {
+        let snap = self.input.snap;
+        let label = match self.input.group_filter {
+            GroupFilter::All => "All projects".to_owned(),
+            GroupFilter::Ungrouped => "No group".to_owned(),
+            GroupFilter::Group(id) => snap
+                .ws
+                .groups
+                .iter()
+                .find(|g| g.id == *id)
+                .map_or_else(|| "All projects".to_owned(), |g| g.name.clone()),
+        };
+        let (full, _) =
+            ui.allocate_exact_size(vec2(ui.available_width(), FILTER_ROW), Sense::hover());
+        let rect = inset(full);
+        let button = ui.interact(rect, Id::unique("group-filter"), Sense::click());
+        let painter = ui.painter();
+        let fill = if button.hovered() {
+            theme::ROW_HOVER
+        } else {
+            theme::RAISED_BG
+        };
+        painter.rect_filled(rect.shrink2(vec2(0.0, 2.0)), 7.0, fill);
+        painter.rect_stroke(
+            rect.shrink2(vec2(0.0, 2.0)),
+            7.0,
+            Stroke::new(1.0, theme::BORDER),
+            StrokeKind::Inside,
+        );
+        let galley = fit(
+            painter,
+            &format!("Show: {label}"),
+            FontId::proportional(12.0),
+            theme::TEXT,
+            rect.width() - 34.0,
+        );
+        painter.galley(
+            pos2(rect.min.x + 10.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            theme::TEXT,
+        );
+        icons::twisty(
+            painter,
+            pos2(rect.max.x - 14.0, rect.center().y),
+            true,
+            theme::TEXT_MUTED,
+        );
+        button.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::accesskit::Role::ComboBox,
+                true,
+                format!("Show projects: {label}"),
+            )
+        });
+        self.out.note(|| Hit::GroupFilter, rect);
+        let out = &mut *self.out;
+        egui::Popup::menu(&button).show(|ui| {
+            let mut item = |ui: &mut Ui, key: String, text: &str, filter: GroupFilter, on: bool| {
+                let response = ui.selectable_label(on, text);
+                out.note(|| Hit::GroupFilterItem(key), response.rect);
+                if response.clicked() {
+                    out.commands.push(Command::FilterGroups(filter));
+                }
+            };
+            let current = self.input.group_filter;
+            item(
+                ui,
+                "all".to_owned(),
+                "All projects",
+                GroupFilter::All,
+                *current == GroupFilter::All,
+            );
+            for group in &snap.ws.groups {
+                let filter = GroupFilter::Group(group.id.clone());
+                let on = *current == filter;
+                item(ui, group.id.clone(), &group.name, filter, on);
+            }
+            item(
+                ui,
+                "ungrouped".to_owned(),
+                "No group",
+                GroupFilter::Ungrouped,
+                *current == GroupFilter::Ungrouped,
+            );
+        });
+    }
+
+    /// The field that names a new group, where its header will be.
+    fn new_group_row(&mut self, ui: &mut Ui) {
+        ui.add_space(5.0);
+        let (full, _) =
+            ui.allocate_exact_size(vec2(ui.available_width(), GROUP_ROW), Sense::hover());
+        let rect = inset(full);
+        if let Some(rename) = self.rename.as_deref_mut() {
+            self.out.rename_drawn = true;
+            let field = Rect::from_min_max(
+                pos2(rect.min.x + 26.0, rect.min.y + 2.0),
+                pos2(rect.max.x - 6.0, rect.max.y - 2.0),
+            );
+            self.out.rename_end = rename
+                .edit(ui, field, FontId::proportional(12.5))
+                .or(self.out.rename_end.take());
+        }
+    }
+
+    /// A group's header. Click folds it; a project dropped on it joins it.
+    /// `None` is the drop zone that takes a dragged project out of its group.
+    fn group_row(
+        &mut self,
+        ui: &mut Ui,
+        group: Option<&connecto_core::ProjectGroup>,
+        count: usize,
+        folded: bool,
+    ) {
+        ui.add_space(8.0);
+        let (full, _) =
+            ui.allocate_exact_size(vec2(ui.available_width(), GROUP_ROW), Sense::hover());
+        let rect = inset(full);
+        let key = group.map_or("group-ungrouped", |g| g.id.as_str());
+        let row = ui.interact(rect, Id::unique(("tree-group", key)), Sense::click());
+        let target = group.map(|g| g.id.clone());
+        let dragged = row.dnd_hover_payload::<ProjectDrag>();
+        let accepts = dragged.as_ref().is_some_and(|drag| drag.group != target);
+        let painter = ui.painter();
+        if accepts {
+            painter.rect_filled(rect, 7.0, theme::CYAN.gamma_multiply(0.15));
+            painter.rect_stroke(rect, 7.0, Stroke::new(1.0, theme::CYAN), StrokeKind::Inside);
+        } else if row.hovered() && group.is_some() {
+            painter.rect_filled(rect, 7.0, theme::ROW_HOVER);
+        }
+        let center_y = rect.center().y;
+        if group.is_some() {
+            icons::twisty(
+                painter,
+                pos2(rect.min.x + 14.0, center_y),
+                !folded,
+                theme::FAINT,
+            );
+        }
+        let name = group.map_or("Remove from group", |g| g.name.as_str());
+        let renaming = group.and_then(|g| {
+            self.rename
+                .as_deref_mut()
+                .filter(|rename| rename.target == RenameTarget::Group(g.id.clone()))
+        });
+        if let Some(rename) = renaming {
+            self.out.rename_drawn = true;
+            let field = Rect::from_min_max(
+                pos2(rect.min.x + 26.0, rect.min.y + 2.0),
+                pos2(rect.max.x - 6.0, rect.max.y - 2.0),
+            );
+            self.out.rename_end = rename
+                .edit(ui, field, FontId::proportional(12.5))
+                .or(self.out.rename_end.take());
+        } else {
+            let painter = ui.painter();
+            // The drop zone shows no count.
+            let count_x = if group.is_some() {
+                let count_galley = painter.layout_no_wrap(
+                    count.to_string(),
+                    FontId::monospace(10.5),
+                    theme::FAINT,
+                );
+                let count_x = rect.max.x - 8.0 - count_galley.size().x;
+                painter.galley(
+                    pos2(count_x, center_y - count_galley.size().y / 2.0),
+                    count_galley,
+                    theme::FAINT,
+                );
+                count_x
+            } else {
+                rect.max.x - 8.0
+            };
+            let galley = fit(
+                painter,
+                &name.to_uppercase(),
+                FontId::monospace(10.5),
+                theme::TEXT_MUTED,
+                count_x - rect.min.x - 34.0,
+            );
+            painter.galley(
+                pos2(rect.min.x + 26.0, center_y - galley.size().y / 2.0),
+                galley,
+                theme::TEXT_MUTED,
+            );
+        }
+        self.out.note(
+            || group.map_or(Hit::Ungrouped, |g| Hit::Group(g.id.clone())),
+            rect,
+        );
+        row.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::accesskit::Role::Button,
+                true,
+                !folded,
+                if group.is_some() {
+                    format!("Group {name}, {count} projects")
+                } else {
+                    name.to_owned()
+                },
+            )
+        });
+        if let Some(drag) = row.dnd_release_payload::<ProjectDrag>()
+            && drag.group != target
+        {
+            self.out
+                .commands
+                .push(Command::SetProjectGroup(drag.id.clone(), target.clone()));
+        }
+        let Some(group) = group else { return };
+        // A host's group folds here; it is renamed and deleted there.
+        if self.input.snap.is_remote() {
+            if row.clicked() {
+                self.out
+                    .commands
+                    .push(Command::ToggleGroup(group.id.clone()));
+            }
+            return;
+        }
+        if row.double_clicked() {
+            self.out
+                .commands
+                .push(Command::RenameGroupAt(group.id.clone()));
+        } else if row.clicked() {
+            self.out
+                .commands
+                .push(Command::ToggleGroup(group.id.clone()));
+        }
+        row.context_menu(|ui| {
+            for (label, command) in [
+                ("Rename group…", Command::RenameGroupAt(group.id.clone())),
+                ("Delete group", Command::DeleteGroupAt(group.id.clone())),
+            ] {
+                if ui.button(label).clicked() {
+                    self.out.commands.push(command);
+                    ui.close();
+                }
+            }
+        });
     }
 
     fn error_line(&mut self, ui: &mut Ui, error: &str) {
@@ -509,7 +931,33 @@ impl Tree<'_, '_> {
         let id = project.id.as_str();
         let active = self.input.active == Some(index);
         let open = project.expanded && active;
-        let row = ui.interact(rect, Id::unique(("tree-project", id)), Sense::click());
+        // A remote project's name and closing are its machine's: neither is
+        // offered here. Its history and settings are read from that machine,
+        // unless the host lists no projects (then there is none to name).
+        let remote = self.input.snap.is_remote();
+        let panels = !id.starts_with("remote-host:");
+        // With groups, a project is dragged onto a group (or a project in it)
+        // to join that group.
+        let grouping = self.input.regrouping();
+        let sense = if grouping {
+            Sense::click_and_drag()
+        } else {
+            Sense::click()
+        };
+        let row = ui.interact(rect, Id::unique(("tree-project", id)), sense);
+        let group = self.input.group_of(project).map(str::to_owned);
+        if grouping {
+            row.dnd_set_drag_payload(ProjectDrag {
+                id: id.to_owned(),
+                group: group.clone(),
+            });
+            if row.dragged() {
+                drag_ghost(ui.ctx(), &project.name);
+            }
+        }
+        let drop_here = row
+            .dnd_hover_payload::<ProjectDrag>()
+            .filter(|drag| drag.id != id && drag.group != group);
         let painter = ui.painter();
         if active {
             painter.rect_filled(rect, 8.0, theme::ROW_ACTIVE);
@@ -530,17 +978,31 @@ impl Tree<'_, '_> {
         } else if row.contains_pointer() {
             painter.rect_filled(rect, 8.0, theme::ROW_HOVER);
         }
+        if drop_here.is_some() {
+            painter.rect_stroke(rect, 8.0, Stroke::new(1.0, theme::CYAN), StrokeKind::Inside);
+        }
+        if let Some(drag) = row.dnd_release_payload::<ProjectDrag>()
+            && drag.id != id
+            && drag.group != group
+        {
+            self.out
+                .commands
+                .push(Command::SetProjectGroup(drag.id.clone(), group.clone()));
+        }
         let center_y = rect.center().y;
 
         let twisty_rect = Rect::from_min_size(rect.min, vec2(26.0, PROJECT_ROW));
         let twisty = ui.interact(twisty_rect, Id::unique(("tree-twisty", id)), Sense::click());
         let painter = ui.painter();
-        icons::twisty(
+        // A project is a folder: open while its terminals are listed.
+        icons::folder(
             painter,
-            pos2(rect.min.x + 14.0, center_y),
+            pos2(rect.min.x + 15.0, center_y),
             open,
             if twisty.hovered() {
                 theme::TEXT
+            } else if active {
+                theme::TEXT_MUTED
             } else {
                 theme::FAINT
             },
@@ -554,7 +1016,7 @@ impl Tree<'_, '_> {
             )
         });
         let dot = project_dot(self.input.seen, project, view);
-        dot.paint(painter, pos2(rect.min.x + 33.0, center_y), self.input.time);
+        dot.paint(painter, pos2(rect.min.x + 36.0, center_y), self.input.time);
 
         // Right side: history on hover or when active, the count when folded.
         let mut right = rect.max.x - 6.0;
@@ -570,7 +1032,7 @@ impl Tree<'_, '_> {
             );
             right -= 6.0;
         }
-        let show_clock = active || row.contains_pointer();
+        let show_clock = (active || row.contains_pointer()) && panels;
         let mut clock_rect = None;
         if show_clock {
             let center = pos2(right - ICON_BUTTON / 2.0, center_y);
@@ -648,9 +1110,48 @@ impl Tree<'_, '_> {
             }
             right -= ICON_BUTTON + 2.0;
         }
+        // The project's operations, left of the gear, once it has any.
+        let mut ops_rect = None;
+        if show_clock && let Some(waiting) = self.input.ops.get(id).copied() {
+            let center = pos2(right - ICON_BUTTON / 2.0, center_y);
+            let bolt = ui.interact(
+                Rect::from_center_size(center, Vec2::splat(ICON_BUTTON)),
+                Id::unique(("tree-ops", id)),
+                Sense::click(),
+            );
+            let painter = ui.painter();
+            if bolt.hovered() {
+                painter.rect_filled(bolt.rect, 6.0, theme::RAISED_BG);
+            }
+            icons::bolt(
+                painter,
+                center,
+                if bolt.hovered() {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_MUTED
+                },
+            );
+            if waiting {
+                painter.circle_filled(center + vec2(5.5, -5.5), 2.5, theme::CYAN);
+            }
+            bolt.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::accesskit::Role::Button,
+                    true,
+                    format!("Operations of {}", project.name),
+                )
+            });
+            self.out.note(|| Hit::Ops(id.to_owned()), bolt.rect);
+            ops_rect = Some(bolt.rect);
+            if bolt.on_hover_text("Operations").clicked() {
+                self.out.commands.push(Command::OperationsOf(id.to_owned()));
+            }
+            right -= ICON_BUTTON + 2.0;
+        }
 
         // The name, or the field that renames it.
-        let name_left = rect.min.x + 46.0;
+        let name_left = rect.min.x + 49.0;
         let name_rect = Rect::from_min_max(
             pos2(name_left, rect.min.y + 3.0),
             pos2(right, rect.max.y - 3.0),
@@ -700,6 +1201,7 @@ impl Tree<'_, '_> {
                 twisty.rect.contains(pos)
                     || clock_rect.is_some_and(|rect| rect.contains(pos))
                     || gear_rect.is_some_and(|rect| rect.contains(pos))
+                    || ops_rect.is_some_and(|rect| rect.contains(pos))
             })
         };
         let row = row.on_hover_text(project.path.as_str());
@@ -712,28 +1214,68 @@ impl Tree<'_, '_> {
                 .commands
                 .push(Command::SetExpanded(id.to_owned(), !open));
         } else if row.double_clicked() && !on_control(row.interact_pointer_pos()) {
-            self.out
-                .commands
-                .push(Command::RenameProjectAt(id.to_owned()));
+            if !remote {
+                self.out
+                    .commands
+                    .push(Command::RenameProjectAt(id.to_owned()));
+            }
         } else if row.clicked() && !on_control(row.interact_pointer_pos()) {
             self.out.commands.push(Command::Activate(id.to_owned()));
         }
-        row.context_menu(|ui| {
-            for (label, command) in [
-                ("Rename project…", Command::RenameProjectAt(id.to_owned())),
-                ("History", Command::HistoryOf(id.to_owned())),
-                (
-                    "Project settings…",
-                    Command::ProjectSettingsAt(id.to_owned()),
-                ),
-                ("Close project", Command::CloseProjectAt(id.to_owned())),
-            ] {
-                if ui.button(label).clicked() {
-                    self.out.commands.push(command);
-                    ui.close();
+        if remote && panels {
+            row.context_menu(|ui| {
+                for (label, command) in [
+                    ("History", Command::HistoryOf(id.to_owned())),
+                    (
+                        "Project settings…",
+                        Command::ProjectSettingsAt(id.to_owned()),
+                    ),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.out.commands.push(command);
+                        ui.close();
+                    }
                 }
-            }
-        });
+            });
+        }
+        if !remote {
+            row.context_menu(|ui| {
+                for (label, command) in [
+                    ("Rename project…", Command::RenameProjectAt(id.to_owned())),
+                    ("History", Command::HistoryOf(id.to_owned())),
+                    (
+                        "Project settings…",
+                        Command::ProjectSettingsAt(id.to_owned()),
+                    ),
+                    ("Close project", Command::CloseProjectAt(id.to_owned())),
+                    ("Delete project…", Command::DeleteProjectAt(id.to_owned())),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.out.commands.push(command);
+                        ui.close();
+                    }
+                }
+                let groups = &self.input.snap.ws.groups;
+                if !groups.is_empty() {
+                    ui.menu_button("Move to group", |ui| {
+                        let choices = groups
+                            .iter()
+                            .map(|g| (Some(g.id.clone()), g.name.as_str()))
+                            .chain([(None, "No group")]);
+                        for (target, label) in choices {
+                            if ui.selectable_label(group == target, label).clicked() {
+                                if group != target {
+                                    self.out
+                                        .commands
+                                        .push(Command::SetProjectGroup(id.to_owned(), target));
+                                }
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+            });
+        }
     }
 
     fn terminals(
@@ -780,6 +1322,9 @@ impl Tree<'_, '_> {
                 kid_counts.get(entry.id.as_str()).copied().unwrap_or(0)
             };
             let rect = self.terminal_row(ui, pid, entry, node.child, shown, kids);
+            if background_open(ui, pid, entry) {
+                self.background_rows(ui, pid, entry, node.child);
+            }
             if !node.child && kids > 0 {
                 line = Some((rect.min.x + 10.0, rect.max.y, f32::NAN));
             } else if let Some(line) = line.as_mut() {
@@ -875,6 +1420,49 @@ impl Tree<'_, '_> {
             }
             kids_rect = Some(zone);
             right -= 36.0;
+        }
+        // The arrow that opens the list of background tasks, shown while any
+        // runs. The tasks, each with its own stop, are rows under this one,
+        // so the state line keeps saying the state.
+        let mut list_rect = None;
+        if !entry.background.is_empty() {
+            let open = background_open(ui, pid, entry);
+            let center = pos2(right - 8.0, center_y);
+            let zone = Rect::from_center_size(center, Vec2::splat(20.0));
+            let toggle = ui.interact(zone, Id::unique(("tree-bg-list", pid, tid)), Sense::click());
+            let painter = ui.painter();
+            if toggle.hovered() {
+                painter.circle_filled(center, 9.0, theme::RAISED_BG);
+            }
+            let color = if toggle.hovered() {
+                theme::TEXT
+            } else if long_running(entry, Instant::now()) {
+                theme::LONG_RUNNING
+            } else {
+                theme::TEXT_MUTED
+            };
+            icons::twisty(painter, center, open, color);
+            let count = entry.background.len();
+            toggle.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::accesskit::Role::Button,
+                    true,
+                    open,
+                    format!("{count} background tasks of {}", title(entry)),
+                )
+            });
+            self.out
+                .note(|| Hit::BackgroundList(pid.to_owned(), tid.to_owned()), zone);
+            let tip = match (open, count) {
+                (true, _) => "Hide the background tasks".to_owned(),
+                (false, 1) => "Show the background task".to_owned(),
+                (false, n) => format!("Show the {n} background tasks"),
+            };
+            if toggle.on_hover_text(tip).clicked() {
+                set_background_open(ui, pid, entry, !open);
+            }
+            list_rect = Some(zone);
+            right -= 24.0;
         }
         let mut close_rect = None;
         if hovered || done_child || shown {
@@ -977,7 +1565,7 @@ impl Tree<'_, '_> {
             right -= 24.0;
         }
 
-        // Two lines: the name, then the state (the id is on hover).
+        // Two lines: the name, then the id and the state.
         let text_left = rect.min.x + 26.0;
         let width = (right - text_left).max(20.0);
         let name_color = if shown {
@@ -1008,19 +1596,51 @@ impl Tree<'_, '_> {
             let galley = fit(painter, title(entry), name_font, name_color, width);
             painter.galley(pos2(text_left, rect.min.y + 6.0), galley, name_color);
         }
-        let meta = meta_line(entry, dot);
-        let meta_color = if shown || hovered {
+        let now = Instant::now();
+        let meta = meta_line(entry, dot, now);
+        let meta_color = if long_running(entry, now) {
+            theme::LONG_RUNNING
+        } else if shown || hovered {
             theme::TEXT_MUTED
         } else {
             theme::FAINT
         };
+        let meta_y = rect.min.y + (height - 15.0);
+        let mut meta_left = text_left;
         let painter = ui.painter();
-        let galley = fit(painter, &meta, FontId::monospace(10.5), meta_color, width);
-        painter.galley(
-            pos2(text_left, rect.min.y + (height - 15.0)),
-            galley,
+        // The id agents use (`claude-41`), left of the state, so a row can be
+        // matched to what `connecto list` prints. The state comes first: the
+        // id takes what the state leaves, and is left out (it stays in the
+        // tooltip) when too little is left; the state is cut only when it
+        // alone does not fit.
+        let meta_font = FontId::monospace(10.5);
+        let room = (right - meta_left).max(20.0);
+        // The longest form of the state that fits, else the shortest.
+        let forms = meta_lines(entry, dot, now);
+        let (meta, state_width) = forms
+            .iter()
+            .map(|form| {
+                let galley = painter.layout_no_wrap(form.clone(), meta_font.clone(), meta_color);
+                (form.clone(), galley.size().x)
+            })
+            .find(|(_, width)| *width <= room)
+            .unwrap_or_else(|| (forms.last().cloned().unwrap_or(meta), room));
+        if let Some(width) = id_room(room, state_width) {
+            let id = row_id(entry);
+            let id_color = if shown { theme::CYAN } else { theme::TEXT_ROW };
+            let galley = fit(painter, &id, meta_font.clone(), id_color, width);
+            let used = galley.size().x;
+            painter.galley(pos2(meta_left, meta_y), galley, id_color);
+            meta_left += used + ID_GAP;
+        }
+        let galley = fit(
+            painter,
+            &meta,
+            meta_font,
             meta_color,
+            (right - meta_left).max(20.0),
         );
+        painter.galley(pos2(meta_left, meta_y), galley, meta_color);
 
         self.out
             .note(|| Hit::Terminal(pid.to_owned(), tid.to_owned()), rect);
@@ -1033,13 +1653,14 @@ impl Tree<'_, '_> {
                     "{}, {}, {}",
                     title(entry),
                     entry.tool.name(),
-                    state_words(entry, dot)
+                    state_line(entry, dot, now)
                 ),
             )
         });
         let on_control = |pos: Option<Pos2>| {
             pos.is_some_and(|pos| {
                 kids_rect.is_some_and(|rect| rect.contains(pos))
+                    || list_rect.is_some_and(|rect| rect.contains(pos))
                     || close_rect.is_some_and(|rect| rect.contains(pos))
                     || robot_rect.is_some_and(|rect| rect.contains(pos))
             })
@@ -1060,10 +1681,12 @@ impl Tree<'_, '_> {
             entry.state,
             TermActivity::Exited | TermActivity::Failed | TermActivity::NotStarted
         );
-        if entry.name.is_some() {
-            row.clone()
-                .on_hover_text(format!("Terminal id: {}", entry.id));
+        let tip = row_tip(entry, now);
+        if !tip.is_empty() {
+            row.clone().on_hover_text(tip);
         }
+        let background = !entry.background.is_empty();
+        let shells = entry.background.iter().any(|work| work.is_shell());
         row.context_menu(|ui| {
             let mut commands = vec![(
                 "Rename…",
@@ -1103,8 +1726,121 @@ impl Tree<'_, '_> {
                     ui.close();
                 }
             }
+            if background {
+                ui.separator();
+                let stop = ui
+                    .add_enabled(shells, egui::Button::new("Stop background shells"))
+                    .on_disabled_hover_text(NOT_A_SHELL);
+                if stop.clicked() {
+                    self.out.commands.push(Command::StopBackgroundAt {
+                        project: pid.to_owned(),
+                        terminal: tid.to_owned(),
+                        task: None,
+                    });
+                    ui.close();
+                }
+            }
         });
         rect
+    }
+
+    /// The square stop button centred on `center`; `task` names the one
+    /// background task it stops, `None` all the terminal's shells. Returns
+    /// where it is.
+    fn stop_button(
+        &mut self,
+        ui: &mut Ui,
+        center: Pos2,
+        pid: &str,
+        tid: &str,
+        task: Option<String>,
+        what: &str,
+    ) -> Rect {
+        let zone = Rect::from_center_size(center, Vec2::splat(20.0));
+        let button = ui.interact(
+            zone,
+            Id::unique(("tree-bg-stop", pid, tid, task.as_deref().unwrap_or(""))),
+            Sense::click(),
+        );
+        let painter = ui.painter();
+        if button.hovered() {
+            painter.circle_filled(center, 9.0, theme::CORAL_BG);
+        }
+        let color = if button.hovered() {
+            theme::CORAL_SOFT
+        } else {
+            theme::TEXT_MUTED
+        };
+        icons::stop(painter, center, 3.5, color);
+        button.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::accesskit::Role::Button, true, what.to_owned())
+        });
+        self.out.note(
+            || Hit::StopBackground(pid.to_owned(), tid.to_owned(), task.clone()),
+            zone,
+        );
+        if button.on_hover_text(what).clicked() {
+            self.out.commands.push(Command::StopBackgroundAt {
+                project: pid.to_owned(),
+                terminal: tid.to_owned(),
+                task,
+            });
+        }
+        zone
+    }
+
+    /// The open list of a terminal's background tasks: one short row each,
+    /// what it is for, how long it has run, and a stop for a shell.
+    fn background_rows(&mut self, ui: &mut Ui, pid: &str, entry: &TerminalEntry, child: bool) {
+        let now = Instant::now();
+        let indent = if child { 39.0 } else { 20.0 } + 26.0;
+        for work in &entry.background {
+            let (full, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), BACKGROUND_ROW), Sense::hover());
+            let rect = Rect::from_min_max(pos2(full.min.x + indent, full.min.y), full.max);
+            let row = ui.interact(
+                rect,
+                Id::unique(("tree-bg-row", pid, entry.id.as_str(), work.id.as_str())),
+                Sense::hover(),
+            );
+            let center_y = rect.center().y;
+            let mut right = rect.max.x - 8.0;
+            if work.is_shell() {
+                let what = format!("Stop {}", task_title(work));
+                self.stop_button(
+                    ui,
+                    pos2(right - 8.0, center_y),
+                    pid,
+                    &entry.id,
+                    Some(work.id.clone()),
+                    &what,
+                );
+            }
+            right -= 24.0;
+            let color = if row.hovered() {
+                theme::TEXT_MUTED
+            } else {
+                theme::FAINT
+            };
+            let painter = ui.painter();
+            let age =
+                painter.layout_no_wrap(short_age(work.age(now)), FontId::monospace(10.0), color);
+            let age_left = right - age.size().x;
+            painter.galley(pos2(age_left, center_y - age.size().y / 2.0), age, color);
+            let text = fit(
+                painter,
+                &task_title(work),
+                FontId::proportional(11.0),
+                color,
+                (age_left - 6.0 - rect.min.x).max(20.0),
+            );
+            painter.galley(
+                pos2(rect.min.x, center_y - text.size().y / 2.0),
+                text,
+                color,
+            );
+            row.on_hover_text(task_tip(work, now));
+        }
     }
 
     fn new_row(&mut self, ui: &mut Ui, pid: &str, project_name: &str, view: &TerminalsView) {
@@ -1181,6 +1917,30 @@ impl Tree<'_, '_> {
     }
 }
 
+/// The name of the project being dragged, following the pointer.
+/// A row moved right by [`LEFT_INSET`], so the dropdowns and group headers
+/// line up with the host switcher instead of the list's edge.
+fn inset(rect: Rect) -> Rect {
+    Rect::from_min_max(pos2(rect.min.x + LEFT_INSET, rect.min.y), rect.max)
+}
+
+fn drag_ghost(ctx: &egui::Context, name: &str) {
+    static GHOST: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
+    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+    let Some(pos) = ctx.pointer_interact_pos() else {
+        return;
+    };
+    egui::Area::new(*GHOST.get_or_init(|| Id::unique("project-drag-ghost")))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(pos + vec2(12.0, 12.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(egui::RichText::new(name).color(Color32::WHITE));
+            });
+        });
+}
+
 fn finish_line(ui: &Ui, line: Option<(f32, f32, f32)>) {
     if let Some((x, top, bottom)) = line
         && bottom.is_finite()
@@ -1208,11 +1968,185 @@ fn parent_of<'a>(view: &'a TerminalsView, entry: &'a TerminalEntry) -> Option<&'
 /// The second line of a row: the state, or who asked for a child. The id is
 /// the title of an unnamed terminal; a named one shows it on hover and in
 /// `connecto list`.
-pub(crate) fn meta_line(entry: &TerminalEntry, dot: Dot) -> String {
+/// What the stop says when only subagents, monitors or workflows run.
+pub(crate) const NOT_A_SHELL: &str =
+    "Only background shells can be stopped. Subagents, monitors and workflows end on their own.";
+
+/// The gap between a row's id and its state.
+const ID_GAP: f32 = 7.0;
+/// The least room an id is shown in; less would leave two letters and a `…`.
+const MIN_ID: f32 = 32.0;
+
+/// The room a row's id gets on the second line: what a state `state` wide
+/// leaves of `room`. `None` when that is too little to show it.
+pub(crate) fn id_room(room: f32, state: f32) -> Option<f32> {
+    let left = room - state - ID_GAP;
+    (left >= MIN_ID).then_some(left)
+}
+
+/// The id a terminal row shows left of its state, on every row: the one the
+/// CLI and agents use (`claude`, `codex-27`), never a second numbering.
+/// Antigravity's long tool name is shortened to `agy` (`agy-3`) to fit.
+pub(crate) fn row_id(entry: &TerminalEntry) -> std::borrow::Cow<'_, str> {
+    let id = entry.display_id();
+    match id.strip_prefix("antigravity") {
+        Some(rest) if rest.is_empty() || rest.starts_with('-') => format!("agy{rest}").into(),
+        _ => id.into(),
+    }
+}
+
+/// The second line of a terminal row: who asked it, or its state. With
+/// only background work at the prompt: `<n> in background · <oldest's age>`.
+pub(crate) fn meta_line(entry: &TerminalEntry, dot: Dot, now: Instant) -> String {
     match &entry.asked_by {
         Some(asker) => format!("asked by {asker}"),
-        None => state_words(entry, dot).to_owned(),
+        None => state_line(entry, dot, now),
     }
+}
+
+/// [`meta_line`] and its shorter forms, longest first, for a narrow row:
+/// background work drops its count, then its age (both stay in the list and
+/// the tooltip).
+pub(crate) fn meta_lines(entry: &TerminalEntry, dot: Dot, now: Instant) -> Vec<String> {
+    let full = meta_line(entry, dot, now);
+    match entry.background.first() {
+        Some(oldest) if entry.asked_by.is_none() && only_background(entry, dot) => vec![
+            full,
+            format!("background · {}", short_age(oldest.age(now))),
+            "background".to_owned(),
+        ],
+        _ => vec![full],
+    }
+}
+
+/// Whether the terminal works only because background tasks run at its
+/// prompt: no turn is running.
+fn only_background(entry: &TerminalEntry, dot: Dot) -> bool {
+    !entry.background.is_empty() && dot == Dot::Working && !entry.in_turn
+}
+
+/// The state in words. When the terminal works only because background
+/// tasks run at its prompt, `<n> in background · <oldest's age>`; a task's
+/// own title is never put here, it is in the list the arrow opens.
+fn state_line(entry: &TerminalEntry, dot: Dot, now: Instant) -> String {
+    match entry.background.first() {
+        Some(oldest) if only_background(entry, dot) => format!(
+            "{} in background · {}",
+            entry.background.len(),
+            short_age(oldest.age(now))
+        ),
+        _ => state_words(entry, dot).to_owned(),
+    }
+}
+
+/// A background task in a few words: what the agent said it is for, or else
+/// what it runs.
+pub(crate) fn task_title(work: &BackgroundWork) -> String {
+    work.description
+        .clone()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| work.label.clone())
+}
+
+/// A background task's tooltip: what it is for, what it runs, its kind and age.
+fn task_tip(work: &BackgroundWork, now: Instant) -> String {
+    let mut lines = Vec::new();
+    if let Some(description) = &work.description {
+        lines.push(description.clone());
+    }
+    lines.push(work.label.clone());
+    lines.push(format!(
+        "{}, running for {}",
+        work.kind,
+        short_age(work.age(now))
+    ));
+    if !work.is_shell() {
+        lines.push(NOT_A_SHELL.to_owned());
+    }
+    lines.join("\n")
+}
+
+/// Whether a terminal's list of background tasks is open: closed until its
+/// arrow is clicked. An open list remembers the tasks it was opened on and
+/// stays open while any of them runs, so a later batch, after they all
+/// ended, starts closed even if the row was not drawn in between.
+fn background_open(ui: &Ui, pid: &str, entry: &TerminalEntry) -> bool {
+    let key = background_key(pid, &entry.id);
+    let Some(seen) = ui.data(|data| data.get_temp::<Vec<String>>(key)) else {
+        return false;
+    };
+    let ids = task_ids(entry);
+    let open = ids.iter().any(|id| seen.contains(id));
+    if !open {
+        ui.data_mut(|data| data.remove::<Vec<String>>(key));
+    } else if seen != ids {
+        ui.data_mut(|data| data.insert_temp(key, ids));
+    }
+    open
+}
+
+fn set_background_open(ui: &Ui, pid: &str, entry: &TerminalEntry, open: bool) {
+    let key = background_key(pid, &entry.id);
+    ui.data_mut(|data| {
+        if open {
+            data.insert_temp(key, task_ids(entry));
+        } else {
+            data.remove::<Vec<String>>(key);
+        }
+    });
+}
+
+fn task_ids(entry: &TerminalEntry) -> Vec<String> {
+    entry
+        .background
+        .iter()
+        .map(|work| work.id.clone())
+        .collect()
+}
+
+fn background_key(pid: &str, tid: &str) -> Id {
+    Id::unique(("tree-bg-open", pid, tid))
+}
+
+/// Whether the oldest background work has run for [`LONG_RUNNING`] or more.
+pub(crate) fn long_running(entry: &TerminalEntry, now: Instant) -> bool {
+    entry
+        .background
+        .first()
+        .is_some_and(|oldest| oldest.age(now) >= LONG_RUNNING)
+}
+
+/// A terminal row's tooltip: its id when it has a name, and the background
+/// work running, each with its age.
+pub(crate) fn row_tip(entry: &TerminalEntry, now: Instant) -> String {
+    let mut lines = Vec::new();
+    if entry.name.is_some() {
+        lines.push(format!("Terminal id: {}", entry.display_id()));
+    }
+    if !entry.background.is_empty() {
+        let long = if long_running(entry, now) {
+            ", running for a long time"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "Background work at the prompt{long}. The turn has not finished:"
+        ));
+        for work in &entry.background {
+            lines.push(format!(
+                "• {} ({}, {})",
+                task_title(work),
+                work.kind,
+                short_age(work.age(now))
+            ));
+        }
+        lines.push(if entry.background.iter().any(|work| work.is_shell()) {
+            "The arrow lists them; ■ stops one shell.".to_owned()
+        } else {
+            NOT_A_SHELL.to_owned()
+        });
+    }
+    lines.join("\n")
 }
 
 // ---------- the collapsed rail ----------
@@ -1294,6 +2228,9 @@ pub(crate) fn rail(ui: &mut Ui, rect: Rect, input: &TreeInput<'_>, out: &mut Tre
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| {
                 for (index, project) in input.snap.ws.projects.iter().enumerate() {
+                    if !input.listed(project) {
+                        continue;
+                    }
                     let view = input.snap.views.get(index).and_then(|view| view.as_deref());
                     tile(ui, input, index, project, view, out);
                 }
@@ -1414,7 +2351,7 @@ mod tests {
 
     #[test]
     fn monograms_take_two_letters() {
-        assert_eq!(monogram("orbit-worker"), "OW");
+        assert_eq!(monogram("quill-worker"), "QW");
         assert_eq!(monogram("connecto"), "CO");
         assert_eq!(monogram("x"), "X");
         assert_eq!(monogram("payments api"), "PA");

@@ -55,9 +55,11 @@
   <li>values after names such as <code>password=</code>;</li>
   <li>long random-looking strings.</li>
 </ul>
-<p>It applies to messages between agents, the audit log, history transcripts, the text sent to the automation classifier, and the text used to title a terminal. If redaction fails, the content is withheld instead of passed on.</p>
+<p>It applies to the audit log (including its copy of messages between agents), history transcripts, the text sent to the automation classifier, and the text used to title a terminal. If redaction fails, the content is withheld instead of passed on.</p>
+<p>A message one agent sends another with <code>connecto send</code> is delivered as written, with only control characters removed: what an agent puts in it reaches the other terminal, and only the audit copy is redacted.</p>
 <p>Your own terminal is never redacted: you see exactly what the tool printed.</p>
-<div class="note"><p>Redaction is best effort. It lowers the chance that a secret travels; it is not proof that none did.</p></div>
+<p>Values kept in the <a href="secrets.html">secret vault</a> are removed by their exact text and their common encodings, wherever redaction applies, and also from the screen that <code>connecto read</code> returns.</p>
+<div class="note"><p>Redaction is best effort. It lowers the chance that a secret travels; it is not proof that none did. To give an agent a token without putting it where the agent can read it, use the <a href="secrets.html">secret vault</a>.</p></div>
 
 <h2>What Connecto does to limit damage</h2>
 <ul>

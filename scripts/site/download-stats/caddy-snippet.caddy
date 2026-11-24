@@ -1,5 +1,6 @@
-# Add inside the site block that serves /downloads/ in your Caddyfile.
-# Caddy 2.11. Change the log path to suit your server.
+# Add inside the `connecto.studio { ... }` block of the server's Caddyfile (and of
+# the source that Caddyfile is deployed from, or the next deploy removes it
+# again). Caddy 2.11.
 #
 # Logs only requests for the download files, one JSON line each, with no IP
 # address, port or cookie. count-downloads.py reads these files. Downloads are
@@ -9,7 +10,7 @@
 	@not_a_download not path /downloads/*.dmg /downloads/*.zip
 	log_skip @not_a_download
 	log connecto_downloads {
-		output file /var/log/caddy/connecto-downloads.log {
+		output file /config/logs/connecto-downloads.log {
 			roll_size 50MiB
 			roll_keep 1000
 			roll_keep_for 87600h

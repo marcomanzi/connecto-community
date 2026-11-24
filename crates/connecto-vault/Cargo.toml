@@ -1,0 +1,30 @@
+[package]
+name = "connecto-vault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+connecto-core.workspace = true
+connecto-redact.workspace = true
+connecto-secrets.workspace = true
+serde_json.workspace = true
+aes-gcm = "0.10"
+getrandom = "0.3"
+signature = "2"
+ssh-encoding = { version = "0.2", features = ["alloc"] }
+# Same features as connecto-net, so one build of it.
+ssh-key = { version = "0.6", features = ["std", "ed25519", "ecdsa", "rsa", "rand_core"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["socket", "signal", "process", "user"] }
+
+[dev-dependencies]
+ssh-agent-client-rs = "1"
+tempfile = "3"

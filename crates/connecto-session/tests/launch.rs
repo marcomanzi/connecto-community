@@ -773,6 +773,43 @@ fn a_status_check_leaves_no_run_folder_and_no_socket() {
     );
 }
 
+/// OpenCode upgrades itself in place: one recorded as 1.x that is OpenCode 2
+/// by the next start is refused there, with what to do, before anything is
+/// launched. Asked of the program as it is, not of the record.
+#[test]
+fn an_opencode_upgraded_in_place_to_2_is_refused_before_it_starts() {
+    let fixture = Fixture::new("opencode2");
+    let project = fixture.project("p", "echo x\n");
+    let entry = fixture.root.join("home/.opencode/bin/opencode");
+    fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    let write = |version: &str| {
+        fs::write(&entry, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write("1.19.6");
+    let installed = Store::new(&fixture.layout.data_root)
+        .provision(Tool::OpenCode, &entry, &AnySignature)
+        .unwrap();
+    let check = || {
+        connecto_session::launch::check_auth(&fixture.layout, &project, Tool::OpenCode, &installed)
+    };
+    assert!(matches!(check(), Ok(AuthState::LoggedIn { .. })));
+    write("2.3.2");
+    let refused = check().unwrap_err().to_string();
+    assert!(
+        refused.contains("OpenCode 2.3.2 is not supported yet") && refused.contains("1.x"),
+        "{refused}"
+    );
+    // The same when its version comes on stderr alone: the output it is read
+    // from is the one checked.
+    fs::write(&entry, "#!/bin/sh\necho '2.0.0' >&2\n").unwrap();
+    let refused = check().unwrap_err().to_string();
+    assert!(
+        refused.contains("OpenCode 2.0.0 is not supported yet"),
+        "{refused}"
+    );
+}
+
 #[test]
 fn stop_ends_a_login_and_nothing_starts_after_it() {
     let fixture = Fixture::new("stoplogin");

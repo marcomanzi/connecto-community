@@ -41,7 +41,7 @@
 //! Nothing here logs, prints or puts a secret in an error.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read as _, Seek as _, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -57,6 +57,10 @@ pub const ACCOUNT: &str = "secrets";
 
 /// The Jev API key (text).
 pub const JEV_API_KEY: &str = "jev.api-key";
+/// The OpenRouter API key Pi terminals are given (text).
+pub const PI_OPENROUTER_API_KEY: &str = "pi.openrouter-api-key";
+/// The Together AI API key Pi terminals are given (text).
+pub const PI_TOGETHER_API_KEY: &str = "pi.together-api-key";
 /// The shared token of the self-hosted relay (text).
 pub const REMOTE_RELAY_TOKEN: &str = "remote.relay-token";
 /// The 32-byte secret of this machine's iroh endpoint (binary).
@@ -124,6 +128,21 @@ pub const fn system_store_available() -> bool {
     cfg!(any(target_os = "macos", windows))
 }
 
+/// The system store itself (the macOS Keychain, Windows Credential Manager),
+/// for an item kept apart from the document, such as the vault's master key.
+/// `None` where there is none.
+#[must_use]
+pub fn system_items() -> Option<Arc<dyn Items>> {
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        Some(platform::items())
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        None
+    }
+}
+
 // ---------- the file ----------
 
 /// The document in one file. Only [`SERVICE`]/[`ACCOUNT`] lives here: any
@@ -184,7 +203,10 @@ impl Items for FileItems {
 /// Write `bytes` to `path` so that a reader sees the old file or the new one,
 /// never half of one: a new file beside it (0600), flushed to disk, then
 /// renamed over it. The folder is made 0700.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+///
+/// # Errors
+/// When the folder or the file cannot be made, written or renamed.
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other("the secrets file has no folder"))?;
@@ -532,7 +554,9 @@ impl Doc {
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn b64_encode(bytes: &[u8]) -> String {
+/// Standard base64 with padding, as the document stores binary.
+#[must_use]
+pub fn b64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b = [
@@ -552,7 +576,9 @@ fn b64_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn b64_decode(text: &str) -> Option<Vec<u8>> {
+/// The bytes of standard base64 text, `None` when it is not.
+#[must_use]
+pub fn b64_decode(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
     if !bytes.len().is_multiple_of(4) {
         return None;
@@ -830,8 +856,8 @@ impl Secrets {
             // document now.
             let _ = previous.delete(SERVICE, ACCOUNT);
         }
-        if held.is_some() {
-            self.put_new_stamp();
+        if let Some(held) = &held {
+            self.put_new_stamp(held);
         }
         Ok(doc)
     }
@@ -860,7 +886,7 @@ impl Secrets {
             .clone();
         let fresh = match (&*state, known) {
             (Loaded::Ready(cached), Some(known))
-                if held.is_some() && self.read_stamp().as_deref() == Some(known.as_str()) =>
+                if held.as_ref().and_then(stamp_in).as_deref() == Some(known.as_str()) =>
             {
                 cached.clone()
             }
@@ -882,23 +908,26 @@ impl Secrets {
         // stamp until a new one is written.
         *self.stamp.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.items.write(SERVICE, ACCOUNT, &doc.to_bytes())?;
-        if held.is_some() {
-            self.put_new_stamp();
+        if let Some(held) = &held {
+            self.put_new_stamp(held);
         }
         *state = Loaded::Ready(doc);
         Ok(())
     }
 
-    fn put_new_stamp(&self) {
+    /// Write a new stamp into the lock file, through `held`, the handle that
+    /// holds the lock. On Windows the lock is mandatory: a second handle could
+    /// neither write nor read the file while it is held.
+    fn put_new_stamp(&self, held: &File) {
         let stamp = new_stamp();
-        let written = self
-            .lock_file
-            .as_ref()
-            .is_some_and(|path| std::fs::write(path, &stamp).is_ok());
+        let mut file = held;
+        let written = file.set_len(0).is_ok()
+            && file.seek(SeekFrom::Start(0)).is_ok()
+            && file.write_all(stamp.as_bytes()).is_ok();
         *self.stamp.lock().unwrap_or_else(PoisonError::into_inner) = written.then_some(stamp);
     }
 
-    /// The stamp in the lock file, if there is one.
+    /// The stamp in the lock file, if there is one, read without the lock.
     fn read_stamp(&self) -> Option<String> {
         let text = std::fs::read_to_string(self.lock_file.as_ref()?).ok()?;
         let text = text.trim();
@@ -915,6 +944,7 @@ impl Secrets {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
+            .read(true)
             .write(true)
             .open(path)
             .map_err(|err| format!("secrets lock: {err}"))?;
@@ -929,6 +959,17 @@ impl Secrets {
             }
         }
     }
+}
+
+/// The stamp in the lock file, read through `held`, the handle that holds
+/// the lock (see [`Secrets::put_new_stamp`]).
+fn stamp_in(held: &File) -> Option<String> {
+    let mut file = held;
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 #[cfg(test)]

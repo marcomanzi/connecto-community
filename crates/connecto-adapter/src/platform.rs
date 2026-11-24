@@ -3,7 +3,7 @@
 //! The shapes that differ per system (hook commands, quoting, the environment,
 //! Codex's hook keys) are written as functions of [`Flavor`], so both shapes
 //! are unit-tested on every host. The public API always uses [`Flavor::HOST`].
-//! The Windows shapes were checked against the real Claude Code and Codex.
+//! Facts for the Windows shapes: `docs/windows-port.md` section 4.8.
 
 use std::path::{Path, PathBuf};
 

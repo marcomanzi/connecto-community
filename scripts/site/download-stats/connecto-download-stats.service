@@ -4,9 +4,13 @@ After=docker.service
 
 [Service]
 Type=oneshot
-# Set the two folders for your server: where Caddy writes the download log
-# (caddy-snippet.caddy), and the site's downloads folder.
+# Caddy (in its container) writes the log into the volume mounted at /config.
+# Set both folders for your server in /etc/default/connecto-download-stats
+# (see README.md); the values here are only defaults.
+Environment=CADDY_LOG_DIR=/var/lib/docker/volumes/caddy_config/_data/logs
+Environment=SITE_DOWNLOADS_DIR=/var/www/connecto/downloads
+EnvironmentFile=-/etc/default/connecto-download-stats
 ExecStart=/usr/bin/python3 -I /usr/local/lib/connecto/count-downloads.py \
-  --logs /var/log/caddy \
-  --downloads /var/www/connecto/downloads
+  --logs ${CADDY_LOG_DIR} \
+  --downloads ${SITE_DOWNLOADS_DIR}
 Nice=10

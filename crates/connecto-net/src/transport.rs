@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 
 use crate::wire::{FrameDecoder, Message, WireError};
 
@@ -23,6 +23,10 @@ pub type EndpointId = [u8; 32];
 pub enum NetError {
     #[error("the connection is closed")]
     Closed,
+    /// The peer's queue is full: it is not reading yet. Not the end of the
+    /// connection; the sender decides whether to wait.
+    #[error("the peer is not reading yet")]
+    Full,
     #[error("bad frame from the peer: {0}")]
     Wire(#[from] WireError),
     #[error("transport: {0}")]
@@ -32,10 +36,11 @@ pub enum NetError {
 /// One ordered, framed message pipe. Both halves may be used from different
 /// threads at once.
 pub trait Stream: Send + Sync {
-    /// Send at once; it does not wait for the peer to read.
+    /// Send at once; it never waits for the peer to read.
     ///
     /// # Errors
-    /// `Closed` when the peer or the connection is gone.
+    /// `Full` when the peer's queue is full (it is not reading yet), which a
+    /// sender may retry; `Closed` when the peer or the connection is gone.
     fn send(&self, message: &Message) -> Result<(), NetError>;
 
     /// The next message, `Ok(None)` after `timeout` with nothing.
@@ -61,6 +66,16 @@ pub trait Connection: Send + Sync {
     /// # Errors
     /// `Closed` when the connection is gone.
     fn open_stream(&self) -> Result<Box<dyn Stream>, NetError>;
+    /// Open a new stream, waiting at most `timeout` for it: a request with a
+    /// deadline does not wait out the transport's own. By default as
+    /// [`Self::open_stream`], for a transport that never waits.
+    ///
+    /// # Errors
+    /// `Closed` when the connection is gone; `Transport` when it took too long.
+    fn open_stream_within(&self, timeout: Duration) -> Result<Box<dyn Stream>, NetError> {
+        let _ = timeout;
+        self.open_stream()
+    }
     /// The next stream the peer opened, `Ok(None)` after `timeout`.
     ///
     /// # Errors
@@ -96,7 +111,9 @@ pub struct ChannelStream {
 }
 
 /// Hands one encoded frame to whatever carries it; false when that is gone.
-pub type ChunkSink = Box<dyn Fn(Vec<u8>) -> bool + Send + Sync>;
+/// Queues one frame without waiting: `Full` when the peer is not reading yet,
+/// `Closed` when the peer is gone.
+pub type ChunkSink = Box<dyn Fn(Vec<u8>) -> Result<(), NetError> + Send + Sync>;
 
 impl ChannelStream {
     #[must_use]
@@ -125,7 +142,16 @@ impl ChannelStream {
     /// A stream whose outgoing frames go to a crossbeam channel.
     #[must_use]
     pub fn over_channels(tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8>>) -> Self {
-        Self::new(Box::new(move |frame| tx.send(frame).is_ok()), rx)
+        // Never waits: a peer that does not read fills its queue, and the send
+        // then fails, which ends the stream rather than holding up the host.
+        Self::new(
+            Box::new(move |frame| match tx.try_send(frame) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(_)) => Err(NetError::Full),
+                Err(TrySendError::Disconnected(_)) => Err(NetError::Closed),
+            }),
+            rx,
+        )
     }
 
     /// Two streams wired to each other.
@@ -146,11 +172,7 @@ impl Stream for ChannelStream {
             return Err(NetError::Closed);
         }
         let frame = message.encode()?;
-        if (self.tx)(frame) {
-            Ok(())
-        } else {
-            Err(NetError::Closed)
-        }
+        (self.tx)(frame)
     }
 
     fn recv(&self, timeout: Duration) -> Result<Option<Message>, NetError> {
@@ -197,7 +219,7 @@ pub mod loopback {
     use super::{Arc, AtomicBool, Ordering};
     use super::{
         ChannelStream, Connection, Duration, EndpointId, NetError, Receiver, RecvTimeoutError,
-        Sender, Stream, bounded,
+        Sender, Stream, TrySendError, bounded,
     };
 
     struct Shared {
@@ -265,7 +287,13 @@ pub mod loopback {
                 mine.with_kill(Arc::clone(&self.shared.closed)),
                 theirs.with_kill(Arc::clone(&self.shared.closed)),
             );
-            self.open.send(theirs).map_err(|_| NetError::Closed)?;
+            // Never waits: a peer that has not accepted its pending streams is not
+            // read, and the opener is told so.
+            match self.open.try_send(theirs) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => return Err(NetError::Full),
+                Err(TrySendError::Disconnected(_)) => return Err(NetError::Closed),
+            }
             // The peer may have closed between the check and the send, after
             // it drained its queue: this stream would then never be served.
             if self.shared.closed.load(Ordering::Acquire) {

@@ -136,7 +136,7 @@ fn welcome(ui: &mut Ui, acts: &mut Vec<Act>) {
     ui.add_space(8.0);
     body(
         ui,
-        "Run Claude Code and Codex side by side, in real terminals, and let them work together as a team.",
+        "Run Claude Code, Codex, Pi, Antigravity CLI and OpenCode side by side, in real terminals, and let them work together as a team.",
     );
     ui.add_space(30.0);
     if ui
@@ -157,6 +157,38 @@ fn choose(ui: &mut Ui, view: &SetupView, home: Option<&Path>, acts: &mut Vec<Act
     ui.add_space(8.0);
     body(ui, "Tap to choose. You can change this later.");
     ui.add_space(18.0);
+    // Four agents (and on Windows PowerShell 7) are taller than the window:
+    // the cards scroll, and Continue stays in view under them.
+    let room = (ui.available_height() - CONTINUE_ROOM).max(CARD_MIN_ROOM);
+    egui::ScrollArea::vertical()
+        .id_salt("setup-choices")
+        .max_height(room)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.set_width(COLUMN);
+            ui.with_layout(Layout::top_down(egui::Align::Center), |ui| {
+                choice_cards(ui, view, home, acts);
+            });
+        });
+    ui.add_space(14.0);
+    let any = view.choices.iter().any(|c| c.selected);
+    let label = if any {
+        "Continue"
+    } else {
+        "Continue with just a terminal"
+    };
+    if ui.add_sized([280.0, 44.0], theme::primary(label)).clicked() {
+        acts.push(Act::Confirm);
+    }
+}
+
+/// Height kept under the cards for the Continue button.
+const CONTINUE_ROOM: f32 = 64.0;
+/// The least the cards get, on a window too small for anything else.
+const CARD_MIN_ROOM: f32 = 120.0;
+
+/// One card per agent (and PowerShell 7), with the note of one to install.
+fn choice_cards(ui: &mut Ui, view: &SetupView, home: Option<&Path>, acts: &mut Vec<Act>) {
     for choice in &view.choices {
         // A found copy gets a fourth line, so the card is taller and its lines move up.
         let (height, lift) = if choice.found_at.is_some() {
@@ -263,16 +295,6 @@ fn choose(ui: &mut Ui, view: &SetupView, home: Option<&Path>, acts: &mut Vec<Act
             });
         }
         ui.add_space(10.0);
-    }
-    ui.add_space(14.0);
-    let any = view.choices.iter().any(|c| c.selected);
-    let label = if any {
-        "Continue"
-    } else {
-        "Continue with just a terminal"
-    };
-    if ui.add_sized([280.0, 44.0], theme::primary(label)).clicked() {
-        acts.push(Act::Confirm);
     }
 }
 
@@ -803,6 +825,47 @@ mod tests {
             choices: vec![choice(found_at)],
             ..SetupView::default()
         }
+    }
+
+    #[test]
+    fn four_agents_and_powershell_fit_with_continue_in_the_window() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut app = SetupApp::new(Arc::new(Nothing));
+        let card = |key: &str, name: &str| {
+            connecto_core::AgentChoice {
+            key: key.to_owned(),
+            name: name.to_owned(),
+            about: "A coding agent.".to_owned(),
+            selected: true,
+            found: false,
+            found_at: None,
+            install_note: Some(
+                "Not on this Mac yet. Connecto will install it for you from its vendor's official installer. It goes in your own folder and needs no password."
+                    .to_owned(),
+            ),
+        }
+        };
+        let view = SetupView {
+            screen: Screen::Choose,
+            choices: vec![
+                card("claude", "Claude Code"),
+                card("codex", "Codex"),
+                card("pi", "Pi"),
+                card("antigravity", "Antigravity CLI"),
+                card("opencode", "OpenCode"),
+                card("powershell", "PowerShell 7"),
+            ],
+            ..SetupView::default()
+        };
+        let texts = drawn_text(&mut app, &ctx, &view);
+        let continue_at = texts
+            .iter()
+            .find(|(text, _)| text == "Continue")
+            .map(|(_, rect)| *rect)
+            .unwrap();
+        assert!(continue_at.max.y <= 640.0, "{continue_at:?}");
+        assert!(texts.iter().any(|(text, _)| text == "Claude Code"));
     }
 
     fn app_at_home(home: &str) -> SetupApp {

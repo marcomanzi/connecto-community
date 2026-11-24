@@ -4,10 +4,13 @@
 //! values, token patterns, values given to a name such as `password`, then
 //! runs that look random. If it cannot run, the content is withheld. This is a best effort over known shapes, not a proof of absence.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use connecto_core::Redacted;
 use regex::Regex;
+
+mod known;
+pub use known::{MIN_KNOWN, known_forms, known_set};
 
 /// Largest body after redaction. Longer is denied, never truncated.
 pub const MAX_BODY: usize = 4096;
@@ -71,6 +74,8 @@ fn patterns() -> Option<&'static [(Regex, &'static str)]> {
                 (r"xox[abprs]-[A-Za-z0-9-]{10,}", MARK),
                 (r"AIza[0-9A-Za-z_-]{35}", MARK),
                 (r"npm_[A-Za-z0-9]{36}", MARK),
+                // A Together AI key (Claude through TogetherLink, Pi).
+                (r"tgp_v1_[A-Za-z0-9_-]{16,}", MARK),
                 (r"AKIA[0-9A-Z]{16}", MARK),
                 // A Discord token: the user id, a time and a signature in
                 // base64, which always begins with M, N or O.
@@ -169,12 +174,51 @@ fn looks_random(token: &str) -> bool {
     groups >= MIN_DIGIT_GROUPS
 }
 
-/// Replace secrets. `known` holds exact values to remove first.
-pub fn redact(text: &str, known: &[String]) -> Result<Redacted<String>, RedactError> {
-    let mut out = text.to_owned();
+/// Where the app's vault values come from: every form of every value to
+/// hide (see [`known_set`]), longest first.
+pub type KnownSource = Arc<dyn Fn() -> Arc<[String]> + Send + Sync>;
+
+static KNOWN_SOURCE: RwLock<Option<KnownSource>> = RwLock::new(None);
+
+/// Register the vault, once, at startup. From then on every [`redact`],
+/// [`prepare`] and [`hide_known`] also removes the vault's values, wherever it
+/// is called from.
+pub fn set_known_source(source: KnownSource) {
+    *KNOWN_SOURCE.write().unwrap_or_else(PoisonError::into_inner) = Some(source);
+}
+
+/// The vault's forms to hide now (empty without a vault).
+#[must_use]
+pub fn vault_known() -> Arc<[String]> {
+    let source = KNOWN_SOURCE
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    source.map_or_else(|| Arc::from(Vec::new()), |source| source())
+}
+
+/// Replace only the vault's values, and nothing that merely looks secret:
+/// for whole screens shown as they are (`connecto read`), where the shape
+/// rules would hide too much.
+#[must_use]
+pub fn hide_known(text: &str) -> String {
+    replace_known(text.to_owned(), &vault_known())
+}
+
+fn replace_known(mut out: String, known: &[String]) -> String {
     for value in known.iter().filter(|value| !value.is_empty()) {
-        out = out.replace(value.as_str(), MARK);
+        if out.contains(value.as_str()) {
+            out = out.replace(value.as_str(), MARK);
+        }
     }
+    out
+}
+
+/// Replace secrets. `known` holds exact values to remove first; the vault's
+/// values (see [`set_known_source`]) are removed with them.
+pub fn redact(text: &str, known: &[String]) -> Result<Redacted<String>, RedactError> {
+    let out = replace_known(text.to_owned(), known);
+    let mut out = replace_known(out, &vault_known());
     for (pattern, with) in patterns().ok_or(RedactError::Withheld)? {
         out = pattern.replace_all(&out, *with).into_owned();
     }
@@ -257,6 +301,7 @@ mod tests {
             concat!("sk-ant-", "api03-abc_DEF-123456"),
             concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789"),
             concat!("AKIA", "IOSFODNN7EXAMPLE"),
+            concat!("tgp_v1_", "abcdEFGH1234_ijkl-5678"),
             concat!("glpat-", "abcDEF123_ghiJKL-4567"),
             concat!("xoxb-", "123456789012-abcdefABCDEF"),
             concat!("xoxp-", "1234-5678-abcdef"),
@@ -292,7 +337,7 @@ mod tests {
 
     #[test]
     fn high_entropy_is_removed_and_ordinary_text_is_not() {
-        assert!(clean("key=aB3xQ9zL2mN7vK4pR8tY1wE6uI0oP5sD").contains(MARK));
+        assert!(clean(concat!("key=", "aB3xQ9zL2mN7vK4pR8tY1wE6uI0oP5sD")).contains(MARK));
         for keep in [
             "a plain sentence about the build",
             "d2d2f3a9c4e1b0f7a6d5c4b3a2e1f0d9c8b7a6e5",
@@ -330,13 +375,16 @@ mod tests {
             ("password=hunter2hunter", "password=[REDACTED]"),
             ("DB_PASSWORD: Tr0ub4dor&3", "DB_PASSWORD: [REDACTED]"),
             (
-                r#"{"client_secret": "abc123def456"}"#,
+                concat!(r#"{"client_secret": "#, r#""abc123def456"}"#),
                 r#"{"client_secret": "[REDACTED]"}"#,
             ),
             ("export API_KEY='k9f8d7s6a5'", "export API_KEY='[REDACTED]'"),
             ("api-key = 12345678 # prod", "api-key = [REDACTED] # prod"),
             ("apikey:zz99yy88xx", "apikey:[REDACTED]"),
-            ("GITHUB_TOKEN=abcd1234efgh", "GITHUB_TOKEN=[REDACTED]"),
+            (
+                concat!("GITHUB_TOKEN=", "abcd1234efgh"),
+                "GITHUB_TOKEN=[REDACTED]",
+            ),
             ("token_v2: qwerty!uiop", "token_v2: [REDACTED]"),
         ] {
             assert_eq!(clean(text), expected, "{text}");

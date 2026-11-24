@@ -45,7 +45,11 @@ pub fn known_dirs(home: &Path) -> Vec<PathBuf> {
 /// standalone installer (`install.ps1`) puts on the user's `PATH`
 /// (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`, a junction to
 /// `~\.codex\packages\standalone\current\bin`), for when the `PATH` this
-/// process got predates the install.
+/// process got predates the install; and where Pi's installer puts its
+/// launcher `pi.cmd` (`~\.pi\agent\bin`), which Connecto's install of Pi
+/// does not add to the user's `PATH`; and where Antigravity's installer puts
+/// `agy.exe` (`%LOCALAPPDATA%\agy\bin`); and where OpenCode's installer
+/// puts `opencode.exe` (`~\.opencode\bin`).
 pub fn fixed_dirs(home: &Path) -> Vec<PathBuf> {
     vec![
         home.join(".local").join("bin"),
@@ -55,6 +59,9 @@ pub fn fixed_dirs(home: &Path) -> Vec<PathBuf> {
             .join("OpenAI")
             .join("Codex")
             .join("bin"),
+        home.join(".pi").join("agent").join("bin"),
+        home.join("AppData").join("Local").join("agy").join("bin"),
+        home.join(".opencode").join("bin"),
     ]
 }
 

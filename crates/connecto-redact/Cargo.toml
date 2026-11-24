@@ -13,3 +13,6 @@ workspace = true
 connecto-core.workspace = true
 regex = "1"
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

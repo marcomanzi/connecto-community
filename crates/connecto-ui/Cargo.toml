@@ -10,7 +10,7 @@ license.workspace = true
 workspace = true
 
 [features]
-frame-capture = ["dep:png"]
+frame-capture = []
 test-endpoints = []
 ui-test-driver = []
 
@@ -19,12 +19,26 @@ connecto-core.workspace = true
 eframe.workspace = true
 egui.workspace = true
 crossbeam-channel.workspace = true
-png = { version = "0.18", optional = true }
+# Images pasted on a terminal are saved as PNG (pasted.rs); also the
+# frame-capture screenshots.
+png = "0.18"
 rfd = "0.17"
+# The file preview: Markdown drawn as a document, and the common image formats.
+pulldown-cmark = { version = "0.13", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
 serde_json.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# A download is written to a file of its own beside the target, then moved.
+tempfile = "3"
+
+[dev-dependencies]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The native menu bar. Created after winit has made NSApp (in the eframe app
 # creator), so it replaces winit's default menu. See menu.rs.
 muda = { version = "0.21", default-features = false }
+# Files copied in Finder, read from the pasteboard when pasted on a remote
+# terminal (clipboard_files.rs). The versions egui-winit already uses.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem"] }

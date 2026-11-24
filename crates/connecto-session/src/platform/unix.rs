@@ -14,7 +14,8 @@ pub(crate) const PATH_SEPARATOR: &str = ":";
 
 /// Folders in the home folder that hold the CLIs' or the system's state: a
 /// project may not be one of them or sit inside one.
-pub(crate) const HOME_STATE: [&str; 4] = [".claude", ".codex", ".local", "Library"];
+pub(crate) const HOME_STATE: [&str; 6] =
+    [".claude", ".codex", ".local", "Library", ".pi", ".gemini"];
 
 /// The shell used by the panes. `-f` skips user startup files.
 pub const SHELL: &str = "/bin/zsh";

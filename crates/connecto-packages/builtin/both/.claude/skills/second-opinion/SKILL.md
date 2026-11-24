@@ -1,0 +1,99 @@
+---
+name: second-opinion
+description: Get an independent second opinion on one question, plan, diagnosis or change from another coding CLI, in a Connecto terminal of its own, and report it next to your own view. Only when the user asks for it.
+argument-hint: <question, or what change to check>
+disable-model-invocation: true
+---
+
+# Second opinion
+
+Task: $ARGUMENTS
+
+If the task above is empty, ask the user what to get a second opinion on, and stop.
+
+You are the asker. One other agent, in a Connecto terminal of its own, gives an independent opinion on one thing; you pass it on to the user beside your own view, kept apart. It only reads and runs checks: it changes nothing. This is a single consultation, not a team: one terminal, at most one follow-up, then it is closed.
+
+## 1. Choose the agent
+
+First run `connecto list`. If it fails, stop and tell the user that a second opinion needs a Connecto terminal that can use the `connecto` command, because the other agent runs in a Connecto terminal.
+
+Then run:
+
+```bash
+connecto agents --roles
+```
+
+Take its `second-opinion` line. It names a different coding CLI from the one you're running in whenever one is ready (allowed by the project's Tools setting, installed and signed in), and the exact command that starts it.
+
+- If the user named an agent, such as "ask Gemini" (Gemini runs in Antigravity), use that one if the list shows it `ready` or `unverified`, with the command the list gives for it. For an unverified one, tell the user that Connecto couldn't check its sign-in, and if its terminal stops at a sign-in screen, handle it as a failed start, below. If it's `unusable`, `not allowed` or `checking`, tell the user why and ask whether to use the `second-opinion` line instead. If the agent they named is your own CLI while another one is ready, tell them it won't be independent of you and ask which they want.
+- If the line says `(same CLI)`, no other coding CLI is allowed or usable here, so the opinion comes from a fresh session of your own CLI. That still counts, but it must be labelled: say so to the user before you start it, and again in the report.
+- If it says `(unverified)`, Connecto couldn't check that CLI's sign-in before it starts; if its terminal stops at a sign-in screen, handle it as a failed start, below. If it says `via <provider>`, that CLI runs the provider's own model: name it that way in the report.
+- If it says `none`, or an agent it would prefer shows `checking`, run the command again in a moment. If no CLI is ready, tell the user which ones are unusable and why, as the list says, and stop.
+- If `connecto agents` fails with `unknown command "agents"`, or answers that this Connecto app is older than the command, Connecto is too old to say which CLIs are ready, so try them yourself, one at a time, with these commands: Claude `connecto add claude --model claude-opus-5-5 --effort <effort>`, Codex `connecto add codex --model gpt-6.2-astra --effort <effort>`, Antigravity `connecto add antigravity --model gemini-4-neon-<effort>`, Pi `connecto add pi --effort <effort>`, OpenCode `connecto add opencode`. If the user named a CLI, try that one first, and if it is refused or fails, tell the user why and ask before trying another. Otherwise, first try the CLIs other than your own, in this order: Claude, Codex, Antigravity, Pi, OpenCode. Skip one that `connecto add` refuses because of the project's Tools setting (the refusal names the CLIs the project allows), and treat one that exits or stops at a sign-in screen as a failed start, below. Only when every other CLI has been refused or has failed, start a fresh session of your own CLI, which the project allows since you run in it, and label the opinion as the same CLI.
+
+**Effort.** The command has an `<effort>` slot. Fill it by how hard the question looks to you now. Decide by feel; don't read code to decide:
+
+- `low`: a trivial edit, wording, docs, or a config value
+- `medium`: a normal feature or fix
+- `high`: work across modules or crates, concurrency, security, or a risk of losing data
+- `xhigh`: only a rare, very hard problem
+
+Antigravity's command carries the effort in its model name (`gemini-4-neon-<effort>`); OpenCode's has no slot.
+
+`connecto add` prints the new terminal's id, such as `codex-2 starting`. If the terminal exits, or reports that its agent isn't installed or needs a login, before its first reply, close it with `connecto close <id>`, tell the user, and try once with another ready CLI from the list, one that isn't your own while any other is ready. With an older Connecto, which gives no list, go on to the next CLI in the order above instead. If `connecto add` is refused because of the terminal cap (16 terminals), close your own finished or stopped terminals and try again; never close one you didn't start. For any other refusal, such as Connecto being paused, tell the user the reason and stop.
+
+## 2. Brief it
+
+The other agent knows only what you send. Make the brief self-contained: the question or the change, the files and paths that matter, what was already tried or ruled out, and any constraint from the user. Leave out your own conclusion, so the opinion isn't anchored on it, unless the user asked to check a specific claim.
+
+For a question, a plan or a diagnosis:
+
+```bash
+connecto send <id> --ask <<'BRIEF'
+You are giving a second opinion, asked by another agent through Connecto. Read only: don't edit, create or delete project files, don't change git state, and don't start or message other terminals. Run read-only commands and tests if they help, with scratch files outside the project.
+
+Project: <project path>
+
+Question: <the question, plan or symptom>
+
+Context: <files, what was tried or ruled out, constraints>
+
+Reply in at most 15 lines: your answer, how confident you are (high, medium or low) and why, and anything the asker seems to have missed.
+BRIEF
+```
+
+For a change to check:
+
+```bash
+connecto send <id> --ask <<'BRIEF'
+You are giving a second opinion on a change, asked by another agent through Connecto. Read only: don't edit, create or delete project files, don't change git state, and don't start or message other terminals. Run the project's tests and checks yourself, with scratch files outside the project.
+
+Project: <project path>
+
+What it should do: <the task and acceptance criteria>
+
+The change: <changed files, a commit, or a git range>
+
+Report only real problems: bugs, security issues, broken requirements, failing tests, missing tests for risky behavior. Reply in exactly this format, at most 10 findings, most severe first:
+
+VERDICT: PASS or VERDICT: CHANGES_REQUIRED
+
+- [blocker|major|minor] path/to/file:line - the problem, and what to do about it
+BRIEF
+```
+
+After sending, end your turn. Don't wait, sleep, or poll `connecto result`: Connecto delivers the reply to you when it finishes.
+
+## 3. Follow up, then close
+
+If the reply leaves something unclear, ask the same terminal one follow-up question, and end your turn again. Then close it with `connecto close <id>`, so its context can't leak into a later opinion.
+
+## 4. Report
+
+Tell the user, briefly:
+
+- **From:** the CLI and model of the terminal that actually answered, such as "Codex, gpt-6.2-astra at medium effort". Whenever that CLI is your own, however it was chosen, say "Same CLI as mine (<cli>), a fresh session", and why: no other coding CLI was allowed or ready in this project, or the user asked for it.
+- **Its opinion:** the answer or verdict, short, in its own words where they matter.
+- **Compared with mine:** where it agrees and disagrees with your own view, and what you would do now.
+
+Don't act on the opinion, such as changing code, unless the user's request said to. Otherwise ask the user.

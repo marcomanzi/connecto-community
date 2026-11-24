@@ -37,6 +37,18 @@ fn wait_within(child: &mut Child, timeout: Duration) -> bool {
 /// Ask the tool whether it is logged in. Only the state and method are kept. A check that fails or hangs is [`AuthState::Unknown`]. Blocks, up to a
 /// limit.
 pub(crate) fn auth_status(adapter: &dyn ToolAdapter, ctx: &LoginCtx) -> AuthState {
+    let Some((stdout, stderr)) = status_output(adapter, ctx) else {
+        return AuthState::Unknown;
+    };
+    match adapter.parse_status(&stdout) {
+        AuthState::Unknown => adapter.parse_status(&stderr),
+        known => known,
+    }
+}
+
+/// What the tool's status command printed (stdout, stderr), or `None` when
+/// it did not run or did not finish in time.
+pub(crate) fn status_output(adapter: &dyn ToolAdapter, ctx: &LoginCtx) -> Option<(String, String)> {
     let spec = adapter.status(ctx);
     let spawned = crate::platform::no_console(&mut Command::new(&spec.program))
         .args(&spec.args)
@@ -47,20 +59,17 @@ pub(crate) fn auth_status(adapter: &dyn ToolAdapter, ctx: &LoginCtx) -> AuthStat
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
-    let Ok(mut child) = spawned else {
-        return AuthState::Unknown;
-    };
+    let mut child = spawned.ok()?;
     let stdout = collect(child.stdout.take());
     let stderr = collect(child.stderr.take());
     let finished = wait_within(&mut child, TIMEOUT);
     if !finished {
         let _ = child.kill();
         let _ = child.wait();
-        return AuthState::Unknown;
+        return None;
     }
-    let stdout = stdout.join().unwrap_or_default();
-    match adapter.parse_status(&stdout) {
-        AuthState::Unknown => adapter.parse_status(&stderr.join().unwrap_or_default()),
-        known => known,
-    }
+    Some((
+        stdout.join().unwrap_or_default(),
+        stderr.join().unwrap_or_default(),
+    ))
 }

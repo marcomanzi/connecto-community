@@ -95,9 +95,16 @@ fn machine_in(
         ring: Arc::clone(&ring),
     });
     let terminals = Arc::new(FixedTerminals(Mutex::new(vec![HostTerminal {
+        entry: None,
+        ran: true,
+        owner: None,
+        background: Vec::new(),
         id: 1,
         name: "claude-1".into(),
         tool: 1,
+        project_id: "p".into(),
+        project_name: "Project".into(),
+        parent: None,
         attempt: 1,
         activity: 0,
         session: Arc::clone(&fake) as Arc<dyn TerminalSession>,

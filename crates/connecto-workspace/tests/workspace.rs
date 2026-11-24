@@ -22,10 +22,27 @@ use connecto_workspace::{Workspace, WorkspaceConfig};
 struct Rig {
     root: PathBuf,
     layout: Layout,
+    /// Held for the test: every workspace start sets the launcher's
+    /// process-wide launch modes, which one test here checks.
+    _serial: Option<std::sync::MutexGuard<'static, ()>>,
 }
+
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Rig {
     fn new(name: &str) -> Self {
+        let serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::made(name, Some(serial))
+    }
+
+    /// A second rig in a test that already holds one, and so the lock.
+    fn alongside(_first: &Rig, name: &str) -> Self {
+        Self::made(name, None)
+    }
+
+    fn made(name: &str, serial: Option<std::sync::MutexGuard<'static, ()>>) -> Self {
         let root = std::env::temp_dir().join(format!("mg-ws-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for dir in ["home", "data", "work"] {
@@ -36,7 +53,11 @@ impl Rig {
             data_root: root.join("data"),
             home: root.join("home"),
         };
-        Self { root, layout }
+        Self {
+            root,
+            layout,
+            _serial: serial,
+        }
     }
 
     /// A project folder under `work`.
@@ -47,14 +68,35 @@ impl Rig {
     }
 
     fn start(&self) -> Workspace {
+        self.launch(false)
+    }
+
+    fn launch(&self, after_update: bool) -> Workspace {
         Workspace::start(WorkspaceConfig {
             layout: self.layout.clone(),
             extras: LaunchExtras::default(),
             audit: Audit::open(&self.root.join(format!("audit-{}.jsonl", unique()))).unwrap(),
             wake: Arc::new(|| {}),
             default_tools: vec![Tool::Claude, Tool::Codex],
+            after_update,
         })
         .unwrap()
+    }
+
+    /// Save a project's terminal list as an update's quit leaves it: one
+    /// idle terminal, saved running.
+    fn save_idle_running(&self, folder: &Path) {
+        let dir = self
+            .layout
+            .data_root
+            .join("projects")
+            .join(project_id(folder));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("terminals.json"),
+            r#"{"version":1,"next":{"claude":2},"terminals":[{"id":"claude","tool":"claude","desired":"running"}]}"#,
+        )
+        .unwrap();
     }
 
     fn audit_start(&self, file: &Path) -> Workspace {
@@ -64,6 +106,7 @@ impl Rig {
             audit: Audit::open(file).unwrap(),
             wake: Arc::new(|| {}),
             default_tools: vec![Tool::Claude, Tool::Codex],
+            after_update: false,
         })
         .unwrap()
     }
@@ -128,6 +171,41 @@ fn terminal_ids(ws: &Workspace, project: &str) -> Vec<String> {
         .collect()
 }
 
+fn desired_running(ws: &Workspace, project: &str) -> Option<bool> {
+    let view = ws.view();
+    let open = view.projects.iter().find(|p| p.id == project)?;
+    let terminals = open.terminals.as_ref()?.view();
+    terminals.terminals.first().map(|t| t.desired_running)
+}
+
+/// ADR 0030: the launch after an update brings back the idle terminals of the
+/// projects open at its quit; a project opened afterwards restores as after a
+/// quit.
+#[test]
+fn after_an_update_only_the_projects_open_at_the_quit_bring_back_idle_terminals() {
+    let rig = Rig::new("after-update");
+    let (a, b) = (rig.folder("a"), rig.folder("b"));
+    let ws = rig.start();
+    ws.open_project(&a).unwrap();
+    ready(&ws, 1);
+    ws.begin_shutdown();
+    assert!(ws.shut_down(Duration::from_secs(5)));
+    drop(ws);
+    rig.save_idle_running(&a);
+    rig.save_idle_running(&b);
+
+    let ws = rig.launch(true);
+    ready(&ws, 1);
+    assert_eq!(desired_running(&ws, &project_id(&a)), Some(true));
+    ws.open_project(&b).unwrap();
+    ready(&ws, 2);
+    wait_for("b restored as after a quit", || {
+        desired_running(&ws, &project_id(&b)) == Some(false)
+    });
+    ws.begin_shutdown();
+    assert!(ws.shut_down(Duration::from_secs(5)));
+}
+
 /// R1: the open projects, their order and names, which one is shown, each one's
 /// shown terminal and expanded flag, the sidebar and the recents come back.
 #[test]
@@ -171,12 +249,61 @@ fn the_workspace_round_trips_across_a_relaunch() {
     assert!(view.warning.is_none());
 }
 
+/// Sidebar groups: made, named, given projects, kept across a relaunch, and
+/// removed without closing their projects.
+#[test]
+fn project_groups_are_saved_and_a_deleted_group_frees_its_projects() {
+    let rig = Rig::new("groups");
+    let (a, b) = (rig.folder("a/app"), rig.folder("b/tool"));
+    let ws = rig.start();
+    ws.open_project(&a).unwrap();
+    ws.open_project(&b).unwrap();
+    ready(&ws, 2);
+    let (ida, idb) = (project_id(&a), project_id(&b));
+    assert!(ws.create_group("  ").is_err(), "a group needs a name");
+    ws.create_group("Clients").unwrap();
+    wait_for("the group", || ws.view().groups.len() == 1);
+    let group = ws.view().groups[0].id.clone();
+    assert_eq!(group, "group-1");
+    assert!(ws.set_project_group(&ida, Some("group-9")).is_err());
+    ws.set_project_group(&ida, Some(&group)).unwrap();
+    ws.rename_group(&group, "Customers").unwrap();
+    wait_for("the saved groups", || {
+        let text = rig.saved();
+        text.contains("Customers") && text.contains("\"group\": \"group-1\"")
+    });
+    ws.begin_shutdown();
+    assert!(ws.shut_down(Duration::from_secs(5)));
+    drop(ws);
+
+    let again = rig.start();
+    ready(&again, 2);
+    let view = again.view();
+    assert_eq!(view.groups.len(), 1);
+    assert_eq!(view.groups[0].name, "Customers");
+    let group_of = |id: &str| {
+        again
+            .view()
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.group.clone())
+    };
+    assert_eq!(group_of(&ida).as_deref(), Some("group-1"));
+    assert_eq!(group_of(&idb), None);
+    again.delete_group(&group).unwrap();
+    wait_for("the group to go", || again.view().groups.is_empty());
+    assert_eq!(again.view().projects.len(), 2, "its projects stay open");
+    assert_eq!(group_of(&ida), None);
+}
+
 /// Two workspaces in one process keep their own Automations folder: one's
 /// registration is not the other's, and settings without a folder clear an
 /// older registration for the same data folder.
 #[test]
 fn workspaces_register_their_own_automations_folder_and_cleared_settings_clear_it() {
-    let (one, two) = (Rig::new("auto-one"), Rig::new("auto-two"));
+    let one = Rig::new("auto-one");
+    let two = Rig::alongside(&one, "auto-two");
     let folder = |rig: &Rig| {
         let dir = rig.root.join("data/automations");
         fs::create_dir_all(dir.join("x")).unwrap();
@@ -876,6 +1003,9 @@ fn the_launch_modes_are_saved_applied_to_the_launcher_and_restored() {
     set_launch_modes(LaunchModes {
         claude: AgentMode::Prompt,
         codex: AgentMode::Prompt,
+        pi: AgentMode::Prompt,
+        antigravity: AgentMode::Prompt,
+        opencode: AgentMode::Prompt,
     });
     let ws = rig.start();
     // An old file: both tools keep today's behaviour, and the launcher is told.
@@ -884,6 +1014,9 @@ fn the_launch_modes_are_saved_applied_to_the_launcher_and_restored() {
     let chosen = LaunchModes {
         claude: AgentMode::Auto,
         codex: AgentMode::Prompt,
+        pi: AgentMode::Bypass,
+        antigravity: AgentMode::Auto,
+        opencode: AgentMode::Prompt,
     };
     ws.set_launch_modes(chosen);
     assert_eq!(launch_modes(), chosen, "the next start or restart uses it");
@@ -1062,4 +1195,81 @@ fn two_saved_windows_spellings_of_one_folder_are_one_project() {
     wait_for("the worker to take a command", || {
         ws.view().active.as_deref() == Some(project_id(&b).as_str())
     });
+}
+
+/// The Automations folder and the agentic jobs folder open in the Connecto
+/// Internal group, made once; other projects and a project the user moved
+/// elsewhere are left alone.
+#[test]
+fn connecto_folders_open_in_the_internal_group() {
+    let rig = Rig::new("internal");
+    let home = rig.root.join("data/connecto-home");
+    let jobs = home.join(connecto_workspace::AGENTIC_JOBS_FOLDER);
+    fs::create_dir_all(home.join("automations")).unwrap();
+    fs::create_dir_all(&jobs).unwrap();
+    let home = fs::canonicalize(home).unwrap();
+    let ws = rig.start();
+    ws.set_connecto_home(Some(home.clone())).unwrap();
+    ws.set_automations_root(Some(home.join("automations")))
+        .unwrap();
+    let plain = rig.folder("plain");
+    for dir in [home.join("automations"), jobs.clone(), plain.clone()] {
+        ws.open_project(&dir).unwrap();
+    }
+    ready(&ws, 3);
+    let view = ws.view();
+    let internal: Vec<_> = view
+        .groups
+        .iter()
+        .filter(|g| g.name == connecto_workspace::INTERNAL_GROUP)
+        .collect();
+    assert_eq!(internal.len(), 1);
+    let group_of = |dir: &Path| {
+        let id = project_id(&fs::canonicalize(dir).unwrap());
+        view.projects
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .group
+            .clone()
+    };
+    assert_eq!(
+        group_of(&home.join("automations")),
+        Some(internal[0].id.clone())
+    );
+    assert_eq!(group_of(&jobs), Some(internal[0].id.clone()));
+    assert_eq!(group_of(&plain), None);
+    // Moved out by the user, it stays where it was put when opened again.
+    ws.create_group("Mine").unwrap();
+    wait_for("the group", || ws.view().groups.len() == 2);
+    let mine = ws
+        .view()
+        .groups
+        .iter()
+        .find(|g| g.name == "Mine")
+        .unwrap()
+        .id
+        .clone();
+    let jobs_id = project_id(&fs::canonicalize(&jobs).unwrap());
+    ws.set_project_group(&jobs_id, Some(&mine)).unwrap();
+    ws.open_project(&jobs).unwrap();
+    wait_for("the move", || {
+        ws.view()
+            .projects
+            .iter()
+            .any(|p| p.id == jobs_id && p.group.as_deref() == Some(mine.as_str()))
+    });
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        ws.view()
+            .projects
+            .iter()
+            .find(|p| p.id == jobs_id)
+            .unwrap()
+            .group
+            .as_deref(),
+        Some(mine.as_str())
+    );
+    ws.begin_shutdown();
+    assert!(ws.shut_down(Duration::from_secs(5)));
 }

@@ -53,6 +53,9 @@ pub(crate) const FAINT: Color32 = Color32::from_rgb(0x6d, 0x84, 0x94);
 pub(crate) const TEXT_ROW: Color32 = Color32::from_rgb(0xc9, 0xd6, 0xdf);
 /// Waiting for the user.
 pub(crate) const AMBER: Color32 = Color32::from_rgb(0xf5, 0xb8, 0x5a);
+/// Background work running for a long time: a muted sand, apart from the
+/// amber that wants the user, and calm.
+pub(crate) const LONG_RUNNING: Color32 = Color32::from_rgb(0xd4, 0xb4, 0x83);
 /// An idle terminal: a subtle light gray, quiet against the dark sidebar.
 pub(crate) const IDLE: Color32 = Color32::from_rgb(0xa9, 0xb5, 0xbf);
 /// Done, finished.
@@ -224,6 +227,8 @@ mod tests {
             ("row text on sidebar", TEXT_ROW, SIDEBAR_BG),
             ("muted on selected row", TEXT_MUTED, TERM_ON),
             ("amber on sidebar", AMBER, SIDEBAR_BG),
+            ("long-running on sidebar", LONG_RUNNING, SIDEBAR_BG),
+            ("long-running on selected row", LONG_RUNNING, TERM_ON),
             ("text on popover", TEXT, POPOVER_BG),
             ("muted on popover", TEXT_MUTED, POPOVER_BG),
             ("primary button", ON_CYAN, CYAN),

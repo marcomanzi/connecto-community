@@ -51,3 +51,28 @@ pub(crate) fn card(ctx: &Context, id: &'static str, body: impl FnOnce(&mut Ui)) 
     // Focus stays inside the dialog: Tab does not reach what is under it.
     ctx.memory_mut(|memory| memory.set_modal_layer(area.response.layer_id));
 }
+
+/// A request dialog's heading, with a Minimize button at its right that
+/// shrinks the request to a card in the window's bottom-right corner.
+/// Returns whether it was clicked.
+pub(crate) fn heading_with_minimize<A>(
+    ui: &mut Ui,
+    out: &mut crate::forms::Out<A>,
+    title: &str,
+    key: &str,
+) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        out.say(ui, crate::forms::heading(title));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let button = ui
+                .add(egui::Button::new(egui::RichText::new("\u{2013}  Minimize").size(11.5)).small())
+                .on_hover_text(
+                    "Shrink it to the bottom-right corner to read and use the terminal; click it there to answer. Esc does the same.",
+                );
+            out.mark(key, button.rect);
+            clicked = button.clicked();
+        });
+    });
+    clicked
+}

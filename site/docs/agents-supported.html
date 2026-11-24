@@ -18,35 +18,84 @@
 <noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
 <main class="doc">
 <h1>Supported agents</h1>
-<p class="lead">Connecto runs agent CLIs through adapters: one per tool. Two are available, and three are next.</p>
+<p class="lead">Connecto runs agent CLIs through adapters: one per tool. Five are available, and one is next.</p>
 
 <table>
   <tr><th>Agent</th><th>Status</th><th>Command for a new terminal</th></tr>
   <tr><td><strong>Claude Code</strong></td><td><span class="pill">available</span></td><td><code>connecto add claude</code> · <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>1</kbd></td></tr>
   <tr><td><strong>Codex</strong></td><td><span class="pill">available</span></td><td><code>connecto add codex</code> · <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>2</kbd></td></tr>
+  <tr><td><strong>Pi</strong></td><td><span class="pill">available</span></td><td><code>connecto add pi</code> · <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>4</kbd></td></tr>
+  <tr><td><strong>Antigravity CLI</strong></td><td><span class="pill">available</span></td><td><code>connecto add antigravity</code> · <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>5</kbd></td></tr>
+  <tr><td><strong>OpenCode</strong></td><td><span class="pill">available</span></td><td><code>connecto add opencode</code> · <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>6</kbd></td></tr>
   <tr><td><strong>Plain shell</strong> (not an agent)</td><td><span class="pill">available</span></td><td><code>connecto add shell</code> · <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>3</kbd></td></tr>
-  <tr><td><strong>Gemini CLI</strong></td><td><span class="pill red">next</span></td><td></td></tr>
   <tr><td><strong>Cursor CLI</strong></td><td><span class="pill red">next</span></td><td></td></tr>
-  <tr><td><strong>opencode</strong></td><td><span class="pill red">next</span></td><td></td></tr>
 </table>
 
 <h2>Available today</h2>
-<p>Claude Code and Codex both have everything in these docs: terminals, the <code>connecto</code> command, automations, packages, isolated and system profiles, history, and remote sessions.</p>
+<p>Claude Code and Codex both have everything in these docs (Pi and Antigravity CLI have their own sections below): terminals, the <code>connecto</code> command, automations, packages, isolated and system profiles, history, and remote sessions.</p>
 <ul>
   <li>Connecto does not pin a CLI version. It relies on the tools staying compatible, and runs its own verified copy, made from your install at the first launch. To pick up a newer version by hand, run <code>connecto-app provision</code>.</li>
   <li>The tools' own auto-update is turned off inside Connecto, so a session never changes under you.</li>
   <li>Writing a new <a href="packages.html">package</a> with an agent's help uses Claude. <a href="history.html#utility-sessions">Titles</a> use Claude too.</li>
 </ul>
 
+<h2 id="pi">Pi, with the model provider you choose</h2>
+<p><a href="https://pi.dev">Pi</a> is an agent CLI that is not tied to one vendor. In Connecto it has its own terminals, the <code>connecto</code> command (so it can ask Claude or Codex, and be asked), history and resume, and the same Pause and audit log.</p>
+<ul>
+  <li><strong>Choose it at the first launch, or add it in Settings &gt; Agents.</strong> Either way, Connecto runs Pi's own installer from pi.dev, on macOS and on Windows. Pi needs Node.js 22.19 or newer: if it is missing or older, Connecto asks, then installs Node.js 22 from nodejs.org in your own folder (<code>~/.local/share/pi-node</code> on a Mac, <code>%LOCALAPPDATA%\pi-node</code> on Windows), without touching a Node.js you already have. A <code>pi</code> you installed yourself is found where it is.</li>
+  <li><strong>Set up a provider</strong> with <em>Set up model providers…</em> on Pi's card: an API key for <strong>OpenRouter</strong> or <strong>Together AI</strong>, or the address of a local <strong>LM Studio</strong> server. Keys are kept in Connecto's secret store and given to a Pi terminal only in its environment. The local server is checked when you save its address, and found by itself when it listens on another port.</li>
+  <li><strong>Pi is offered once a provider works</strong>: a saved key, or a local server that answers with a chat model. The New terminal chooser then shows which ones it has, such as <em>Together AI | OpenRouter | Local</em>.</li>
+  <li><strong>Choose the model when you open the terminal.</strong> The chooser has a model field for Pi: type to find one among every model your providers offer, or leave it empty for the default set in the same dialog. An agent chooses with <code>connecto add pi --model &lt;provider&gt;/&lt;model&gt;</code>. Inside Pi, <code>/model</code> changes it at any time.</li>
+  <li><strong>Local models load on demand.</strong> Every model you downloaded in LM Studio is listed under <code>lmstudio/</code>, loaded or not, and LM Studio loads one at the first message.</li>
+  <li>A project's <a href="packages.html">Tools</a> can be Claude, Codex, Pi, Antigravity or All.</li>
+</ul>
+<p>Where Pi differs from the other two:</p>
+<ul>
+  <li><strong>No verified copy.</strong> Pi is a Node.js program published without a code signature, so Connecto runs it where it is installed.</li>
+  <li><strong>No permission prompts.</strong> Pi never asks before a tool call. Settings &gt; Launch only decides whether a project's own <code>.pi</code> resources load without asking.</li>
+  <li>There are no <a href="automations.html">automations</a> for Pi's screens, and <a href="memory.html">project memory</a> does not capture Pi's turns yet.</li>
+</ul>
+
+<h2 id="antigravity">Antigravity CLI</h2>
+<p><a href="https://antigravity.google/docs/cli">Antigravity CLI</a> (<code>agy</code>) is Google's coding agent, on Gemini models, and the successor of Gemini CLI. In Connecto it has its own terminals, the <code>connecto</code> command (so it can ask Claude, Codex or Pi, and be asked), history and resume, and the same Pause and audit log.</p>
+<ul>
+  <li><strong>Choose it at the first launch, or add it in Settings &gt; Agents.</strong> Connecto runs Google's official installer from antigravity.google, on macOS and on Windows. It puts <code>agy</code> in <code>~/.local/bin</code> (<code>%LOCALAPPDATA%\agy\bin</code> on Windows). An <code>agy</code> you installed yourself is found where it is.</li>
+  <li><strong>Sign in inside its terminal</strong>, with your Google account, or give it a <code>GEMINI_API_KEY</code>.</li>
+  <li><strong>Your own settings.</strong> Antigravity always uses your own <code>~/.gemini</code>: it has no way to be pointed at another folder, so there is no isolated profile for it.</li>
+  <li><strong>Its turns are reported by hooks.</strong> Connecto keeps one entry, named <code>connecto</code>, in <code>~/.gemini/config/hooks.json</code>, and leaves your other hooks as they are. Outside a Connecto terminal it does nothing.</li>
+  <li>Settings &gt; Launch: skip permission prompts (<code>--dangerously-skip-permissions</code>), auto mode where your account offers it (<code>--mode auto</code>), or its normal prompts.</li>
+</ul>
+<p>Where Antigravity differs from Claude Code and Codex:</p>
+<ul>
+  <li><strong>No verified copy.</strong> <code>agy</code> updates itself, so Connecto runs it where it is installed, as it does Pi.</li>
+  <li><strong>A permission prompt is not reported.</strong> Antigravity has no hook for it, so a terminal waiting at one is not marked as needing you. An interrupted turn ends as finished.</li>
+  <li>It was built from Antigravity's documentation, not yet tried with a signed-in account. There are no <a href="automations.html">automations</a> for its screens, and <a href="memory.html">project memory</a> does not capture its turns yet.</li>
+</ul>
+
+<h2 id="opencode">OpenCode</h2>
+<p><a href="https://github.com/anomalyco/opencode">OpenCode</a> (<code>opencode</code>) is an open coding agent on any provider's models, with free ones of its own. In Connecto it has its own terminals, the <code>connecto</code> command (so it can ask the other agents, and be asked), history and resume, and the same Pause and audit log. Connecto supports the 1.x line, the one OpenCode's installer puts in <code>~/.opencode/bin</code>.</p>
+<ul>
+  <li><strong>Choose it at the first launch, or add it in Settings &gt; Agents.</strong> Connecto runs OpenCode's official installer from opencode.ai, and leaves your shell's startup file alone; on Windows it installs OpenCode's own release from GitHub into <code>~\.opencode\bin</code>. An <code>opencode</code> you installed yourself is found where it is. Only OpenCode 1.x is supported: an OpenCode 2 is refused with how to install 1.x.</li>
+  <li><strong>Sign in inside its terminal</strong>: type <code>/connect</code> and pick a provider. Its free models need no sign-in at all.</li>
+  <li><strong>Your own settings, or the project's.</strong> By default it uses your own OpenCode folders. With its config set to Isolated in the project's settings, the project has its own OpenCode settings, sign-ins and sessions; the commands the agent runs still see your own folders.</li>
+  <li><strong>Its turns are reported by a plugin</strong> that Connecto loads for its terminals only. Nothing is written into OpenCode's folders, and your own plugins still load.</li>
+  <li>Settings &gt; Launch: approve every permission your config does not deny (<code>--auto</code>), or its normal prompts. <code>--model</code> takes <code>provider/model</code>; there is no <code>--effort</code>.</li>
+</ul>
+<p>Where OpenCode differs from Claude Code and Codex:</p>
+<ul>
+  <li><strong>No verified copy.</strong> OpenCode upgrades itself, so Connecto runs it where it is installed.</li>
+  <li><strong>An interrupted turn ends as failed</strong>, not as interrupted. There are no <a href="automations.html">automations</a> for its screens, and <a href="memory.html">project memory</a> does not capture its turns yet.</li>
+</ul>
+
 <h2>A plain shell</h2>
 <p>Besides the agents, a terminal can be your login shell: <code>$SHELL</code> started as an interactive login shell in the project folder, so it has the environment you know. It has no turns, no login and no launch mode, so its dot is a small grey square that only says it is running. Other terminals drive it with <code>connecto send &lt;id&gt; '&lt;one command line&gt;'</code> and <code>connecto read &lt;id&gt;</code>; <code>--ask</code> and <code>watch</code> are refused, because a shell has no end of turn to report. It is held to the same rules as any terminal: Pause blocks writes, and every write is in the audit log. It is also as powerful as a bypass-permissions agent, so treat access to it that way.</p>
 
-<h2>Next: Gemini CLI, Cursor CLI and opencode</h2>
-<div class="note soon"><p><b>These three are being built now.</b> This page will list what each supports as it lands.</p></div>
+<h2>Next: Cursor CLI</h2>
+<div class="note soon"><p><b>It is being built now.</b> This page will list what it supports as it lands.</p></div>
 <p>The aim is for a new agent to be a full member of the workspace, not a second-class terminal:</p>
 <ul>
   <li>its own terminals, in the same project tree, with the same states;</li>
-  <li>the <code>connecto</code> command, so it can ask Claude or Codex for help, and be asked;</li>
+  <li>the <code>connecto</code> command, so it can ask the other agents for help, and be asked;</li>
   <li>the same Pause, audit log and redaction;</li>
   <li>a place in packages, automations and per-project settings, as far as each tool allows.</li>
 </ul>

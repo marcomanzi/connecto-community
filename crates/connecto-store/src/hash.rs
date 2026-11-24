@@ -9,7 +9,11 @@ use sha2::{Digest, Sha256};
 
 const BUFFER: usize = 1024 * 1024;
 
-pub(crate) fn sha256_file(path: &Path) -> io::Result<String> {
+/// The SHA-256 of the file at `path`, as lowercase hex.
+///
+/// # Errors
+/// When the file cannot be read.
+pub fn sha256_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; BUFFER];

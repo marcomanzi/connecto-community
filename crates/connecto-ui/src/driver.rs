@@ -2,7 +2,9 @@
 //! and PTY paths run unchanged. Compiled only with `ui-test-driver`.
 //!
 //! A script line is `<ms from start> click <x> <y>`, `<ms> press <name>`,
-//! `<ms> text <text>`, `<ms> key <Enter|Down|Escape>`.
+//! `<ms> text <text>`, `<ms> key <Enter|Down|Escape>`, `<ms> cmdclick <x> <y>`
+//! (a click with Cmd held, Ctrl off macOS; the key stays held for the rest of
+//! the run).
 //!
 //! `press` clicks a widget that named itself with [`note`], wherever this
 //! frame's layout put it. It waits until the widget exists, so a later step
@@ -27,6 +29,8 @@ enum Press {
 enum Step {
     Events(Vec<Event>),
     Point(Pos2, Press),
+    /// A step of a click made with the command key held.
+    CommandPoint(Pos2, Press),
     Target(String, Press),
     /// A command by name, for sheets no click reaches (`settings`).
     Command(String),
@@ -152,6 +156,13 @@ fn parse_line(line: &str, steps: &mut VecDeque<(Duration, Step)>) -> Option<()> 
             // One step per frame: a press and release in one frame is no click.
             for (offset, press) in [(0, Press::Hover), (40, Press::Down), (80, Press::Up)] {
                 steps.push_back((when(offset), Step::Point(pos, press)));
+            }
+        }
+        "cmdclick" => {
+            let (x, y) = argument.split_once(' ')?;
+            let pos = Pos2::new(x.parse().ok()?, y.parse().ok()?);
+            for (offset, press) in [(0, Press::Hover), (40, Press::Down), (80, Press::Up)] {
+                steps.push_back((when(offset), Step::CommandPoint(pos, press)));
             }
         }
         "press" if !argument.is_empty() => {
@@ -285,6 +296,17 @@ impl Driver {
                     .unwrap_or_else(|| ("nothing".to_owned(), Rect::from_min_max(pos, pos)));
                 self.note_press(ctx, press, &format!("click:{name}"), rect);
                 Some(press_events(press, pos))
+            }
+            Some(Step::CommandPoint(pos, press)) => {
+                let held = Modifiers {
+                    command: true,
+                    mac_cmd: cfg!(target_os = "macos"),
+                    ctrl: !cfg!(target_os = "macos"),
+                    ..Modifiers::NONE
+                };
+                let mut events = vec![Event::ModifiersChanged(held)];
+                events.extend(press_events(press, pos));
+                Some(events)
             }
             Some(Step::Command(name)) => {
                 self.commands.push(name);

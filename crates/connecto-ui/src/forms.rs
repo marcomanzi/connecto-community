@@ -77,6 +77,23 @@ impl<A> Out<A> {
         response.clicked()
     }
 
+    /// A tab of a second row, under the top-level tabs: smaller, and muted
+    /// unless it is the one on show, so the two levels never read alike.
+    pub(crate) fn sub_choice(&mut self, ui: &mut Ui, key: &str, on: bool, text: &str) -> bool {
+        let color = if on { theme::TEXT } else { theme::TEXT_MUTED };
+        let response = ui.selectable_label(on, RichText::new(text).size(11.5).color(color));
+        self.mark(key, response.rect);
+        response.clicked()
+    }
+
+    /// A line of text drawn by hand (not through `say`), recorded for tests.
+    pub(crate) fn text_mark(&mut self, text: &str) {
+        #[cfg(test)]
+        self.marks.texts.push(text.to_owned());
+        #[cfg(not(test))]
+        let _ = text;
+    }
+
     /// A small rounded tag.
     pub(crate) fn pill(&mut self, ui: &mut Ui, text: &str, color: Color32) {
         egui::Frame::NONE
@@ -88,6 +105,28 @@ impl<A> Out<A> {
                 self.say(ui, RichText::new(text).size(11.0).color(color));
             });
     }
+}
+
+/// A row of top-level tabs, drawn the same wherever a sheet has sections. Each
+/// entry is the tab, its test key and its label. Returns the tab clicked, when
+/// it is not the one on show.
+pub(crate) fn tab_row<A, T: Copy + PartialEq>(
+    ui: &mut Ui,
+    out: &mut Out<A>,
+    current: T,
+    tabs: impl IntoIterator<Item = (T, &'static str, &'static str)>,
+) -> Option<T> {
+    let mut picked = None;
+    ui.horizontal_wrapped(|ui| {
+        for (tab, key, label) in tabs {
+            let on = tab == current;
+            if out.choice(ui, key, on, label) && !on {
+                picked = Some(tab);
+            }
+        }
+    });
+    ui.add_space(6.0);
+    picked
 }
 
 pub(crate) fn muted(text: impl Into<String>) -> RichText {

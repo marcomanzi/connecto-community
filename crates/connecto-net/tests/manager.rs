@@ -89,6 +89,15 @@ struct Machine {
 }
 
 fn machine(tag: &str) -> Machine {
+    machine_with(tag, false, &[])
+}
+
+/// One terminal a host lists: wire id, name, host id, parent, owner.
+type Listed<'a> = (u32, &'a str, &'a str, Option<u32>, Option<u32>);
+
+/// A machine whose manager is a chat client when `chat`, and whose host
+/// lists `listed` in project "p" (one terminal when it is empty).
+fn machine_with(tag: &str, chat: bool, listed: &[Listed<'_>]) -> Machine {
     let dir = std::env::temp_dir().join(format!("mg-net-mgr-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let ring = Arc::new(Ring::new(1 << 20));
@@ -101,15 +110,45 @@ fn machine(tag: &str) -> Machine {
         ring: Arc::clone(&ring),
         typed: Mutex::new(Vec::new()),
     });
-    let terminals = Arc::new(FixedTerminals(Mutex::new(vec![HostTerminal {
-        id: 1,
-        name: "p: claude-1".into(),
-        tool: 1,
-        attempt: 1,
-        activity: 5,
-        session: Arc::clone(&fake) as Arc<dyn TerminalSession>,
-        ring,
-    }])));
+    let list = if listed.is_empty() {
+        vec![HostTerminal {
+            entry: None,
+            ran: true,
+            owner: None,
+            background: Vec::new(),
+            id: 1,
+            name: "p: claude-1".into(),
+            tool: 1,
+            project_id: "p".into(),
+            project_name: "Project".into(),
+            parent: None,
+            attempt: 1,
+            activity: 5,
+            session: Arc::clone(&fake) as Arc<dyn TerminalSession>,
+            ring,
+        }]
+    } else {
+        listed
+            .iter()
+            .map(|&(id, name, entry, parent, owner)| HostTerminal {
+                entry: Some(entry.into()),
+                ran: true,
+                owner,
+                background: Vec::new(),
+                id,
+                name: name.into(),
+                tool: 1,
+                project_id: "p".into(),
+                project_name: "Project".into(),
+                parent,
+                attempt: 1,
+                activity: 5,
+                session: Arc::clone(&fake) as Arc<dyn TerminalSession>,
+                ring: Arc::clone(&ring),
+            })
+            .collect()
+    };
+    let terminals = Arc::new(FixedTerminals(Mutex::new(list)));
     let pause = Arc::new(PauseSwitch::default());
     let guard = Arc::new(RemoteGate::new(
         Arc::clone(&pause),
@@ -118,7 +157,12 @@ fn machine(tag: &str) -> Machine {
     let secrets = Arc::new(MemorySecrets::default());
     let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
     let signer: Arc<dyn Signer> = Arc::new(KeySigner(key.clone()));
-    let manager = RemoteManager::start(ManagerConfig {
+    let start = if chat {
+        RemoteManager::start_chat_client
+    } else {
+        RemoteManager::start
+    };
+    let manager = start(ManagerConfig {
         dir: dir.clone(),
         secrets: Arc::clone(&secrets) as Arc<dyn SecretStore>,
         guard: Arc::clone(&guard) as Arc<dyn RemoteGuard>,
@@ -500,6 +544,67 @@ fn two_managers_connect_over_iroh_and_a_host_is_drawn_like_a_project() {
     wait_until("a link again", || {
         client.manager.view().hosts[0].link == HostLink::Direct
     });
+    host.manager.shutdown();
+    client.manager.shutdown();
+    let _ = std::fs::remove_dir_all(&host.dir);
+    let _ = std::fs::remove_dir_all(&client.dir);
+}
+
+/// A chat client (Connecto Chat) attaches only the project's app session,
+/// yet a call's roster of the project names every terminal the host lists:
+/// the person's own, and an agent's helper as the agent's that asked for it.
+#[test]
+fn a_chat_client_knows_every_terminal_of_the_project_and_whose_each_is() {
+    let host = machine_with(
+        "roster-host",
+        false,
+        &[
+            (1, "app-session", "claude-68", None, None),
+            (2, "claude-75", "claude-75", None, None),
+            (3, "coder", "claude-78", Some(1), None),
+            // Asked for by the coder, filed under the app session.
+            (4, "check", "claude-80", Some(1), Some(3)),
+        ],
+    );
+    let client = machine_with("roster-client", true, &[]);
+    host.manager
+        .add_authorized_key(&client.key.public_key().to_openssh().unwrap())
+        .unwrap();
+    host.manager.set_hosting(true);
+    wait_until("the host to listen", || {
+        host.manager.view().hosting == HostingStatus::Listening
+    });
+    client
+        .manager
+        .add_host("mac", &host.manager.view().my_address)
+        .unwrap();
+    client.manager.confirm_host();
+    wait_until("the roster", || {
+        client
+            .manager
+            .project_roster("mac", "p")
+            .is_some_and(|r| !r.is_empty())
+    });
+    // The chat client attaches the app session alone.
+    let attached = client.manager.terminals("mac").unwrap().view();
+    assert_eq!(attached.terminals.len(), 1);
+    assert_eq!(attached.terminals[0].display_id(), "claude-68");
+
+    let roster = client.manager.project_roster("mac", "p").unwrap();
+    let rows: Vec<(&str, Option<&str>, bool)> = roster
+        .iter()
+        .map(|t| (t.id.as_str(), t.owner.as_deref(), t.app_session))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("claude-68", None, true),
+            ("claude-75", None, false),
+            ("claude-78", Some("claude-68"), false),
+            ("claude-80", Some("claude-78"), false),
+        ]
+    );
+    assert!(client.manager.project_roster("mac", "nope").is_none());
     host.manager.shutdown();
     client.manager.shutdown();
     let _ = std::fs::remove_dir_all(&host.dir);

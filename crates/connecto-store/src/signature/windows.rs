@@ -49,8 +49,8 @@ struct Publisher {
 }
 
 /// The publishers a `team` may name, each with the exact subject its
-/// certificates have (seen on Windows on 2026-11-12). A `team` not listed
-/// here is refused.
+/// certificates have (seen on Windows on 2026-11-12, docs/windows-port.md
+/// 4.8.2 and 4.8.3). A `team` not listed here is refused.
 const PUBLISHERS: [(&str, Publisher); 3] = [
     (
         CLAUDE_SIGNER,

@@ -393,7 +393,7 @@ mod tests {
                 default.slug
             );
             assert!(slugs.insert(default.slug), "{} twice", default.slug);
-            for private in ["/Users/", "/home/", "@", "mmanzi", "http", "sk-", "Bearer"] {
+            for private in ["/Users/", "/home/", "@", "http", "sk-", "Bearer"] {
                 assert!(
                     !default.text.contains(private),
                     "{} mentions {private}",

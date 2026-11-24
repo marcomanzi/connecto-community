@@ -39,8 +39,14 @@ pub struct UpdateView {
     /// The version running.
     pub current: String,
     pub status: UpdateStatus,
-    /// Check at launch and daily.
+    /// Check at launch and then every minute.
     pub auto_check: bool,
+    /// Install a ready update by itself as soon as nothing blocks a restart,
+    /// and carry on the agent turns the restart cut.
+    pub auto_install: bool,
+    /// What holds back the automatic install of a ready update now (a
+    /// pairing, a file transfer...), if anything.
+    pub held: Option<String>,
     /// The status comes from a check the person asked for (so a result such as
     /// "up to date" is worth showing).
     pub asked: bool,
@@ -56,8 +62,11 @@ pub trait UpdateControl: Send + Sync {
     /// Check now (Connecto > Check for Updates…).
     fn check_now(&self);
 
-    /// Check at launch and daily, or not. Saved.
+    /// Check at launch and every minute, or not. Saved.
     fn set_auto_check(&self, on: bool);
+
+    /// Install ready updates by themselves, or wait for the person. Saved.
+    fn set_auto_install(&self, _on: bool) {}
 
     /// Hand the downloaded release over to the installer, which waits for this
     /// process to end. `Ok`: the app must now quit; it is started again on the

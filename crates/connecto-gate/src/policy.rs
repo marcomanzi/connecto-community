@@ -5,7 +5,7 @@ use connecto_core::Readiness;
 use crate::Denial;
 
 /// Changes whenever a rule here changes. Recorded in every audit entry.
-pub const POLICY_REVISION: u32 = 4;
+pub const POLICY_REVISION: u32 = 5;
 
 /// Who is asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,8 @@ pub enum AgentAction {
     Add,
     Start,
     Close,
+    /// Stop the background shells a target's agent left running.
+    StopTasks,
 }
 
 impl AgentAction {
@@ -68,6 +70,7 @@ impl AgentAction {
             Self::Add => "add",
             Self::Start => "start",
             Self::Close => "close",
+            Self::StopTasks => "stop-tasks",
         }
     }
 }
@@ -112,12 +115,14 @@ pub const fn decide_deliver(
 }
 
 /// Whether an agent's `action` may reach a target in `state`. Readiness and
-/// busy are not consulted: text is typed at once (R3). Add, Start and Close are
-/// process control, so they pass, on a bridge-off target too.
+/// busy are not consulted: text is typed at once (R3). Add, Start, Close and
+/// StopTasks are process control, so they pass, on a bridge-off target too.
 #[must_use]
 pub const fn decide_agent(action: AgentAction, state: &TargetState) -> Decision {
     match action {
-        AgentAction::Add | AgentAction::Start | AgentAction::Close => Decision::Allow,
+        AgentAction::Add | AgentAction::Start | AgentAction::Close | AgentAction::StopTasks => {
+            Decision::Allow
+        }
         AgentAction::Type | AgentAction::Keys | AgentAction::Wake => {
             if !state.running {
                 Decision::Deny(Denial::NotRunning)
@@ -272,7 +277,12 @@ mod tests {
                 Decision::Deny(Denial::ManualMode)
             );
         }
-        for action in [AgentAction::Add, AgentAction::Start, AgentAction::Close] {
+        for action in [
+            AgentAction::Add,
+            AgentAction::Start,
+            AgentAction::Close,
+            AgentAction::StopTasks,
+        ] {
             assert_eq!(decide_agent(action, &stopped), Decision::Allow);
             assert_eq!(decide_agent(action, &manual), Decision::Allow);
         }

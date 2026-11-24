@@ -8,6 +8,9 @@ use std::io::{self, Read, Write};
 
 use serde_json::{Value, json};
 
+/// The op of a `connecto add` that carries `--effort`.
+pub const ADD_EFFORT_OP: &str = "add_effort";
+
 /// The wire version both sides speak.
 pub const WIRE_VERSION: u64 = 1;
 
@@ -17,10 +20,33 @@ pub const BRIDGE_SOCKET_ENV: &str = "CONNECTO_BRIDGE_SOCK";
 /// Longest header a reply may carry.
 pub const MAX_HEADER: usize = 1024 * 1024;
 
+/// The drain's field saying the helper may hold a prompt (see
+/// [`Op::Drain`]).
+const BLOCKS_ON_HOOK_FAILURE: &str = "blocks_on_hook_failure";
+
+/// The op that carries another op into another project (ADR 0035). An op
+/// of its own, so an older app refuses it as unknown instead of ignoring the
+/// project and acting on its own.
+pub const IN_PROJECT_OP: &str = "in_project";
+
 /// One request. Long text arrives in `Send`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     List,
+    /// `connecto projects`: the projects this Connecto knows (ADR 0035).
+    Projects,
+    /// `connecto agents [--roles]`: the coding CLIs this project can start
+    /// now and, with `roles`, which one takes each role of a team (ADR 0045).
+    Agents {
+        roles: bool,
+    },
+    /// `--project <name|path>`: `op` acts on that project's terminals. Only
+    /// list, read, send, result, watch and unwatch are allowed; the app
+    /// refuses any other.
+    InProject {
+        project: String,
+        op: Box<Op>,
+    },
     Send {
         target: String,
         ask: bool,
@@ -48,6 +74,8 @@ pub enum Op {
         name: Option<String>,
         /// The model the new terminal runs on, from `--model`.
         model: Option<String>,
+        /// Its reasoning effort, from `--effort`.
+        effort: Option<String>,
     },
     Start {
         target: String,
@@ -55,8 +83,61 @@ pub enum Op {
     Close {
         target: String,
     },
+    /// `connecto tasks <id> [--stop [task]]`: the background work a terminal's
+    /// agent left running; with `stop`, stop its background shells, or only
+    /// `task`.
+    Tasks {
+        target: String,
+        stop: bool,
+        task: Option<String>,
+    },
     Drain {
         event: String,
+        /// The prompt being submitted, for project operations (ADR 0031).
+        /// An older app ignores it.
+        prompt: Option<String>,
+        /// This hook can take an intercept: confirm it, print the block,
+        /// then say go, and Claude blocks the prompt if the hook fails or
+        /// times out (`onFailure: "block"`, set with `--holds`). On the
+        /// wire as `blocks_on_hook_failure`; an earlier `holds` field, sent
+        /// by helpers that could not promise the latter, is ignored.
+        /// Without it the app never answers with an intercept.
+        holds: bool,
+    },
+    /// `connecto memory <verb> [args]`: the verb word and the arguments as
+    /// given, checked by the app; `text` is stdin for `propose` and `flag`.
+    Memory {
+        verb: String,
+        args: Vec<String>,
+        text: Option<String>,
+    },
+    /// `connecto op <verb> [args]`: the project's operations (ADR 0031);
+    /// `text` is stdin for `llm`.
+    Ops {
+        verb: String,
+        args: Vec<String>,
+        text: Option<String>,
+    },
+    /// `connecto send-file <path>`: offer a file to the machines viewing this
+    /// one over Connecto's remote link. `path` is absolute (the command
+    /// resolves it against the folder it was typed in).
+    SendFile {
+        path: String,
+    },
+    /// `connecto works <verb> [args]`: the project's Agentic Works; `text`
+    /// is what the command read for it (a definition, a prompt, a key file).
+    Works {
+        verb: String,
+        args: Vec<String>,
+        text: Option<String>,
+    },
+    /// `connecto secret <verb> [args]`: the vault, by name only. No reply to
+    /// it ever holds a secret's value.
+    Secret {
+        verb: String,
+        args: Vec<String>,
+        /// The folder the command was typed in, for `run`.
+        cwd: Option<String>,
     },
 }
 
@@ -65,6 +146,30 @@ pub enum Op {
 pub enum BadRequest {
     Version,
     Malformed(String),
+}
+
+/// An optional list of text (absent is empty).
+fn text_list(value: &Value, field: &str) -> Result<Vec<String>, BadRequest> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| BadRequest::Malformed(format!("`{field}` is not a list of text"))),
+        Some(_) => Err(BadRequest::Malformed(format!(
+            "`{field}` is not a list of text"
+        ))),
+    }
+}
+
+/// An optional text field (absent or null is None).
+fn optional_text(value: &Value, field: &str) -> Result<Option<String>, BadRequest> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(BadRequest::Malformed(format!("`{field}` is not text"))),
+    }
 }
 
 fn string(value: &Value, field: &str) -> Result<String, BadRequest> {
@@ -81,6 +186,11 @@ impl Op {
     pub fn to_json(&self) -> Value {
         let mut value = match self {
             Self::List => json!({ "op": "list" }),
+            Self::Projects => json!({ "op": "projects" }),
+            Self::Agents { roles } => json!({ "op": "agents", "roles": roles }),
+            Self::InProject { project, op } => {
+                json!({ "op": IN_PROJECT_OP, "project": project, "inner": op.to_json() })
+            }
             Self::Send { target, ask, text } => {
                 json!({ "op": "send", "target": target, "ask": ask, "text": text })
             }
@@ -89,19 +199,84 @@ impl Op {
             Self::Result { request } => json!({ "op": "result", "request": request }),
             Self::Watch { target } => json!({ "op": "watch", "target": target }),
             Self::Unwatch { target } => json!({ "op": "unwatch", "target": target }),
-            Self::Add { tool, name, model } => {
-                let mut value = json!({ "op": "add", "tool": tool });
+            Self::Add {
+                tool,
+                name,
+                model,
+                effort,
+            } => {
+                // An add with an effort has an op of its own, so an older app,
+                // which would drop the field and launch at the default
+                // effort, refuses it as an unknown op instead.
+                let op = if effort.is_some() {
+                    ADD_EFFORT_OP
+                } else {
+                    "add"
+                };
+                let mut value = json!({ "op": op, "tool": tool });
                 if let Some(name) = name {
                     value["name"] = json!(name);
                 }
                 if let Some(model) = model {
                     value["model"] = json!(model);
                 }
+                if let Some(effort) = effort {
+                    value["effort"] = json!(effort);
+                }
                 value
             }
             Self::Start { target } => json!({ "op": "start", "target": target }),
             Self::Close { target } => json!({ "op": "close", "target": target }),
-            Self::Drain { event } => json!({ "op": "drain", "event": event }),
+            Self::Tasks { target, stop, task } => {
+                let mut value = json!({ "op": "tasks", "target": target, "stop": stop });
+                if let Some(task) = task {
+                    value["task"] = json!(task);
+                }
+                value
+            }
+            Self::Drain {
+                event,
+                prompt,
+                holds,
+            } => {
+                let mut value = json!({ "op": "drain", "event": event });
+                if let Some(prompt) = prompt {
+                    value["prompt"] = json!(prompt);
+                }
+                if *holds {
+                    value[BLOCKS_ON_HOOK_FAILURE] = json!(true);
+                }
+                value
+            }
+            Self::SendFile { path } => json!({ "op": "send_file", "path": path }),
+            Self::Memory { verb, args, text } => {
+                let mut value = json!({ "op": "memory", "verb": verb, "args": args });
+                if let Some(text) = text {
+                    value["text"] = json!(text);
+                }
+                value
+            }
+            Self::Ops { verb, args, text } => {
+                let mut value = json!({ "op": "ops", "verb": verb, "args": args });
+                if let Some(text) = text {
+                    value["text"] = json!(text);
+                }
+                value
+            }
+            Self::Works { verb, args, text } => {
+                let mut value = json!({ "op": "works", "verb": verb, "args": args });
+                if let Some(text) = text {
+                    value["text"] = json!(text);
+                }
+                value
+            }
+            Self::Secret { verb, args, cwd } => {
+                let mut value = json!({ "op": "secret", "verb": verb, "args": args });
+                if let Some(cwd) = cwd {
+                    value["cwd"] = json!(cwd);
+                }
+                value
+            }
         };
         value["v"] = json!(WIRE_VERSION);
         value
@@ -118,6 +293,34 @@ impl Op {
         let op = string(&value, "op")?;
         Ok(match op.as_str() {
             "list" => Self::List,
+            "projects" => Self::Projects,
+            "agents" => Self::Agents {
+                roles: match value.get("roles") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(roles)) => *roles,
+                    Some(_) => {
+                        return Err(BadRequest::Malformed("`roles` is not true or false".into()));
+                    }
+                },
+            },
+            IN_PROJECT_OP => {
+                let project = string(&value, "project")?;
+                let inner = value
+                    .get("inner")
+                    .ok_or_else(|| BadRequest::Malformed("`inner` is missing".into()))?;
+                let bytes = serde_json::to_vec(inner)
+                    .map_err(|err| BadRequest::Malformed(format!("`inner`: {err}")))?;
+                let inner = Self::parse(&bytes)?;
+                if matches!(inner, Self::InProject { .. }) {
+                    return Err(BadRequest::Malformed(
+                        "`in_project` cannot carry another `in_project`".into(),
+                    ));
+                }
+                Self::InProject {
+                    project,
+                    op: Box::new(inner),
+                }
+            }
             "send" => Self::Send {
                 target: string(&value, "target")?,
                 ask: match value.get("ask") {
@@ -154,17 +357,24 @@ impl Op {
             "unwatch" => Self::Unwatch {
                 target: string(&value, "target")?,
             },
-            "add" => {
+            "add" | ADD_EFFORT_OP => {
                 let optional = |field: &str| match value.get(field) {
                     None | Some(Value::Null) => Ok(None),
                     Some(Value::String(text)) => Ok(Some(text.clone())),
                     Some(_) => Err(BadRequest::Malformed(format!("`{field}` is not text"))),
                 };
-                Self::Add {
+                let add = Self::Add {
                     tool: string(&value, "tool")?,
                     name: optional("name")?,
                     model: optional("model")?,
+                    effort: optional("effort")?,
+                };
+                if op == ADD_EFFORT_OP && matches!(add, Self::Add { effort: None, .. }) {
+                    return Err(BadRequest::Malformed(format!(
+                        "`{ADD_EFFORT_OP}` takes an `effort`"
+                    )));
                 }
+                add
             }
             "start" => Self::Start {
                 target: string(&value, "target")?,
@@ -172,8 +382,76 @@ impl Op {
             "close" => Self::Close {
                 target: string(&value, "target")?,
             },
+            "tasks" => Self::Tasks {
+                target: string(&value, "target")?,
+                stop: match value.get("stop") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(stop)) => *stop,
+                    Some(_) => {
+                        return Err(BadRequest::Malformed("`stop` is not true or false".into()));
+                    }
+                },
+                task: match value.get("task") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(task)) => Some(task.clone()),
+                    Some(_) => return Err(BadRequest::Malformed("`task` is not text".into())),
+                },
+            },
             "drain" => Self::Drain {
                 event: string(&value, "event")?,
+                prompt: match value.get("prompt") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(prompt)) => Some(prompt.clone()),
+                    Some(_) => return Err(BadRequest::Malformed("`prompt` is not text".into())),
+                },
+                holds: value.get(BLOCKS_ON_HOOK_FAILURE).and_then(Value::as_bool) == Some(true),
+            },
+            "ops" => Self::Ops {
+                verb: string(&value, "verb")?,
+                args: text_list(&value, "args")?,
+                text: match value.get("text") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(text)) => Some(text.clone()),
+                    Some(_) => return Err(BadRequest::Malformed("`text` is not text".into())),
+                },
+            },
+            "send_file" => Self::SendFile {
+                path: string(&value, "path")?,
+            },
+            "works" => Self::Works {
+                verb: string(&value, "verb")?,
+                args: text_list(&value, "args")?,
+                text: optional_text(&value, "text")?,
+            },
+            "secret" => Self::Secret {
+                verb: string(&value, "verb")?,
+                args: text_list(&value, "args")?,
+                cwd: match value.get("cwd") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(cwd)) => Some(cwd.clone()),
+                    Some(_) => return Err(BadRequest::Malformed("`cwd` is not text".into())),
+                },
+            },
+            "memory" => Self::Memory {
+                verb: string(&value, "verb")?,
+                args: match value.get("args") {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(Value::Array(args)) => args
+                        .iter()
+                        .map(|arg| arg.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            BadRequest::Malformed("`args` is not a list of text".into())
+                        })?,
+                    Some(_) => {
+                        return Err(BadRequest::Malformed("`args` is not a list of text".into()));
+                    }
+                },
+                text: match value.get("text") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(text)) => Some(text.clone()),
+                    Some(_) => return Err(BadRequest::Malformed("`text` is not text".into())),
+                },
             },
             other => return Err(BadRequest::Malformed(format!("unknown op {other:?}"))),
         })
@@ -331,10 +609,59 @@ pub fn valid_key(key: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// An add with an effort travels as its own op, so an older app refuses
+    /// it rather than launching at the default effort; without one it stays
+    /// the plain `add` every app knows.
+    #[test]
+    fn an_add_with_an_effort_has_an_op_of_its_own() {
+        let add = |effort: Option<&str>| Op::Add {
+            tool: "codex".into(),
+            name: None,
+            model: Some("gpt-6.2-astra".into()),
+            effort: effort.map(str::to_owned),
+        };
+        assert_eq!(add(None).to_json()["op"], "add");
+        assert_eq!(add(Some("medium")).to_json()["op"], ADD_EFFORT_OP);
+        let bare = json!({ "v": WIRE_VERSION, "op": ADD_EFFORT_OP, "tool": "codex" });
+        assert!(Op::parse(bare.to_string().as_bytes()).is_err());
+    }
+
+    /// A helper from before the gate sent `holds` whatever Claude would do on
+    /// a hook failure: the app reads it as a drain that cannot hold, so the
+    /// session gets Suggest.
+    #[test]
+    fn a_legacy_holds_field_does_not_let_a_drain_hold() {
+        let legacy = json!({ "v": WIRE_VERSION, "op": "drain", "event": "UserPromptSubmit",
+            "prompt": "run the tests", "holds": true });
+        assert!(matches!(
+            Op::parse(legacy.to_string().as_bytes()).unwrap(),
+            Op::Drain { holds: false, .. }
+        ));
+        let gated = Op::Drain {
+            event: "UserPromptSubmit".into(),
+            prompt: Some("run the tests".into()),
+            holds: true,
+        }
+        .to_json();
+        assert_eq!(gated["blocks_on_hook_failure"], true);
+        assert!(gated.get("holds").is_none());
+    }
+
     #[test]
     fn every_op_round_trips() {
         let ops = [
             Op::List,
+            Op::Projects,
+            Op::Agents { roles: false },
+            Op::Agents { roles: true },
+            Op::InProject {
+                project: "harbor app".into(),
+                op: Box::new(Op::Send {
+                    target: "claude-12".into(),
+                    ask: true,
+                    text: "hi".into(),
+                }),
+            },
             Op::Send {
                 target: "codex-2".into(),
                 ask: true,
@@ -354,22 +681,112 @@ mod tests {
                 tool: "claude".into(),
                 name: None,
                 model: None,
+                effort: None,
             },
             Op::Add {
                 tool: "codex".into(),
                 name: Some("review the diff".into()),
-                model: Some("gpt-6.1-sol".into()),
+                model: Some("gpt-6.2-astra".into()),
+                effort: Some("medium".into()),
             },
             Op::Start { target: "a".into() },
             Op::Close { target: "a".into() },
+            Op::Tasks {
+                target: "a".into(),
+                stop: false,
+                task: None,
+            },
+            Op::Tasks {
+                target: "a".into(),
+                stop: true,
+                task: Some("b1".into()),
+            },
             Op::Drain {
                 event: "UserPromptSubmit".into(),
+                prompt: None,
+                holds: false,
+            },
+            Op::Drain {
+                event: "UserPromptSubmit".into(),
+                prompt: Some("deploy".into()),
+                holds: true,
+            },
+            Op::SendFile {
+                path: "/tmp/report.html".into(),
+            },
+            Op::Memory {
+                verb: "brief".into(),
+                args: Vec::new(),
+                text: None,
+            },
+            Op::Memory {
+                verb: "search".into(),
+                args: vec!["release".into(), "--room".into(), "officina".into()],
+                text: None,
+            },
+            Op::Memory {
+                verb: "propose".into(),
+                args: vec!["--type".into(), "task".into()],
+                text: Some("We chose SQLite.\nBecause.".into()),
+            },
+            Op::Ops {
+                verb: "run".into(),
+                args: vec!["deploy".into(), "--yes".into()],
+                text: None,
+            },
+            Op::Ops {
+                verb: "llm".into(),
+                args: Vec::new(),
+                text: Some("Write a commit message.".into()),
+            },
+            Op::Secret {
+                verb: "list".into(),
+                args: Vec::new(),
+                cwd: None,
+            },
+            Op::Works {
+                verb: "show".into(),
+                args: Vec::new(),
+                text: None,
+            },
+            Op::Works {
+                verb: "publish".into(),
+                args: vec!["summary".into()],
+                text: Some("{}".into()),
+            },
+            Op::Secret {
+                verb: "run".into(),
+                args: vec!["GITHUB".into(), "--".into(), "/usr/bin/gh".into()],
+                cwd: Some("/work/p".into()),
             },
         ];
         for op in ops {
             let bytes = serde_json::to_vec(&op.to_json()).unwrap();
             assert_eq!(Op::parse(&bytes).unwrap(), op);
         }
+    }
+
+    #[test]
+    fn a_project_op_is_an_op_of_its_own_and_carries_one_level() {
+        let op = Op::InProject {
+            project: "p".into(),
+            op: Box::new(Op::List),
+        };
+        let value = op.to_json();
+        // An older app does not know this op, so it refuses instead of
+        // listing its own project.
+        assert_eq!(value["op"], IN_PROJECT_OP);
+        let nested = json!({
+            "v": WIRE_VERSION, "op": IN_PROJECT_OP, "project": "a",
+            "inner": { "v": WIRE_VERSION, "op": IN_PROJECT_OP, "project": "b",
+                       "inner": { "v": WIRE_VERSION, "op": "list" } }
+        });
+        assert!(matches!(
+            Op::parse(&serde_json::to_vec(&nested).unwrap()),
+            Err(BadRequest::Malformed(_))
+        ));
+        let no_inner = json!({ "v": WIRE_VERSION, "op": IN_PROJECT_OP, "project": "a" });
+        assert!(Op::parse(&serde_json::to_vec(&no_inner).unwrap()).is_err());
     }
 
     #[test]
@@ -405,6 +822,30 @@ mod tests {
                 text: "x".into()
             }
         );
+    }
+
+    #[test]
+    fn a_memory_request_checks_its_fields_and_ignores_unknown_ones() {
+        assert_eq!(
+            Op::parse(br#"{"v":1,"op":"memory","verb":"status","future":true}"#).unwrap(),
+            Op::Memory {
+                verb: "status".into(),
+                args: Vec::new(),
+                text: None
+            }
+        );
+        for bad in [
+            &br#"{"v":1,"op":"memory"}"#[..],
+            br#"{"v":1,"op":"memory","verb":"read","args":"m-x"}"#,
+            br#"{"v":1,"op":"memory","verb":"read","args":[1]}"#,
+            br#"{"v":1,"op":"memory","verb":"propose","text":7}"#,
+        ] {
+            assert!(
+                matches!(Op::parse(bad), Err(BadRequest::Malformed(_))),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 
     #[test]

@@ -1,11 +1,19 @@
 //! macOS (and other Unix) side of [`crate::platform`].
 
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::store::Tool;
+
+/// The variables a launcher script is run with besides `PATH`, when the rest
+/// of the environment is cleared: none (`HOME` is set by each caller).
+#[must_use]
+pub const fn launcher_env(_home: &Path) -> Vec<(OsString, OsString)> {
+    Vec::new()
+}
 
 /// The helper's file name in the store.
 pub const HOOK_NAME: &str = "connecto-hook";

@@ -1,0 +1,95 @@
+{
+  "name": "Game Dev",
+  "description": "Make games with Godot 4.7 and coding agents: a one-page design kept to solo size, the Godot workflow (headless checks, tests, the godot-ai editor link, exports), 3D art from Blender scripts exported as .glb, playtests that judge the game on screenshots, video frames pulled with FFmpeg and logs, and how several agents share the work. Needs Godot, Blender and FFmpeg.",
+  "version": 3,
+  "requires": [
+    {
+      "id": "godot",
+      "name": "Godot 4 (4.7 or later)",
+      "why": "The game engine. Agents build, check, run and export the game with its command line.",
+      "detect": {
+        "programs": ["godot"],
+        "paths": {
+          "macos": [
+            "/Applications/Godot.app/Contents/MacOS/Godot",
+            "~/Applications/Godot.app/Contents/MacOS/Godot"
+          ],
+          "linux": [
+            "/var/lib/flatpak/exports/bin/org.godotengine.Godot",
+            "~/.local/share/flatpak/exports/bin/org.godotengine.Godot"
+          ]
+        },
+        "version": { "flag": "--version", "min": "4.7", "below": "5" }
+      },
+      "install": {
+        "macos": "brew install --cask godot",
+        "windows": "winget install -e --id GodotEngine.GodotEngine",
+        "linux": "flatpak install -y flathub org.godotengine.Godot"
+      },
+      "manual": "Download the standard (not .NET) build of Godot 4.7 or a later 4.x from godotengine.org. On a Mac, move Godot.app to Applications; elsewhere, put the godot program on your PATH. Godot is free and MIT-licensed: there is no account or licence to accept.",
+      "url": "https://godotengine.org/download/"
+    },
+    {
+      "id": "blender",
+      "name": "Blender (4.2 or later)",
+      "why": "Makes the game's 3D models. Agents write Blender Python scripts, run them without the interface (blender -b -P) and export .glb files for Godot.",
+      "detect": {
+        "programs": ["blender"],
+        "paths": {
+          "macos": [
+            "/Applications/Blender.app/Contents/MacOS/Blender",
+            "~/Applications/Blender.app/Contents/MacOS/Blender"
+          ],
+          "windows": [
+            "%ProgramFiles%\\Blender Foundation\\Blender 4.2\\blender.exe",
+            "%ProgramFiles%\\Blender Foundation\\Blender 4.3\\blender.exe",
+            "%ProgramFiles%\\Blender Foundation\\Blender 4.4\\blender.exe",
+            "%ProgramFiles%\\Blender Foundation\\Blender 4.5\\blender.exe",
+            "%ProgramFiles%\\Blender Foundation\\Blender 5.0\\blender.exe",
+            "%ProgramFiles%\\Blender Foundation\\Blender 5.1\\blender.exe",
+            "%ProgramFiles%\\Blender Foundation\\Blender 5.2\\blender.exe",
+            "%ProgramFiles%\\Blender Foundation\\Blender 5.3\\blender.exe",
+            "%ProgramFiles%\\Blender Foundation\\Blender 5.4\\blender.exe",
+            "%ProgramFiles%\\Blender Foundation\\Blender 5.5\\blender.exe",
+            "%ProgramFiles%\\Blender Foundation\\Blender 5.6\\blender.exe",
+            "%ProgramFiles%\\Blender Foundation\\Blender 6.0\\blender.exe"
+          ],
+          "linux": [
+            "/var/lib/flatpak/exports/bin/org.blender.Blender",
+            "~/.local/share/flatpak/exports/bin/org.blender.Blender"
+          ]
+        },
+        "version": { "flag": "--version", "min": "4.2" }
+      },
+      "install": {
+        "macos": "brew install --cask blender",
+        "windows": "winget install -e --id BlenderFoundation.Blender",
+        "linux": "flatpak install -y flathub org.blender.Blender"
+      },
+      "manual": "Download Blender 4.2 or later from blender.org. On a Mac, move Blender.app to Applications; on Windows, run the installer and keep its folder (Program Files\\Blender Foundation); on Linux, put the blender program on your PATH. Blender is free and GPL-licensed: there is no account or licence to accept.",
+      "url": "https://www.blender.org/download/"
+    },
+    {
+      "id": "ffmpeg",
+      "name": "FFmpeg (4.4 or later)",
+      "why": "Pulls frames and contact sheets out of the game's recordings, so agents and playtests can look at motion and animation.",
+      "detect": {
+        "programs": ["ffmpeg"],
+        "paths": {
+          "windows": [
+            "%LOCALAPPDATA%\\Microsoft\\WinGet\\Links\\ffmpeg.exe",
+            "%ProgramFiles%\\WinGet\\Links\\ffmpeg.exe"
+          ]
+        },
+        "version": { "flag": "-version", "min": "4.4" }
+      },
+      "install": {
+        "macos": "brew install ffmpeg",
+        "windows": "winget install -e --id Gyan.FFmpeg",
+        "linux": "sh -c 'if command -v apt-get >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y ffmpeg; elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y ffmpeg-free; elif command -v pacman >/dev/null 2>&1; then sudo pacman -S --needed --noconfirm ffmpeg; elif command -v zypper >/dev/null 2>&1; then sudo zypper --non-interactive install ffmpeg; else echo \"No apt-get, dnf, pacman or zypper here: install ffmpeg 4.4 or later yourself, then check again.\"; fi'"
+      },
+      "manual": "Install FFmpeg 4.4 or later with your system's package manager (macOS: brew install ffmpeg; Debian or Ubuntu: sudo apt install ffmpeg; Fedora: sudo dnf install ffmpeg-free; Arch: sudo pacman -S ffmpeg), or download a build linked from ffmpeg.org and put the ffmpeg program on your PATH. FFmpeg is free (LGPL/GPL): there is no account or licence to accept.",
+      "url": "https://ffmpeg.org/download.html"
+    }
+  ]
+}

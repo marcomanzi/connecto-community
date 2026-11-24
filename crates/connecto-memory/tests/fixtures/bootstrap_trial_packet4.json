@@ -1,0 +1,67 @@
+{
+ "operations": [
+  {
+   "op": "create",
+   "ref": "export-formats",
+   "room": "architettura",
+   "slug": "export-formats",
+   "kind": "fatto",
+   "standing": "accertato",
+   "status": "candidato",
+   "summary": "The exporter (src/bramble/export.py) writes every bookmark in one of three formats: Netscape HTML for browsers, JSON Lines for scripts and CSV for spreadsheets. It runs as bramble export --format json and never changes the database.",
+   "details": "Each format has a writer function registered in WRITERS under its name. Tags become a comma-separated field in CSV, an array in JSON Lines and the TAGS attribute in HTML. Dates are written as ISO 8601 strings in UTC, except in HTML, whose browser format wants seconds since 1970. Bookmarks come out in the order they were added. A format name missing from WRITERS stops the command before any file is opened.",
+   "scope": "project",
+   "anchors": [
+    {
+     "path": "src/bramble/export.py",
+     "blob": ""
+    }
+   ],
+   "sources": [
+    "e-113"
+   ]
+  },
+  {
+   "op": "create",
+   "ref": "export-atomic",
+   "room": "architettura",
+   "slug": "export-writes-are-atomic",
+   "kind": "fatto",
+   "standing": "accertato",
+   "status": "candidato",
+   "summary": "An export never leaves a half-written file behind. The writer streams into a temporary file next to the target and renames it over the target only after the last row is flushed. An existing target is replaced only with --force.",
+   "details": "The temporary file takes the target's name plus a .partial suffix and is removed if the writer raises. Rows are read from the database 200 at a time, so a large collection is never held in memory whole. The command prints how many bookmarks it wrote and the final path. Whether the rename is atomic on a network drive was not checked in this material.",
+   "scope": "project",
+   "anchors": [
+    {
+     "path": "src/bramble/export.py",
+     "blob": ""
+    }
+   ],
+   "sources": [
+    "e-113"
+   ]
+  },
+  {
+   "op": "create",
+   "ref": "export-backup",
+   "room": "officina",
+   "slug": "nightly-backup-with-export",
+   "kind": "procedura",
+   "standing": "documentata",
+   "status": "candidato",
+   "summary": "For a nightly backup, schedule bramble export --format json --output backups/bramble.jsonl --force with cron or launchd. Restoring is bramble import on the same file, which skips bookmarks that already exist.",
+   "details": "The module's docstring suggests this procedure; the scheduling itself is outside the project. JSON Lines suits backups because it keeps every field, including tags and the date added, which CSV flattens. Nobody ran a restore from such a file in this material.",
+   "scope": "project",
+   "anchors": [
+    {
+     "path": "src/bramble/export.py",
+     "blob": ""
+    }
+   ],
+   "sources": [
+    "e-113"
+   ]
+  }
+ ]
+}

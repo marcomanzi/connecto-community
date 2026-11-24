@@ -3,8 +3,8 @@
 //! The default shell is PowerShell: `pwsh.exe` when it is on `PATH`, else
 //! Windows PowerShell (`powershell.exe`). Folders get no Unix modes: the data
 //! folder is under `%APPDATA%`, which only the user (and administrators) can
-//! read. Agent terminals run Claude Code and Codex natively. The hook and
-//! bridge endpoints are named pipes.
+//! read. Agent terminals run Claude Code and Codex natively (milestone M3 of
+//! `docs/windows-port.md`). The hook and bridge endpoints are named pipes.
 
 use std::ffi::OsString;
 use std::fs;
@@ -53,7 +53,8 @@ pub(crate) const PATH_SEPARATOR: &str = ";";
 /// Folders in the home folder that hold the CLIs' or the system's state: a
 /// project may not be one of them or sit inside one. `AppData` is what
 /// `Library` is on macOS.
-pub(crate) const HOME_STATE: [&str; 4] = [".claude", ".codex", ".local", "AppData"];
+pub(crate) const HOME_STATE: [&str; 6] =
+    [".claude", ".codex", ".local", "AppData", ".pi", ".gemini"];
 
 /// The shell used by the panes: Windows PowerShell, where Windows installs it.
 /// `-NoProfile` skips the user's profile scripts. Where Windows is not on
@@ -295,7 +296,7 @@ pub(crate) fn no_console(command: &mut std::process::Command) -> &mut std::proce
 /// The whole environment of the `codex app-server` that reads hook trust
 /// ([`crate::codex_trust`]): a scratch home, and `SystemRoot`, without which
 /// Windows programs fail to load parts of the system. No `PATH` is needed
-/// (checked on Codex 0.167.2).
+/// (checked on Codex 0.167.2, `docs/windows-port.md` 4.8.3).
 pub(crate) fn codex_trust_env(scratch: &Path) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = vec![
         ("CODEX_HOME".into(), scratch.into()),
@@ -307,7 +308,8 @@ pub(crate) fn codex_trust_env(scratch: &Path) -> Vec<(OsString, OsString)> {
     env
 }
 
-/// Agent terminals (Claude Code, Codex) run natively on Windows.
+/// Agent terminals (Claude Code, Codex) run natively on Windows (M3 of
+/// `docs/windows-port.md`).
 pub(crate) const fn agents_supported() -> io::Result<()> {
     Ok(())
 }

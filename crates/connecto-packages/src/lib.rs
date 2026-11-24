@@ -6,6 +6,7 @@
 //! The UI holds an `Arc<dyn connecto_core::PackagesControl>` (see [`Packages`]);
 //! everything here runs on its own thread.
 
+pub mod bundle;
 pub mod commit;
 mod engine;
 mod fsx;
@@ -15,6 +16,7 @@ mod host;
 pub mod install;
 pub mod package;
 mod platform;
+pub mod requires;
 mod session;
 pub mod state;
 
@@ -35,6 +37,10 @@ pub use host::{Host, ProjectInfo, ProjectRef};
 /// `package.rs` pins these values.
 pub use package::{STATUSLINE_PS1, SUBAGENT_STATUSLINE_PS1};
 
+/// Why an approved install command was not run.
+pub(crate) const CHANGED: &str =
+    "the package's install command changed since you saw it: look at it again";
+
 /// The running manager, as the UI's handle.
 pub struct Packages {
     view: Arc<ArcSwap<PackagesView>>,
@@ -44,7 +50,48 @@ pub struct Packages {
     host: Arc<dyn Host>,
 }
 
+/// What a settings write from an older peer leaves as the project has it
+/// when the write is applied.
+#[derive(Clone, Copy)]
+enum Keep {
+    Nothing,
+    /// From before OpenCode (and so before sets of tools).
+    OpenCodeAndTools,
+    /// From before sets of tools.
+    Tools,
+}
+
 impl Packages {
+    /// Check `settings` and queue them for `project_id`; `keep_opencode`
+    /// leaves the project's OpenCode config as the worker finds it.
+    fn checked_set(
+        &self,
+        project_id: &str,
+        settings: ProjectSettings,
+        keep: Keep,
+    ) -> Result<(), String> {
+        if !self.host.projects().iter().any(|p| p.id == project_id) {
+            return Err("no such project".to_owned());
+        }
+        let view = self.view();
+        for id in &settings.packages {
+            if !view.packages.iter().any(|p| p.id == *id) {
+                return Err(format!("no such package: {id}"));
+            }
+        }
+        // A package added while a tool it needs is missing (the user did not
+        // install it, or refused to) is not turned on (ADR 0037).
+        if let Some(why) = connecto_core::requirements_refusal(&view, project_id, &settings) {
+            return Err(why);
+        }
+        let id = project_id.to_owned();
+        self.send(match keep {
+            Keep::Nothing => Cmd::SetProject(id, settings),
+            Keep::OpenCodeAndTools => Cmd::SetProjectKeepingOpenCode(id, settings),
+            Keep::Tools => Cmd::SetProjectKeepingTools(id, settings),
+        })
+    }
+
     /// Start the manager for the app, with the given host (the app's
     /// workspace and automations). `wake` is called whenever the view changes.
     pub fn start(data_root: PathBuf, host: Arc<dyn Host>, wake: Wake) -> std::io::Result<Self> {
@@ -57,6 +104,7 @@ impl Packages {
             user_home,
             host,
             wake,
+            detector: None,
         })
     }
 
@@ -103,8 +151,8 @@ impl Packages {
 
     /// A user package that is in the list (not the built-in one).
     fn user_package(&self, id: &str) -> Result<(), String> {
-        if id == package::BUILTIN_ID {
-            return Err("the built-in package cannot be changed".to_owned());
+        if package::is_builtin(id) {
+            return Err("a built-in package cannot be changed".to_owned());
         }
         if self.view().packages.iter().any(|p| p.id == id) {
             Ok(())
@@ -140,6 +188,11 @@ impl PackagesControl for Packages {
         {
             return Err("no such package".to_owned());
         }
+        // The default goes into every project that uses it: not one that
+        // needs a tool this machine does not have.
+        if let Some(why) = package.and_then(|id| connecto_core::package_refusal(&self.view(), id)) {
+            return Err(why);
+        }
         self.send(Cmd::SetDefault(package.map(str::to_owned)))
     }
 
@@ -173,24 +226,87 @@ impl PackagesControl for Packages {
         self.send(Cmd::Delete(id.to_owned()))
     }
 
+    fn export_package(&self, id: &str, dest: PathBuf) -> Result<(), String> {
+        self.has_home()?;
+        self.user_package(id)?;
+        self.send(Cmd::Export {
+            id: id.to_owned(),
+            dest,
+        })
+    }
+
+    fn import_package(&self, path: PathBuf) -> Result<(), String> {
+        self.has_home()?;
+        self.send(Cmd::Import(path))
+    }
+
     fn set_project_settings(
         &self,
         project_id: &str,
         settings: ProjectSettings,
     ) -> Result<(), String> {
-        if !self.host.projects().iter().any(|p| p.id == project_id) {
-            return Err("no such project".to_owned());
-        }
-        let view = self.view();
-        for id in &settings.packages {
-            if !view.packages.iter().any(|p| p.id == *id) {
-                return Err(format!("no such package: {id}"));
-            }
-        }
-        self.send(Cmd::SetProject(project_id.to_owned(), settings))
+        self.checked_set(project_id, settings, Keep::Nothing)
+    }
+
+    fn set_project_settings_keeping_opencode(
+        &self,
+        project_id: &str,
+        settings: ProjectSettings,
+    ) -> Result<(), String> {
+        self.checked_set(project_id, settings, Keep::OpenCodeAndTools)
+    }
+
+    fn set_project_settings_keeping_tools(
+        &self,
+        project_id: &str,
+        settings: ProjectSettings,
+    ) -> Result<(), String> {
+        self.checked_set(project_id, settings, Keep::Tools)
     }
 
     fn refresh_project(&self, project_id: &str) {
         let _ = self.send(Cmd::Refresh(project_id.to_owned()));
+    }
+
+    fn check_requirements(&self, package: &str) -> Result<(), String> {
+        if !self.view().packages.iter().any(|p| p.id == package) {
+            return Err("no such package".to_owned());
+        }
+        self.send(Cmd::CheckRequirements(package.to_owned()))
+    }
+
+    fn install_requirement(
+        &self,
+        project_id: &str,
+        package: &str,
+        requirement: &str,
+        command: &str,
+    ) -> Result<(), String> {
+        if !self.host.projects().iter().any(|p| p.id == project_id) {
+            return Err("no such project".to_owned());
+        }
+        let view = self.view();
+        let req = view
+            .packages
+            .iter()
+            .find(|p| p.id == package)
+            .and_then(|p| p.requires.iter().find(|r| r.id == requirement))
+            .ok_or("no such tool")?;
+        match req.install.as_deref() {
+            None => {
+                return Err(format!(
+                    "{} has no install command here: follow its manual steps",
+                    req.name
+                ));
+            }
+            Some(current) if current != command => return Err(CHANGED.to_owned()),
+            Some(_) => {}
+        }
+        self.send(Cmd::InstallRequirement {
+            project: project_id.to_owned(),
+            package: package.to_owned(),
+            requirement: requirement.to_owned(),
+            command: command.to_owned(),
+        })
     }
 }

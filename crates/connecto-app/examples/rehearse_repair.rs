@@ -10,6 +10,10 @@ fn main() {
             .expect("usage: rehearse_repair <DATA_ROOT>"),
     );
     println!(
+        "sign-in identity notes written: {}",
+        connecto_session::launch::repair_secure_storage(&data)
+    );
+    println!(
         "conversation files brought into empty profiles: {}",
         connecto_session::launch::repair_empty_generations(&data)
     );

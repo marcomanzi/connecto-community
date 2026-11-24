@@ -10,8 +10,10 @@ use serde_json::Value;
 use crate::platform::Flavor;
 use crate::quote::{QuoteError, powershell_quote, shell_quote};
 use crate::spec::{
-    AdapterError, Capabilities, ComposerState, Continuation, HookCtx, LaunchCtx, LaunchSpec,
-    LogMark, LoginCtx, ToolAdapter, base_env, hook_env, under_profile, with_bridge_path,
+    AdapterError, Capabilities, ComposerState, ComposerView, Continuation, DraftKeys, HookCtx,
+    LaunchCtx, LaunchSpec, LogMark, LoggedTurn, LoginCtx, Row, Screen, ToolAdapter, UtilityLaunch,
+    UtilityTool, base_env, hook_env, prompt_matches_exact, under_profile, utility_hook_env,
+    with_bridge_path,
 };
 
 /// Stops a filled profile folder from costing unbounded time per event.
@@ -65,35 +67,38 @@ fn safe_thread_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
-fn find_rollout(dir: &Path, suffix: &str, depth: u8, budget: &mut usize) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
-    };
+fn find_rollout(dir: &Path, suffix: &str, depth: u8, budget: &mut usize) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         if *budget == 0 {
-            return false;
+            return None;
         }
         *budget -= 1;
         let Ok(kind) = entry.file_type() else {
             continue;
         };
         if kind.is_dir() {
-            if depth > 0 && find_rollout(&entry.path(), suffix, depth - 1, budget) {
-                return true;
+            if depth > 0
+                && let Some(found) = find_rollout(&entry.path(), suffix, depth - 1, budget)
+            {
+                return Some(found);
             }
         } else if kind.is_file() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with("rollout-") && name.ends_with(suffix) {
-                return true;
+                return Some(entry.path());
             }
         }
     }
-    false
+    None
 }
 
-/// Hidden title threads have no rollout file, which is how they are told apart.
-fn has_rollout(profile: &Path, thread_id: &str) -> bool {
+/// The rollout file of `thread_id` under the profile, if there is one.
+pub(crate) fn rollout_of(profile: &Path, thread_id: &str) -> Option<PathBuf> {
+    if !safe_thread_id(thread_id) {
+        return None;
+    }
     let mut budget = MAX_ROLLOUT_ENTRIES;
     find_rollout(
         &profile.join("sessions"),
@@ -103,14 +108,28 @@ fn has_rollout(profile: &Path, thread_id: &str) -> bool {
     )
 }
 
+/// Hidden title threads have no rollout file, which is how they are told apart.
+fn has_rollout(profile: &Path, thread_id: &str) -> bool {
+    rollout_of(profile, thread_id).is_some()
+}
+
 /// The events Codex gets a hook for. `Stop` and `Interrupt` are not added:
 /// `notify` stays the turn end, which keeps their unproven interplay small.
 const HOOK_EVENTS: [&str; 2] = ["SessionStart", "UserPromptSubmit"];
 
+/// Set to `1` when Connecto's `SessionStart` hook should hand Codex the
+/// built-in package's recap, which is compiled into the helper. The helper
+/// reads the same name (`connecto_hook::codex::RECAP_ENV`).
+pub const RECAP_ENV: &str = "CONNECTO_CODEX_RECAP";
+
+/// The bridge text, for Connecto's `SessionStart` hook to hand to Codex. The
+/// helper reads the same name (`connecto_hook::codex::BRIDGE_TEXT_ENV`).
+pub const BRIDGE_TEXT_ENV: &str = "CONNECTO_CODEX_BRIDGE_TEXT";
+
 /// The command Codex runs for `event`. On macOS Codex runs it with `sh -c`;
 /// on Windows with `pwsh.exe -NoProfile -Command` (or Windows PowerShell),
 /// where a quoted path alone is a string, not a command, so `&` calls it
-/// (checked on Codex 0.167.2).
+/// (checked on Codex 0.167.2, `docs/windows-port.md` 4.8.3).
 fn hook_command(flavor: Flavor, helper: &str, event: &str) -> Result<String, QuoteError> {
     let context = if event == "UserPromptSubmit" {
         " --context"
@@ -129,13 +148,30 @@ fn hook_command(flavor: Flavor, helper: &str, event: &str) -> Result<String, Quo
     })
 }
 
+/// The most tokens of the `SessionStart` hook's context Codex keeps. Its own
+/// limit (about 2,500 tokens on 0.167.0) would cut the bridge text, which is
+/// over 2,000 with the memory and operations sections, and the recap after
+/// it: Codex keeps the start and the end and drops the middle. This leaves
+/// room to grow. Codex 0.167.0 takes the key in this spelling only
+/// (`additional_context_limit` is ignored); checked with
+/// `tests/codex_real_bridge.rs`. Part of the hook definition, so of its
+/// trust hash, which preflight reads for these same values.
+const SESSION_START_CONTEXT_LIMIT: u32 = 20_000;
+
 fn hook_config_as(flavor: Flavor, helper: &Path) -> Result<Vec<String>, QuoteError> {
     HOOK_EVENTS
         .iter()
         .map(|event| {
             let command = hook_command(flavor, &helper.to_string_lossy(), event)?;
+            // Only `SessionStart` carries the launch's instructions; the
+            // prompt hook's notices keep Codex's own limit.
+            let limit = if *event == "SessionStart" {
+                format!(",additionalContextLimit={SESSION_START_CONTEXT_LIMIT}")
+            } else {
+                String::new()
+            };
             Ok(format!(
-                "hooks.{event}=[{{hooks=[{{type=\"command\",command={}}}]}}]",
+                "hooks.{event}=[{{hooks=[{{type=\"command\",command={}{limit}}}]}}]",
                 toml_string(&command)
             ))
         })
@@ -293,17 +329,19 @@ const COMPOSER_PLACEHOLDER: &str = "Ask Codex to do anything";
 /// choice such as an approval's `1. Yes` are `Occupied`. A line below the composer
 /// that is not footer, or a composer with no footer, is `Booting`: not ready, and
 /// not a prompt either. The status row directly above an empty composer says
-/// `Busy` when Codex is working.
-pub fn codex_composer_state(screen: &str) -> ComposerState {
-    let lines: Vec<&str> = screen
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+/// `Busy` when Codex is working. A placeholder Codex draws dimmed (its own, or
+/// one of the example prompts it picks at random) is not typed text.
+pub fn codex_composer_state(screen: Screen<'_>) -> ComposerState {
+    let rows: Vec<Row<'_>> = screen
+        .rows()
+        .into_iter()
+        .filter(|row| !row.drawn.is_empty())
         .collect();
-    let Some(at) = lines.iter().rposition(|line| line.starts_with('›')) else {
+    let Some(at) = rows.iter().rposition(|row| row.drawn.starts_with('›')) else {
         return ComposerState::Booting;
     };
-    let typed = lines[at].trim_start_matches('›').trim();
+    let typed = rows[at].typed.trim_start_matches('›').trim();
+    let lines: Vec<&str> = rows.iter().map(|row| row.drawn).collect();
     if typed.is_empty() || typed == COMPOSER_PLACEHOLDER {
         // An empty composer.
     } else if COMPOSER_PLACEHOLDER.starts_with(typed) {
@@ -313,7 +351,17 @@ pub fn codex_composer_state(screen: &str) -> ComposerState {
         return ComposerState::Occupied;
     }
     let below = &lines[at + 1..];
-    if below.is_empty() || !below.iter().all(|line| is_footer_line(line)) {
+    let (_, rest) = codex_box(screen);
+    // Text typed on a later row of the box (its first row empty): a draft,
+    // whatever the footer looks like.
+    if matches!(&rest, crate::spec::BoxRows::Read(rows) if rows.iter().any(|r| !r.is_empty())) {
+        return ComposerState::Occupied;
+    }
+    // Ready once its footer is drawn: rows of the footer's shape, or the
+    // footer the box's geometry verifies (a status row naming the folder,
+    // drawn without a `·` on some versions).
+    let footer_drawn = !below.is_empty() && below.iter().all(|line| is_footer_line(line));
+    if !footer_drawn && !matches!(rest, crate::spec::BoxRows::Read(_)) {
         return ComposerState::Booting;
     }
     let status_above = at.checked_sub(1).map(|row| lines[row]).unwrap_or("");
@@ -323,6 +371,67 @@ pub fn codex_composer_state(screen: &str) -> ComposerState {
         return ComposerState::Busy;
     }
     ComposerState::Empty
+}
+
+/// Codex's input box, from its geometry: its last row starting with `›` at
+/// the first column (earlier prompts above are drawn the same way; the box
+/// is the last), the rows under it indented, down to the footer block at
+/// the screen's bottom (the footer's shape, after any blank rows). What is
+/// typed on its first row (without the marker) and on the others. A row at
+/// the first column under the marker, or no footer block, is ambiguous.
+fn codex_box(screen: Screen<'_>) -> (String, crate::spec::BoxRows) {
+    use crate::spec::BoxRows;
+    let rows = crate::spec::raw_rows(screen);
+    let Some(at) = rows
+        .iter()
+        .rposition(|(d, _)| *d == "›" || d.starts_with("› ") || d.starts_with("›\u{a0}"))
+    else {
+        return (String::new(), BoxRows::Ambiguous);
+    };
+    let below = &rows[at + 1..];
+    // The footer, from the screen's bottom up: hint rows, then the one
+    // status row (it names the folder), then the blank row that separates
+    // it from the box. Anything else there: where the box ends is unknown.
+    let mut end = below.len();
+    while end > 0 && below[end - 1].0.trim().is_empty() {
+        end -= 1;
+    }
+    while end > 0 && is_hint_row(below[end - 1].0) {
+        end -= 1;
+    }
+    let Some(status) = end.checked_sub(1).filter(|&s| is_status_row(below[s].0)) else {
+        return (String::new(), BoxRows::Ambiguous);
+    };
+    let Some(footer) = status
+        .checked_sub(1)
+        .filter(|&s| below[s].0.trim().is_empty())
+    else {
+        return (String::new(), BoxRows::Ambiguous);
+    };
+    let inside = &below[..footer];
+    if inside
+        .iter()
+        .any(|(d, _)| d.chars().next().is_some_and(|c| c != ' '))
+    {
+        return (String::new(), BoxRows::Ambiguous);
+    }
+    let typed = rows[at].1;
+    let first_line = typed.strip_prefix('›').unwrap_or(typed).trim().to_owned();
+    let rest = inside.iter().map(|(_, t)| t.trim().to_owned()).collect();
+    (first_line, BoxRows::Read(rest))
+}
+
+/// Codex's status row: the model, then the folder it works in (`~/…` or
+/// `/…`), perhaps the thread's name after it.
+fn is_status_row(line: &str) -> bool {
+    line.split([' ', '·']).any(|word| {
+        word == "~" || word.starts_with("~/") || (word.starts_with('/') && word.len() > 1)
+    })
+}
+
+/// A hint row under Codex's status row.
+fn is_hint_row(line: &str) -> bool {
+    line.contains("? for shortcuts") || line.contains("f2 to view")
 }
 
 /// A line of Codex's footer: the hint row, or the status line that names the
@@ -344,6 +453,9 @@ impl Codex {
             "notify=[{},\"codex\"]",
             toml_string(&ctx.hook_binary.to_string_lossy())
         );
+        if let Some(utility) = &ctx.utility {
+            return Self::utility_launch(flavor, ctx, utility, notify);
+        }
         let mut args: Vec<OsString> = Vec::new();
         // `codex resume <id>` takes the same options as the plain command.
         if let Some(id) = &ctx.resume {
@@ -370,29 +482,22 @@ impl Codex {
             "-c".into(),
             notify.into(),
         ]);
+        if let Some(effort) = &ctx.effort {
+            args.extend([
+                "-c".into(),
+                format!("model_reasoning_effort={}", toml_string(effort)).into(),
+            ]);
+        }
         if let Some(model) = &ctx.model {
             args.push("-c".into());
             args.push(format!("model={}", toml_string(model)).into());
         }
         #[cfg(feature = "test-endpoints")]
-        if let Some(url) = &ctx.fake_model {
-            // The default model offers the fake endpoint no tools at all.
-            let provider = format!(
-                "model_providers.fake={{name=\"fake\",base_url={},wire_api=\"responses\",env_key=\"FAKE_KEY\"}}",
-                toml_string(&format!("{url}/v1"))
-            );
-            for value in [
-                provider.as_str(),
-                "model_provider=\"fake\"",
-                "model=\"gpt-fake\"",
-            ] {
-                args.push("-c".into());
-                args.push(value.into());
-            }
-        }
+        push_fake_model(ctx, &mut args);
         // Hooks are never registered without a trust state to go with them.
         // The trust state was read for these same values, so a helper path
         // they cannot be built for has none either.
+        let mut hooks = false;
         if ctx.bridge.hooks
             && let Some(trust) = &ctx.bridge.trust
             && let Ok(values) = hook_config_as(flavor, &ctx.hook_binary)
@@ -403,10 +508,7 @@ impl Codex {
             }
             args.push("-c".into());
             args.push(trust.into());
-        }
-        if let Some(text) = &ctx.bridge.text {
-            args.push("-c".into());
-            args.push(format!("developer_instructions={}", toml_string(text)).into());
+            hooks = true;
         }
         if let (Some(_), Some(note)) = (&ctx.resume, &ctx.resume_note) {
             args.push("--".into());
@@ -428,6 +530,89 @@ impl Codex {
         );
         env.extend(hook_env(ctx));
         with_bridge_path(flavor, &mut env, ctx);
+        // The bridge text and the package recap, through the `SessionStart`
+        // hook: Codex adds the hook's context as a developer message of its
+        // own, beside the configured `developer_instructions` and AGENTS.md,
+        // when a thread starts, resumes, is cleared or compacted (ADR 0046).
+        // `-c developer_instructions` is never used: it replaces the ones the
+        // user configured. The bridge text goes in Codex's environment, which
+        // the hook inherits; the recap is compiled into the helper and only
+        // turned on. Without the hooks Codex has no channel that adds to its
+        // instructions, and both are left out (the bridge is then off anyway:
+        // preflight gives no text without hooks and their trust).
+        if hooks {
+            if let Some(text) = &ctx.bridge.text {
+                env.push((BRIDGE_TEXT_ENV.into(), text.into()));
+            }
+            if ctx.package_text.is_some() {
+                env.push((RECAP_ENV.into(), "1".into()));
+            }
+        }
+        #[cfg(feature = "test-endpoints")]
+        if ctx.fake_model.is_some() {
+            env.push(("FAKE_KEY".into(), "fake-local-model".into()));
+        }
+        LaunchSpec {
+            program: ctx.entry.clone(),
+            args,
+            cwd: ctx.project.clone(),
+            env,
+            files: Vec::new(),
+        }
+    }
+
+    /// A utility session: Codex has no launch without tools (spike S2), so
+    /// every utility access gets the narrowest one it has: the read-only
+    /// sandbox, never an approval prompt, no MCP server, no web search, no
+    /// bypass flag, no hooks and no bridge. The turn ends by `notify`; the
+    /// prompt and reply are read from the rollout where `notify` lacks them.
+    fn utility_launch(
+        flavor: Flavor,
+        ctx: &LaunchCtx,
+        utility: &UtilityLaunch,
+        notify: String,
+    ) -> LaunchSpec {
+        let mut args: Vec<OsString> = vec![
+            "--no-daemon".into(),
+            "--no-alt-screen".into(),
+            "--sandbox".into(),
+            "read-only".into(),
+            "--ask-for-approval".into(),
+            "never".into(),
+            "-C".into(),
+            ctx.project.clone().into(),
+            "-c".into(),
+            "check_for_update_on_startup=false".into(),
+            "-c".into(),
+            notify.into(),
+            "-c".into(),
+            "mcp_servers={}".into(),
+            "-c".into(),
+            "web_search=\"disabled\"".into(),
+        ];
+        if let Some(model) = &utility.model {
+            args.push("-c".into());
+            args.push(format!("model={}", toml_string(model)).into());
+        }
+        args.push("-c".into());
+        args.push(
+            format!(
+                "model_reasoning_effort={}",
+                toml_string(codex_effort(&utility.effort))
+            )
+            .into(),
+        );
+        #[cfg(feature = "test-endpoints")]
+        push_fake_model(ctx, &mut args);
+        let mut env = tool_env(
+            flavor,
+            &ctx.home,
+            &ctx.session_tmp,
+            &ctx.profile,
+            ctx.system_config,
+            &ctx.inherited,
+        );
+        env.extend(utility_hook_env(ctx));
         #[cfg(feature = "test-endpoints")]
         if ctx.fake_model.is_some() {
             env.push(("FAKE_KEY".into(), "fake-local-model".into()));
@@ -442,9 +627,195 @@ impl Codex {
     }
 }
 
+/// Point Codex at the fake model endpoint of the end-to-end tests. The
+/// default model offers the fake endpoint no tools at all.
+#[cfg(feature = "test-endpoints")]
+fn push_fake_model(ctx: &LaunchCtx, args: &mut Vec<OsString>) {
+    if let Some(url) = &ctx.fake_model {
+        let provider = format!(
+            "model_providers.fake={{name=\"fake\",base_url={},wire_api=\"responses\",env_key=\"FAKE_KEY\"}}",
+            toml_string(&format!("{url}/v1"))
+        );
+        for value in [
+            provider.as_str(),
+            "model_provider=\"fake\"",
+            "model=\"gpt-fake\"",
+        ] {
+            args.push("-c".into());
+            args.push(value.into());
+        }
+    }
+}
+
+/// Codex's word for an effort: it has no `max`, its top is `xhigh`.
+fn codex_effort(effort: &str) -> &str {
+    if effort == "max" { "xhigh" } else { effort }
+}
+
+/// Codex's folder trust prompt is on `screen`.
+fn codex_trust_screen(screen: &str) -> bool {
+    screen.contains("trust the contents of this directory") || screen.contains("Do you trust")
+}
+
+/// A Codex screen that waits for a person, named by what it is.
+fn codex_blocked_reason(screen: &str) -> Option<String> {
+    let has = |text: &str| screen.contains(text);
+    if codex_trust_screen(screen) {
+        Some("blocked at Codex's folder trust prompt: open a Codex terminal in this project and answer it once".to_owned())
+    } else if has("Sign in with ChatGPT") || has("Provide your own API key") {
+        Some("Codex is not logged in for this project".to_owned())
+    } else if has("Update available") && has("Skip") {
+        Some("blocked at Codex's update prompt".to_owned())
+    } else {
+        None
+    }
+}
+
+/// The text of a rollout `response_item` that is a user message: its
+/// `input_text` blocks, joined.
+pub(crate) fn user_item_text(payload: &Value) -> Option<String> {
+    if payload.get("type").and_then(Value::as_str) != Some("message")
+        || payload.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return None;
+    }
+    let texts: Vec<&str> = payload
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("input_text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect();
+    (!texts.is_empty()).then(|| texts.join("\n"))
+}
+
+/// Measured on 0.167.1: the prompt is a `response_item` user `message` (the
+/// environment context before it is one too, and never matches); 0.166.0 also
+/// wrote it as an `event_msg` `user_message`. The reply is `task_complete`'s
+/// `last_agent_message`, which closes the turn. `agent_message` events before
+/// it are commentary between tool calls, never the response. A failed turn
+/// has an `error` event.
+fn codex_read_turn(log: &str, sent: &str) -> LoggedTurn {
+    let mut turn = LoggedTurn::default();
+    let prompt = |turn: &mut LoggedTurn, message: &str| {
+        let whole = prompt_matches_exact(sent, message);
+        turn.prompt_chars = turn.prompt_chars.max(message.chars().count());
+        turn.reply = None;
+        turn.complete = false;
+        if whole || !turn.prompt_whole {
+            turn.prompt_whole |= whole;
+            turn.error = None;
+        }
+    };
+    for line in log.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("response_item") => {
+                if let Some(message) = user_item_text(payload) {
+                    prompt(&mut turn, &message);
+                }
+                continue;
+            }
+            Some("event_msg") => {}
+            _ => continue,
+        }
+        let text = |field: &str| {
+            payload
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        match payload.get("type").and_then(Value::as_str) {
+            Some("user_message") => {
+                // The same prompt again (0.166.0 writes both forms): it must
+                // not clear what the first one proved.
+                if let Some(message) = text("message")
+                    && !(turn.prompt_whole && prompt_matches_exact(sent, &message))
+                {
+                    prompt(&mut turn, &message);
+                }
+            }
+            Some("task_complete") => {
+                turn.reply = text("last_agent_message");
+                turn.complete = true;
+            }
+            Some("error") => {
+                turn.error =
+                    Some(text("message").unwrap_or_else(|| "Codex reported an error".to_owned()));
+            }
+            Some("turn_aborted") => {
+                turn.error = Some("the turn was interrupted".to_owned());
+            }
+            _ => {}
+        }
+    }
+    turn
+}
+
+impl UtilityTool for Codex {
+    fn ready(&self, screen: &str) -> bool {
+        codex_composer_state(Screen::plain(screen)) == ComposerState::Empty
+    }
+
+    fn blocked(&self, screen: &str) -> Option<String> {
+        codex_blocked_reason(screen)
+    }
+
+    fn untrusted(&self, screen: &str) -> Option<String> {
+        codex_trust_screen(screen).then(|| {
+                "Codex has not been trusted for this project folder yet: open a Codex terminal in the project once and accept".to_owned()
+            })
+    }
+
+    /// A utility session has no hooks (they need a trust read that only a
+    /// bridged terminal makes), so only `notify` reports.
+    fn prompt_hook(&self) -> bool {
+        false
+    }
+
+    fn composer(&self, screen: &str) -> ComposerState {
+        codex_composer_state(Screen::plain(screen))
+    }
+
+    /// Codex drops trailing whitespace (measured on 0.166.0), which the
+    /// whitespace-blind comparison already allows.
+    fn prompt_matches(&self, sent: &str, submitted: &str) -> bool {
+        prompt_matches_exact(sent, submitted)
+    }
+
+    fn log_path(
+        &self,
+        reported: Option<&Path>,
+        thread: Option<&str>,
+        ctx: &HookCtx,
+    ) -> Option<PathBuf> {
+        if let Some(path) = reported.and_then(|path| under_profile(path, &ctx.profile)) {
+            return Some(path);
+        }
+        rollout_of(&ctx.profile, thread?).and_then(|path| under_profile(&path, &ctx.profile))
+    }
+
+    fn read_turn(&self, log: &str, sent: &str) -> LoggedTurn {
+        codex_read_turn(log, sent)
+    }
+
+    fn reply_error(&self, _reply: &str) -> Option<String> {
+        None
+    }
+}
+
 impl ToolAdapter for Codex {
     fn launch(&self, ctx: &LaunchCtx) -> LaunchSpec {
         Self::launch_as(Flavor::HOST, ctx)
+    }
+
+    fn utility(&self) -> Option<&dyn UtilityTool> {
+        Some(self)
     }
 
     fn login(&self, ctx: &LoginCtx) -> LaunchSpec {
@@ -528,6 +899,8 @@ impl ToolAdapter for Codex {
                 background: Vec::new(),
                 thread: None,
                 turn: None,
+                failure: None,
+                continued: false,
             }]);
         }
         if kind != "agent-turn-complete" {
@@ -595,11 +968,13 @@ impl ToolAdapter for Codex {
             background: Vec::new(),
             thread: id("thread-id", safe_thread_id),
             turn: id("turn-id", safe_turn_id),
+            failure: None,
+            continued: false,
         }])
     }
 
     fn readiness(&self, screen: &str) -> Readiness {
-        if codex_composer_state(screen) == ComposerState::Empty {
+        if codex_composer_state(Screen::plain(screen)) == ComposerState::Empty {
             Readiness::Ready
         } else {
             Readiness::NotReady
@@ -669,6 +1044,36 @@ impl ToolAdapter for Codex {
     fn continuation(&self, _prompt: &str) -> Option<Continuation> {
         None
     }
+
+    /// Shift+Enter (ESC CR) is a newline; Ctrl-C empties the composer or
+    /// interrupts a turn; a long paste is shown as `[Pasted Content N chars]`.
+    fn draft_keys(&self) -> DraftKeys {
+        DraftKeys {
+            multiline: true,
+            esc_enter_newline: true,
+            ctrl_c_clears: false,
+            collapses_pastes: true,
+        }
+    }
+
+    fn composer(&self, screen: Screen<'_>) -> Option<ComposerView> {
+        let state = codex_composer_state(screen);
+        // Read from the box's geometry; what is typed on its first row,
+        // whatever the state.
+        let (first_line, rest) = codex_box(screen);
+        // A box not read for certain: the first row as before, for what
+        // only needs a guess.
+        let first_line = match rest {
+            crate::spec::BoxRows::Read(_) => first_line,
+            _ if state == ComposerState::Occupied => crate::claude::composer_line(screen, '›'),
+            _ => String::new(),
+        };
+        Some(ComposerView {
+            state,
+            first_line,
+            rest,
+        })
+    }
 }
 
 /// The `turn_id` in the start of a line, if it sits there.
@@ -685,6 +1090,11 @@ mod tests {
 
     use super::*;
     use crate::spec::tests::{launch_ctx, login_ctx};
+    use serde_json::json;
+
+    fn has(spec: &LaunchSpec, name: &str) -> bool {
+        spec.env.iter().any(|(key, _)| key == name)
+    }
 
     #[test]
     fn the_ack_form_removes_only_what_codex_was_measured_rewriting() {
@@ -795,6 +1205,18 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// A terminal leaves MCP to the user: the servers in the profile's
+    /// `config.toml` (isolated or the user's own) load. Only utility sessions
+    /// switch them off.
+    #[test]
+    fn a_terminal_launch_keeps_the_users_mcp_servers() {
+        let words = args(&Codex.launch(&launch_ctx()));
+        assert!(
+            !words.iter().any(|w| w.starts_with("mcp_servers")),
+            "{words:?}"
+        );
     }
 
     /// The setup choice maps to exactly one set of flags.
@@ -978,6 +1400,102 @@ mod tests {
         );
     }
 
+    fn env_value(spec: &LaunchSpec, name: &str) -> Option<String> {
+        spec.env
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+    }
+
+    /// The recap reaches Codex through Connecto's `SessionStart` hook, which
+    /// hands it over as a developer message of its own (checked on Codex
+    /// 0.167 in a session rollout). The text is compiled into the helper; the
+    /// launch only turns it on with [`RECAP_ENV`], so there is no file a
+    /// session could rewrite. It never touches `developer_instructions`
+    /// (which would replace the configured ones) nor the command line, and
+    /// the hook command is the same, so its trust hash is too.
+    #[test]
+    fn the_recap_goes_through_the_session_start_hook_not_the_command_line() {
+        let mut ctx = launch_ctx();
+        let without = Codex.launch(&ctx);
+        ctx.package_text = Some("RECAP".into());
+        for bridge in [Some("LAUNCH TEXT".to_owned()), None] {
+            ctx.bridge.text.clone_from(&bridge);
+            let spec = Codex.launch(&ctx);
+            assert_eq!(env_value(&spec, RECAP_ENV).as_deref(), Some("1"));
+            assert!(spec.files.is_empty(), "no file: {:?}", spec.files);
+            let words = args(&spec);
+            assert!(!words.iter().any(|w| w.contains("RECAP")), "{words:?}");
+            if bridge.is_some() {
+                // The command line is the one it was without the recap.
+                assert_eq!(words, args(&without));
+            }
+        }
+        let hooks = hook_config_as(Flavor::Unix, Path::new("/h/connecto-hook")).unwrap();
+        assert!(
+            hooks[0].contains("codex-hook --event SessionStart\""),
+            "{hooks:?}"
+        );
+    }
+
+    /// Without Connecto's hooks there is no channel that adds to the
+    /// configured instructions, so neither the recap nor the bridge text is
+    /// passed at all (and never by `developer_instructions`, which would
+    /// replace the user's); nor to a utility session.
+    #[test]
+    fn no_hooks_no_recap() {
+        let mut ctx = launch_ctx();
+        ctx.package_text = Some("RECAP".into());
+        ctx.bridge.text = Some("LAUNCH TEXT".into());
+        for (hooks, trust) in [(false, ctx.bridge.trust.clone()), (true, None)] {
+            ctx.bridge.hooks = hooks;
+            ctx.bridge.trust = trust;
+            let spec = Codex.launch(&ctx);
+            assert_eq!(env_value(&spec, RECAP_ENV), None);
+            assert_eq!(env_value(&spec, BRIDGE_TEXT_ENV), None);
+            assert!(spec.files.is_empty());
+            let words = args(&spec);
+            assert!(
+                !words
+                    .iter()
+                    .any(|w| w.contains("RECAP") || w.contains("LAUNCH TEXT")),
+                "{words:?}"
+            );
+        }
+        let mut ctx = utility_ctx(crate::UtilityAccess::ReadOnly);
+        ctx.package_text = Some("RECAP".into());
+        ctx.bridge.text = Some("LAUNCH TEXT".into());
+        let spec = Codex.launch(&ctx);
+        assert_eq!(env_value(&spec, RECAP_ENV), None);
+        assert_eq!(env_value(&spec, BRIDGE_TEXT_ENV), None);
+    }
+
+    /// The bridge text reaches the `SessionStart` hook whole, through Codex's
+    /// environment, in a new and a resumed session: nothing goes into
+    /// `developer_instructions` (which replaces the user's configured ones),
+    /// and the command line is the one a launch without the text has.
+    #[test]
+    fn the_bridge_text_goes_through_the_session_start_hook_not_developer_instructions() {
+        let text = "You are terminal \"codex-1\".\n`connecto list` 'q' \\ $HOME ünï";
+        for resume in [None, Some("abc".to_owned())] {
+            let mut ctx = launch_ctx();
+            ctx.resume.clone_from(&resume);
+            ctx.bridge.text = None;
+            let without = args(&Codex.launch(&ctx));
+            ctx.bridge.text = Some(text.to_owned());
+            let spec = Codex.launch(&ctx);
+            assert_eq!(env_value(&spec, BRIDGE_TEXT_ENV).as_deref(), Some(text));
+            assert_eq!(args(&spec), without, "{resume:?}");
+            assert!(
+                !args(&spec)
+                    .iter()
+                    .any(|w| w.contains("developer_instructions")),
+                "{resume:?}"
+            );
+            assert!(spec.files.is_empty());
+        }
+    }
+
     #[test]
     fn toml_strings_are_escaped() {
         assert_eq!(toml_string(r#"a"b\c"#), r#""a\"b\\c""#);
@@ -1041,6 +1559,8 @@ mod tests {
                 background: Vec::new(),
                 thread: Some(EventText::new(THREAD.to_owned())),
                 turn: Some(EventText::new("t".to_owned())),
+                failure: None,
+                continued: false,
             }]
         );
     }
@@ -1184,14 +1704,20 @@ mod tests {
                 .any(|a| a.contains("codex-hook --event UserPromptSubmit --context"))
         );
         assert!(args.iter().any(|a| a.starts_with("hooks.state=")));
+        // The launch text goes to the `SessionStart` hook, never into
+        // `developer_instructions`, which would replace the user's own.
+        assert_eq!(
+            env_value(&spec, BRIDGE_TEXT_ENV).as_deref(),
+            Some("LAUNCH TEXT")
+        );
         assert!(
-            args.iter()
-                .any(|a| a == r#"developer_instructions="LAUNCH TEXT""#)
+            !args.iter().any(|a| a.contains("developer_instructions")),
+            "{args:?}"
         );
         let mut ctx = launch_ctx();
         ctx.bridge.trust = None;
-        let args: Vec<_> = Codex
-            .launch(&ctx)
+        let spec = Codex.launch(&ctx);
+        let args: Vec<_> = spec
             .args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1200,6 +1726,7 @@ mod tests {
             !args.iter().any(|a| a.starts_with("hooks.")),
             "hooks without trust"
         );
+        assert_eq!(env_value(&spec, BRIDGE_TEXT_ENV), None);
         ctx.bridge.hooks = false;
         ctx.bridge.text = None;
         let args: Vec<_> = Codex
@@ -1265,6 +1792,55 @@ mod tests {
         );
     }
 
+    // Regression: a footer drawn without a `·` was not recognised, so an
+    // empty composer read as Booting and every voice write was refused. A
+    // turn at work above it still reads Busy.
+    #[test]
+    fn a_footer_without_a_dot_is_verified_by_the_boxs_geometry() {
+        let screen = include_str!("../tests/fixtures/codex/footer_without_dot.txt");
+        assert_eq!(
+            codex_composer_state(Screen::plain(screen)),
+            ComposerState::Empty
+        );
+        let busy = screen.replace(
+            "› Ask Codex to do anything",
+            "• Working (4s • esc to interrupt)\n› Ask Codex to do anything",
+        );
+        assert_eq!(
+            codex_composer_state(Screen::plain(&busy)),
+            ComposerState::Busy
+        );
+        // Regression: a blank first row with a draft on the second read
+        // Empty, so the relay could send into the draft.
+        for fixture in [
+            screen,
+            include_str!("../tests/fixtures/codex/fresh_default.txt"),
+        ] {
+            let two_lines =
+                fixture.replace("› Ask Codex to do anything\n", "›\n  existing draft\n");
+            assert_ne!(two_lines, fixture);
+            assert_eq!(
+                codex_composer_state(Screen::plain(&two_lines)),
+                ComposerState::Occupied
+            );
+            assert_eq!(
+                Codex.readiness(&two_lines),
+                Readiness::NotReady,
+                "the relay does not send into it"
+            );
+        }
+        // A typed footer-shaped row with no blank row under the box: still
+        // not ready.
+        let typed = screen.replace(
+            "› Ask Codex to do anything\n\n",
+            "› Ask Codex to do anything\n",
+        );
+        assert_eq!(
+            codex_composer_state(Screen::plain(&typed)),
+            ComposerState::Booting
+        );
+    }
+
     /// Screens captured from the real Codex 0.166.0 (in `tests/fixtures/codex`),
     /// with the state each one must read as.
     const SCREENS: &[(&str, ComposerState)] = &[
@@ -1281,9 +1857,9 @@ mod tests {
         ("slash_popup_inline.txt", ComposerState::Occupied),
         ("draft_rename_alt.txt", ComposerState::Occupied),
         ("approval_prompt_inline.txt", ComposerState::Occupied),
-        // A footer with no "·" is not recognised: not ready, which is the
-        // fail-safe side.
-        ("footer_without_dot.txt", ComposerState::Booting),
+        // A footer with no "·": its status row, verified by the box's
+        // geometry (it names the folder, under a blank row), so ready.
+        ("footer_without_dot.txt", ComposerState::Empty),
     ];
 
     #[test]
@@ -1291,7 +1867,11 @@ mod tests {
         for (file, want) in SCREENS {
             let path = format!("{}/tests/fixtures/codex/{file}", env!("CARGO_MANIFEST_DIR"));
             let screen = std::fs::read_to_string(&path).unwrap();
-            assert_eq!(codex_composer_state(&screen), *want, "{file}");
+            assert_eq!(
+                codex_composer_state(Screen::plain(&screen)),
+                *want,
+                "{file}"
+            );
             let ready = *want == ComposerState::Empty;
             let readiness = if ready {
                 Readiness::Ready
@@ -1307,10 +1887,41 @@ mod tests {
         // The phrase is in output above the composer, not on the status row
         // directly above it.
         let idle = "› explain it\n• Press esc to interrupt a turn at any time\n\n› Ask Codex to do anything\n  GPT-6 · ~/p\n";
-        assert_eq!(codex_composer_state(idle), ComposerState::Empty);
+        assert_eq!(
+            codex_composer_state(Screen::plain(idle)),
+            ComposerState::Empty
+        );
         // On the status row directly above the composer it is busy.
         let busy = "› explain it\n• Working (4s • esc to interrupt)\n› Ask Codex to do anything\n  GPT-6 · ~/p\n";
-        assert_eq!(codex_composer_state(busy), ComposerState::Busy);
+        assert_eq!(
+            codex_composer_state(Screen::plain(busy)),
+            ComposerState::Busy
+        );
+    }
+
+    #[test]
+    fn a_faint_example_prompt_in_the_composer_is_not_a_draft() {
+        // Codex can show one of its example prompts, dimmed, in place of
+        // "Ask Codex to do anything".
+        let drawn = "› Explain this codebase\n\n  GPT-6 · ~/p\n";
+        let typed = "›                      \n\n  GPT-6 · ~/p\n";
+        let screen = Screen { drawn, typed };
+        assert_eq!(codex_composer_state(screen), ComposerState::Empty);
+        assert_eq!(
+            ToolAdapter::composer(&Codex, screen).unwrap().first_line,
+            ""
+        );
+        // The same words typed are a draft.
+        assert_eq!(
+            codex_composer_state(Screen::plain(drawn)),
+            ComposerState::Occupied
+        );
+        assert_eq!(
+            ToolAdapter::composer(&Codex, Screen::plain(drawn))
+                .unwrap()
+                .first_line,
+            "Explain this codebase"
+        );
     }
 
     #[test]
@@ -1340,7 +1951,7 @@ mod tests {
         assert_eq!(
             hook_config_as(Flavor::Unix, Path::new("/data/cli/bin/connecto-hook")).unwrap(),
             [
-                r#"hooks.SessionStart=[{hooks=[{type="command",command="'/data/cli/bin/connecto-hook' codex-hook --event SessionStart"}]}]"#,
+                r#"hooks.SessionStart=[{hooks=[{type="command",command="'/data/cli/bin/connecto-hook' codex-hook --event SessionStart",additionalContextLimit=20000}]}]"#,
                 r#"hooks.UserPromptSubmit=[{hooks=[{type="command",command="'/data/cli/bin/connecto-hook' codex-hook --event UserPromptSubmit --context"}]}]"#,
             ]
         );
@@ -1348,7 +1959,7 @@ mod tests {
 
     /// The Windows shape, on every host: Codex runs the command with
     /// PowerShell, so the helper is called with `&` and quoted with single
-    /// quotes only, a `'` written twice (checked on Codex 0.167.2).
+    /// quotes only, a `'` written twice (docs/windows-port.md 4.8.3).
     #[test]
     fn windows_hook_commands_are_powershell_calls() {
         assert_eq!(
@@ -1358,7 +1969,7 @@ mod tests {
         assert_eq!(
             hook_config_as(Flavor::Windows, Path::new(WINDOWS_HELPER)).unwrap(),
             [
-                r#"hooks.SessionStart=[{hooks=[{type="command",command="& 'C:\\Users\\Jane O''Neil\\AppData\\Roaming\\connecto\\cli\\bin\\connecto-hook.exe' codex-hook --event SessionStart"}]}]"#,
+                r#"hooks.SessionStart=[{hooks=[{type="command",command="& 'C:\\Users\\Jane O''Neil\\AppData\\Roaming\\connecto\\cli\\bin\\connecto-hook.exe' codex-hook --event SessionStart",additionalContextLimit=20000}]}]"#,
                 r#"hooks.UserPromptSubmit=[{hooks=[{type="command",command="& 'C:\\Users\\Jane O''Neil\\AppData\\Roaming\\connecto\\cli\\bin\\connecto-hook.exe' codex-hook --event UserPromptSubmit --context"}]}]"#,
             ]
         );
@@ -1442,7 +2053,7 @@ mod tests {
     }
 
     /// The Windows shape: TOML literal keys, and the key Codex listed, drive
-    /// letter included (checked on Codex 0.167.2).
+    /// letter included (docs/windows-port.md 4.8.3).
     #[test]
     fn the_windows_trust_value_has_literal_keys_as_codex_listed_them() {
         let listed = [
@@ -1552,5 +2163,187 @@ mod tests {
             hook_config(Path::new("/h")).unwrap(),
             hook_config_as(Flavor::HOST, Path::new("/h")).unwrap()
         );
+    }
+
+    fn utility_ctx(access: crate::UtilityAccess) -> LaunchCtx {
+        let mut ctx = launch_ctx();
+        ctx.bridge = crate::spec::BridgeLaunch {
+            text: None,
+            hooks: false,
+            trust: None,
+            terminal: String::new(),
+            ..ctx.bridge
+        };
+        ctx.utility = Some(crate::UtilityLaunch {
+            model: Some("gpt-mini".into()),
+            effort: "max".into(),
+            access,
+        });
+        ctx
+    }
+
+    /// Codex cannot start without tools (spike S2), so both utility accesses
+    /// get its narrowest launch: the read-only sandbox and no approvals, with no
+    /// bypass flag, no hooks, no launch text and no bridge.
+    #[test]
+    fn a_utility_launch_is_read_only_with_no_approvals_no_bypass_and_no_bridge() {
+        for access in [
+            crate::UtilityAccess::Minimal,
+            crate::UtilityAccess::ReadOnly,
+        ] {
+            for mode in AgentMode::ALL {
+                let mut ctx = utility_ctx(access);
+                ctx.agent_mode = mode;
+                ctx.bridge.hooks = true;
+                ctx.bridge.text = Some("LAUNCH TEXT".into());
+                ctx.initial_prompt = Some("first".into());
+                let spec = Codex.launch(&ctx);
+                let words = args(&spec);
+                assert!(words.windows(2).any(|w| w == ["--sandbox", "read-only"]));
+                assert!(
+                    words
+                        .windows(2)
+                        .any(|w| w == ["--ask-for-approval", "never"])
+                );
+                for bad in [
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--approve-for-me",
+                    "--yolo",
+                    "--full-auto",
+                    "--search",
+                    "--dangerously-bypass-hook-trust",
+                    "--",
+                ] {
+                    assert!(!words.iter().any(|w| w == bad), "{bad} in {words:?}");
+                }
+                for word in &words {
+                    for key in [
+                        "hooks.",
+                        "developer_instructions",
+                        "sandbox_mode",
+                        "approval_policy",
+                        "sandbox_permissions",
+                        "profile=",
+                    ] {
+                        assert!(!word.starts_with(key), "{word}");
+                    }
+                }
+                assert_eq!(
+                    words.iter().filter(|w| *w == "--sandbox").count(),
+                    1,
+                    "nothing widens the sandbox"
+                );
+                assert!(words.iter().any(|w| w == "mcp_servers={}"));
+                assert!(words.iter().any(|w| w == r#"model="gpt-mini""#));
+                assert!(
+                    words
+                        .iter()
+                        .any(|w| w == r#"model_reasoning_effort="xhigh""#)
+                );
+                assert!(words.iter().any(|w| w.starts_with("notify=")));
+                assert_eq!(spec.cwd, ctx.project, "it works in the project");
+                for name in ["CONNECTO_BRIDGE_SOCK", "CONNECTO_TERMINAL"] {
+                    assert!(!has(&spec, name), "{name}");
+                }
+                let path = spec.env.iter().find(|(k, _)| k == "PATH").unwrap();
+                assert!(!path.1.to_string_lossy().contains("/data/cli/bin"));
+                assert!(has(&spec, "CONNECTO_HOOK_SOCK"));
+            }
+        }
+        let mut ctx = utility_ctx(crate::UtilityAccess::Minimal);
+        if let Some(u) = ctx.utility.as_mut() {
+            u.model = None;
+            u.effort = "low".into();
+        }
+        let words = args(&Codex.launch(&ctx));
+        assert!(
+            !words.iter().any(|w| w.starts_with("model=")),
+            "the CLI's default"
+        );
+        assert!(words.iter().any(|w| w == r#"model_reasoning_effort="low""#));
+    }
+
+    #[test]
+    fn the_utility_surface_finds_the_rollout_and_reads_the_turn() {
+        let profile = Profile::new("utility");
+        let tool = Codex.utility().unwrap();
+        assert!(!tool.prompt_hook());
+        let found = tool.log_path(None, Some(THREAD), &profile.ctx()).unwrap();
+        assert!(
+            found
+                .to_string_lossy()
+                .ends_with(&format!("{THREAD}.jsonl"))
+        );
+        assert_eq!(
+            tool.log_path(None, Some(TITLE_THREAD), &profile.ctx()),
+            None
+        );
+        assert_eq!(tool.log_path(None, Some("../x"), &profile.ctx()), None);
+        assert_eq!(tool.log_path(None, None, &profile.ctx()), None);
+        assert!(
+            tool.blocked("> Do you trust the contents of this directory?")
+                .is_some()
+        );
+        assert_eq!(tool.reply_error("API Error: x"), None);
+        assert!(
+            tool.untrusted("Do you trust the contents of this directory?")
+                .unwrap()
+                .starts_with("Codex has not been trusted")
+        );
+        assert_eq!(tool.untrusted("› Ask Codex to do anything"), None);
+
+        let sent = format!("{}END", "x ".repeat(150_000));
+        let ev = |payload: Value| {
+            json!({"timestamp":"t","type":"event_msg","payload":payload}).to_string()
+        };
+        let log = [
+            ev(json!({"type":"task_started","turn_id":"t1"})),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context/>"}]}}).to_string(),
+            ev(json!({"type":"user_message","message": sent})),
+            ev(json!({"type":"agent_message","message":"partial"})),
+            ev(json!({"type":"task_complete","turn_id":"t1","last_agent_message":"[]"})),
+        ]
+        .join("\n");
+        let turn = tool.read_turn(&log, &sent);
+        assert!(turn.prompt_whole);
+        assert_eq!(turn.reply.as_deref(), Some("[]"));
+        assert!(turn.complete);
+        let failed = [
+            ev(json!({"type":"user_message","message": sent})),
+            ev(json!({"type":"error","message":"stream disconnected"})),
+        ]
+        .join("\n");
+        let turn = tool.read_turn(&failed, &sent);
+        assert_eq!(turn.error.as_deref(), Some("stream disconnected"));
+        assert!(turn.reply.is_none());
+        // Commentary with no `task_complete` yet is neither the reply nor done.
+        let unfinished = [
+            ev(json!({"type":"user_message","message": sent})),
+            ev(json!({"type":"agent_message","message":"I will read the file."})),
+        ]
+        .join("\n");
+        let turn = tool.read_turn(&unfinished, &sent);
+        assert!(turn.reply.is_none() && !turn.complete);
+        // A prompt with characters missing is not the prompt.
+        let short = format!("{}{}", &sent[..1000], &sent[1400..]);
+        let cut = [ev(json!({"type":"user_message","message": short}))].join("\n");
+        assert!(!tool.read_turn(&cut, &sent).prompt_whole);
+        assert!(tool.prompt_matches("a  b\n", "a b"));
+        // 0.167.1 writes the prompt only as a user `response_item`, after the
+        // environment context, which is a user item too.
+        let item = |text: &str| {
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}).to_string()
+        };
+        let current = [
+            item("<environment_context>cwd</environment_context>"),
+            item(&sent),
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[]"}]}}).to_string(),
+            ev(json!({"type":"task_complete","turn_id":"t1","last_agent_message":"[]"})),
+        ]
+        .join("\n");
+        let turn = tool.read_turn(&current, &sent);
+        assert!(turn.prompt_whole, "{turn:?}");
+        assert_eq!(turn.reply.as_deref(), Some("[]"));
+        assert!(turn.complete);
     }
 }

@@ -22,6 +22,32 @@ pub(crate) fn dropped_paths_text(paths: &[std::path::PathBuf]) -> Option<String>
     (!out.is_empty()).then_some(out)
 }
 
+/// As [`dropped_paths_text`], for paths a remote host saved files at: each
+/// quoted for the host's shell, which the path's own shape tells (a drive
+/// letter or a `\\` share is a Windows host's, PowerShell quoting; else a
+/// Unix shell's), not this computer's.
+pub(crate) fn host_paths_text(paths: &[String]) -> Option<String> {
+    let mut out = String::new();
+    for path in paths {
+        if path.chars().any(char::is_control) {
+            continue;
+        }
+        let bytes = path.as_bytes();
+        let windows = path.starts_with("\\\\")
+            || (bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/'));
+        if windows {
+            crate::platform::quote_powershell(path, &mut out);
+        } else {
+            crate::platform::quote_posix(path, &mut out);
+        }
+        out.push(' ');
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// Bytes for an input event, or `None` when it sends nothing to the child.
 pub(crate) fn translate(event: &Event, modes: InputModes) -> Option<Vec<u8>> {
     match event {
@@ -143,6 +169,36 @@ mod tests {
             repeat: false,
             modifiers,
         }
+    }
+
+    /// Ctrl+V is Claude Code's own paste-an-image key on macOS (Cmd+V is the
+    /// window's): it reaches the terminal as the control byte.
+    #[test]
+    fn host_paths_are_quoted_for_the_hosts_shell_not_this_computers() {
+        let paths = [
+            "/home/me/.local/share/connecto/a b.png".to_owned(),
+            r"C:\Users\me\AppData\it's.png".to_owned(),
+            r"D:/data/plain.txt".to_owned(),
+            "bad\nline".to_owned(),
+        ];
+        assert_eq!(
+            host_paths_text(&paths).as_deref(),
+            Some(
+                r"/home/me/.local/share/connecto/a\ b.png 'C:\Users\me\AppData\it''s.png' D:/data/plain.txt "
+            )
+        );
+        assert_eq!(host_paths_text(&["bad\n".to_owned()]), None);
+    }
+
+    #[test]
+    fn ctrl_v_goes_to_the_terminal_as_its_control_byte() {
+        assert_eq!(
+            translate(
+                &key_event(EguiKey::V, Modifiers::CTRL),
+                InputModes::default()
+            ),
+            Some(vec![0x16])
+        );
     }
 
     fn translated(event: &Event) -> Option<Vec<u8>> {

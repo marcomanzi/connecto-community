@@ -284,6 +284,9 @@ pub(crate) struct HistoryInput<'a> {
     pub(crate) now_ms: u64,
     pub(crate) utc_offset_s: i32,
     pub(crate) project_name: &'a dyn Fn(&str) -> String,
+    /// Why a project's history could not be read or acted on (a remote
+    /// project's host did not answer), by project id.
+    pub(crate) error: &'a dyn Fn(&str) -> Option<String>,
 }
 
 /// The sheet over `area`. It closes with Esc, a click on the dimmed part, or a
@@ -391,20 +394,19 @@ fn list(
         Scope::This(id) => Some(id.clone()),
         Scope::All => None,
     };
-    let chips: [(&str, bool, &str); 4] = [
+    // One chip per agent: a click shows only that agent's, a second all again.
+    let agent_chips: Vec<(String, ToolKind)> = ToolKind::ALL
+        .into_iter()
+        .filter(|tool| tool.is_agent())
+        .map(|tool| (format!("history-chip-{}", tool.name()), tool))
+        .collect();
+    let mut chips: Vec<(&str, bool, &str)> = vec![
         ("This project", this_project.is_some(), "history-chip-this"),
         ("All projects", this_project.is_none(), "history-chip-all"),
-        (
-            "Claude",
-            history.tool == Some(ToolKind::Claude),
-            "history-chip-claude",
-        ),
-        (
-            "Codex",
-            history.tool == Some(ToolKind::Codex),
-            "history-chip-codex",
-        ),
     ];
+    for (id, tool) in &agent_chips {
+        chips.push((tool.label(), history.tool == Some(*tool), id.as_str()));
+    }
     for (label, on, id) in chips {
         let rect = chip(ui, pos2(x, y), label, on, Id::unique(id));
         #[cfg(test)]
@@ -422,17 +424,14 @@ fn list(
             }
         } else if id == Id::unique("history-chip-all") {
             history.scope = Scope::All;
-        } else if id == Id::unique("history-chip-claude") {
-            history.tool = if history.tool == Some(ToolKind::Claude) {
+        } else if let Some((_, tool)) = agent_chips
+            .iter()
+            .find(|(chip_id, _)| id == Id::unique(chip_id.as_str()))
+        {
+            history.tool = if history.tool == Some(*tool) {
                 None
             } else {
-                Some(ToolKind::Claude)
-            };
-        } else if id == Id::unique("history-chip-codex") {
-            history.tool = if history.tool == Some(ToolKind::Codex) {
-                None
-            } else {
-                Some(ToolKind::Codex)
+                Some(*tool)
             };
         }
     }
@@ -445,17 +444,30 @@ fn list(
         .or_else(|| rows.first().map(Row::key));
     let list_rect = Rect::from_min_max(pos2(rect.min.x, y + 32.0), rect.max);
     if rows.is_empty() {
-        let message = if history.query.trim().is_empty() {
-            "Nothing closed yet. A terminal you close is kept here."
-        } else {
-            "No closed terminal matches."
+        let error = input
+            .snap
+            .ws
+            .projects
+            .iter()
+            .filter(|p| match &history.scope {
+                Scope::This(id) => *id == p.id,
+                Scope::All => true,
+            })
+            .find_map(|p| (input.error)(&p.id));
+        let (message, color) = match &error {
+            Some(error) => (error.as_str(), theme::ERROR),
+            None if history.query.trim().is_empty() => (
+                "Nothing closed yet. A terminal you close is kept here.",
+                theme::TEXT_MUTED,
+            ),
+            None => ("No closed terminal matches.", theme::TEXT_MUTED),
         };
         ui.painter().text(
             list_rect.min + vec2(16.0, 18.0),
             Align2::LEFT_TOP,
             message,
             FontId::proportional(12.5),
-            theme::TEXT_MUTED,
+            color,
         );
         key_nav(ui, history, &rows, &selected, out);
         return;
@@ -744,12 +756,17 @@ fn viewer(
         .and_then(|view| view.transcript.as_ref())
         .filter(|transcript| transcript.history_id == hid);
     let Some(transcript) = loaded else {
+        let error = (input.error)(&project);
         ui.painter().text(
             body.min + vec2(14.0, 14.0),
             Align2::LEFT_TOP,
-            "Loading transcript…",
+            error.as_deref().unwrap_or("Loading transcript…"),
             FontId::proportional(12.5),
-            theme::TEXT_MUTED,
+            if error.is_some() {
+                theme::ERROR
+            } else {
+                theme::TEXT_MUTED
+            },
         );
         return;
     };

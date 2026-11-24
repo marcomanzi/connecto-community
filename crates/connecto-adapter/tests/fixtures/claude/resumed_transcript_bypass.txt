@@ -1,6 +1,6 @@
  ▐▛███▛█   Claude Code v2.1.322
 ▝▜██████▀  Fable 5.2 · Claude Ultra
- ▝▝   ▝▝   ~/.skainet-throwaway-home/workroot/remote-proj
+ ▝▝   ▝▝   ~/.northco-throwaway-home/workroot/remote-proj
 
 
 ❯ Reply with exactly: lighthouse ok

@@ -24,14 +24,33 @@ const REPAIR_MARK: &str = ".repair";
 const HOOK_SUM_NAME: &str = "connecto-hook.sha256";
 /// How a provision's work folder is named: this, the tool, `-`, the pid.
 const STAGING_PREFIX: &str = ".staging-";
+/// In the version folder of a tool that runs in place (Pi): the absolute path
+/// of the install it stands for, as it was found on the search path.
+const IN_PLACE_FILE: &str = "in-place";
 
 /// A kind of terminal. Claude and Codex are CLIs the store copies and verifies;
 /// `Shell` is the user's own shell, which is not stored, provisioned or
 /// signature-checked (it is not one of the CLIs `provision` copies).
+///
+/// `Pi` is an agent CLI that runs where it is installed. It is a Node.js
+/// program (a launcher script and a `node_modules` tree), published without a
+/// code signature, so there is nothing to check a copy against and none is
+/// made. The store only records where the install is ([`IN_PLACE_FILE`]), so
+/// the rest of Connecto asks it for Pi the way it asks for the other two.
+///
+/// `Antigravity` (Google's `agy`) runs in place too: its official installer
+/// puts one native program in the user's folders, and that program updates
+/// itself in the background, so a copy would fall behind the install.
+///
+/// `OpenCode` (`opencode`) runs in place for the same reason: its installer
+/// puts one program in `~/.opencode/bin`, and it upgrades itself there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Claude,
     Codex,
+    Pi,
+    Antigravity,
+    OpenCode,
     Shell,
 }
 
@@ -41,14 +60,34 @@ impl Tool {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Pi => "pi",
+            Self::Antigravity => "antigravity",
+            Self::OpenCode => "opencode",
             Self::Shell => "shell",
+        }
+    }
+
+    /// The program's name on the search path: `agy` for Antigravity, else
+    /// [`Tool::name`].
+    #[must_use]
+    pub const fn program(self) -> &'static str {
+        match self {
+            Self::Antigravity => "agy",
+            _ => self.name(),
         }
     }
 
     /// Whether the store holds a copy of this kind.
     #[must_use]
     pub const fn is_stored(self) -> bool {
-        !matches!(self, Self::Shell)
+        matches!(self, Self::Claude | Self::Codex)
+    }
+
+    /// Whether this kind runs from the user's own install, with the store
+    /// holding only where that is.
+    #[must_use]
+    pub const fn runs_in_place(self) -> bool {
+        matches!(self, Self::Pi | Self::Antigravity | Self::OpenCode)
     }
 
     /// Who must have signed the binary: on macOS the Apple Team ID
@@ -59,7 +98,7 @@ impl Tool {
         match self {
             Self::Claude => platform::CLAUDE_SIGNER,
             Self::Codex => platform::CODEX_SIGNER,
-            Self::Shell => "",
+            Self::Pi | Self::Antigravity | Self::OpenCode | Self::Shell => "",
         }
     }
 
@@ -70,7 +109,7 @@ impl Tool {
         match self {
             Self::Claude => platform::CLAUDE_ENTRY,
             Self::Codex => platform::CODEX_ENTRY,
-            Self::Shell => "",
+            Self::Pi | Self::Antigravity | Self::OpenCode | Self::Shell => "",
         }
     }
 
@@ -79,10 +118,29 @@ impl Tool {
     #[must_use]
     pub const fn release_entries(self) -> &'static [&'static str] {
         match self {
-            Self::Claude | Self::Shell => &[],
+            Self::Claude | Self::Pi | Self::Antigravity | Self::OpenCode | Self::Shell => &[],
             Self::Codex => &["bin", "codex-path", "codex-resources", "codex-package.json"],
         }
     }
+}
+
+/// Why the OpenCode that reports `version` cannot be used, or `None` when it
+/// can: Connecto's plugin is for the 1.x line, and OpenCode 2 runs no 1.x
+/// plugin. A version that cannot be read is let through: its terminal then
+/// says what is wrong itself.
+#[must_use]
+pub fn opencode_unsupported(version: &str) -> Option<String> {
+    let word = version.split_whitespace().find(|word| {
+        word.trim_start_matches('v')
+            .starts_with(|c: char| c.is_ascii_digit())
+    })?;
+    let number = word.trim_start_matches('v');
+    let major: u32 = number.split('.').next()?.parse().ok()?;
+    (major != 1).then(|| {
+        format!(
+            "OpenCode {number} is not supported yet: Connecto works with OpenCode 1.x, and OpenCode {major} cannot load its plugin. Install the 1.x line with: curl -fsSL https://opencode.ai/install | bash -s -- --version 1.19.6"
+        )
+    })
 }
 
 /// Failures while provisioning or verifying.
@@ -92,6 +150,10 @@ pub enum StoreError {
     Io { path: PathBuf, source: io::Error },
     #[error("unexpected source layout: {0}")]
     BadSource(String),
+    /// The install runs, but is a version Connecto cannot work with. Says
+    /// what to do.
+    #[error("{0}")]
+    Unsupported(String),
     /// The copy was checked and refused: unsigned, modified, or another team's.
     #[error("signature check failed: {0}")]
     Signature(String),
@@ -186,10 +248,11 @@ fn describe_tried(tried: &[(PathBuf, String)]) -> String {
     describe_list(tried, "; ")
 }
 
-/// The data folder override: `CONNECTO_DATA_DIR`.
+/// The data folder override: `CONNECTO_DATA_DIR`, or the earlier name's
+/// `MAGNETO_DATA_DIR` when only that is set.
 #[must_use]
 pub fn data_dir_override() -> Option<OsString> {
-    std::env::var_os("CONNECTO_DATA_DIR")
+    std::env::var_os("CONNECTO_DATA_DIR").or_else(|| std::env::var_os("MAGNETO_DATA_DIR"))
 }
 
 /// The data root: `CONNECTO_DATA_DIR`, or the app's Application Support folder
@@ -330,7 +393,18 @@ fn layout_problem(tool: Tool, entry: &Path) -> Option<String> {
         Tool::Codex => codex_release_root(&real)
             .is_none()
             .then(|| codex_layout_reason(&real)),
+        Tool::Pi | Tool::Antigravity | Tool::OpenCode => in_place_problem(&real),
         Tool::Shell => Some("a shell is not a CLI the store copies".to_owned()),
+    }
+}
+
+/// Why the real path of a Pi, Antigravity or OpenCode candidate cannot be run, or `None` when it can:
+/// it only has to be a file the user may execute (Pi's launcher).
+fn in_place_problem(real: &Path) -> Option<String> {
+    match fs::metadata(real) {
+        Ok(meta) if meta.is_file() && platform::is_executable(real, &meta) => None,
+        Ok(_) => Some("it is not a program that can be run".to_owned()),
+        Err(_) => Some("it cannot be read".to_owned()),
     }
 }
 
@@ -415,22 +489,49 @@ fn parse_version(output: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// What a program's `--version` printed, as every reader of a version takes
+/// it: its stdout when that names a version, else its stderr when that does
+/// (a program may print it there), else its stdout. One rule for the store,
+/// Setup, Settings and the check before a start, so none of them reads a
+/// version the others miss.
+#[must_use]
+pub fn version_text(stdout: &str, stderr: &str) -> String {
+    if parse_version(stdout).is_none() && parse_version(stderr).is_some() {
+        stderr.to_owned()
+    } else {
+        stdout.to_owned()
+    }
+}
+
 /// Ask a staged binary its version, with an empty environment and a scratch
 /// home, so that it cannot see or touch the user's real CLI state.
 fn read_version(tool: Tool, entry: &Path, scratch: &Path) -> Result<String, StoreError> {
     fs::create_dir_all(scratch).map_err(io_error(scratch))?;
-    let output = platform::no_console(&mut Command::new(entry))
-        .arg("--version")
-        .env_clear()
-        .env("HOME", scratch)
+    let mut command = Command::new(entry);
+    command.arg("--version").env_clear().env("HOME", scratch);
+    if tool.runs_in_place() {
+        // Pi's launcher runs `node`, which is found on the user's own search
+        // path. No network: it would otherwise look for a newer release.
+        let home = platform::home_dir().unwrap_or_else(|| scratch.to_owned());
+        command
+            .env("PATH", discover::run_path(entry, &home))
+            .envs(platform::launcher_env(&home))
+            .env("PI_CODING_AGENT_DIR", scratch)
+            .env("PI_OFFLINE", "1")
+            .env("PI_SKIP_VERSION_CHECK", "1");
+    }
+    let output = platform::no_console(&mut command)
         .env("CLAUDE_CONFIG_DIR", scratch)
         .env("CODEX_HOME", scratch)
         .current_dir(scratch)
         .stdin(Stdio::null())
         .output()
         .map_err(io_error(entry))?;
-    parse_version(&String::from_utf8_lossy(&output.stdout))
-        .ok_or(StoreError::UnknownVersion(tool.name()))
+    parse_version(&version_text(
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    ))
+    .ok_or(StoreError::UnknownVersion(tool.name()))
 }
 
 /// One dot-separated part of a prerelease. A number sorts before a word.
@@ -523,6 +624,15 @@ pub(crate) fn remove_tree(path: &Path) {
     let _ = fs::remove_dir_all(path);
 }
 
+/// The install a version folder of an in-place tool stands for, when the
+/// record is there and still names an absolute path of a runnable file.
+fn in_place_entry(dir: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(dir.join(IN_PLACE_FILE)).ok()?;
+    let entry = PathBuf::from(text.trim_end_matches(['\n', '\r']));
+    (entry.is_absolute() && in_place_problem(&fs::canonicalize(&entry).ok()?).is_none())
+        .then_some(entry)
+}
+
 fn parse_sums(text: &str) -> Option<BTreeMap<PathBuf, String>> {
     text.lines()
         .map(|line| {
@@ -555,6 +665,17 @@ impl Store {
     /// call it off the UI thread. A changed, missing or extra file fails.
     pub fn verify(&self, tool: Tool, version: &str) -> Result<Installed, StoreError> {
         let dir = self.version_dir(tool, version);
+        if tool.runs_in_place() {
+            return in_place_entry(&dir)
+                .map(|entry| Installed {
+                    version: version.to_owned(),
+                    entry,
+                })
+                .ok_or_else(|| StoreError::NotProvisioned {
+                    tool: tool.name(),
+                    version: version.to_owned(),
+                });
+        }
         let sums_path = dir.join(SUMS_FILE);
         if !sums_path.is_file() {
             return Err(StoreError::NotProvisioned {
@@ -609,7 +730,7 @@ impl Store {
     /// [`Store::find_installed`] with the shell's `PATH` given.
     #[must_use]
     pub fn find_installed_in(tool: Tool, home: &Path, path: &[PathBuf]) -> Option<PathBuf> {
-        discover::candidates(tool.name(), home, path)
+        discover::candidates(tool.program(), home, path)
             .into_iter()
             .find(|file| layout_problem(tool, file).is_none())
     }
@@ -638,7 +759,7 @@ impl Store {
     ) -> Result<Provisioned, StoreError> {
         let mut tried = Vec::new();
         let mut refused = false;
-        for file in discover::candidates(tool.name(), home, path) {
+        for file in discover::candidates(tool.program(), home, path) {
             if let Some(why) = layout_problem(tool, &file) {
                 tried.push((file, why));
                 continue;
@@ -678,7 +799,7 @@ impl Store {
         home: &Path,
         path: &[PathBuf],
     ) -> Vec<(PathBuf, String)> {
-        discover::candidates(tool.name(), home, path)
+        discover::candidates(tool.program(), home, path)
             .into_iter()
             .filter_map(|file| layout_problem(tool, &file).map(|why| (file, why)))
             .collect()
@@ -692,11 +813,17 @@ impl Store {
     /// copied.
     #[must_use]
     pub fn program_of(tool: Tool, entry: &Path) -> Option<PathBuf> {
+        if tool.runs_in_place() {
+            // The launcher is the program: it is run as found.
+            return layout_problem(tool, entry)
+                .is_none()
+                .then(|| entry.to_owned());
+        }
         let (root, files) = Self::source_files(tool, entry).ok()?;
         match tool {
             Tool::Claude => files.first().map(|file| root.join(file)),
             Tool::Codex => Some(root.join(tool.entry())),
-            Tool::Shell => None,
+            Tool::Pi | Tool::Antigravity | Tool::OpenCode | Tool::Shell => None,
         }
     }
 
@@ -849,6 +976,10 @@ impl Store {
                 let files = codex_release_files(&root)?;
                 Ok((root, files))
             }
+            Tool::Pi | Tool::Antigravity | Tool::OpenCode => Err(StoreError::BadSource(format!(
+                "{} runs where it is installed and is not copied",
+                tool.name()
+            ))),
             Tool::Shell => Err(StoreError::BadSource(
                 "a shell is not a CLI the store copies".to_owned(),
             )),
@@ -884,6 +1015,9 @@ impl Store {
     ) -> Result<Installed, StoreError> {
         let _one_at_a_time = PROVISIONING.lock().unwrap_or_else(PoisonError::into_inner);
         self.sweep_stale_staging();
+        if tool.runs_in_place() {
+            return self.record_in_place(tool, entry);
+        }
         let (source_root, files) = Self::source_files(tool, entry)?;
         let source_hashes = hash_all(&source_root, &files)?;
 
@@ -905,6 +1039,65 @@ impl Store {
         // and all.
         remove_tree(&staging);
         result
+    }
+
+    /// Record where a tool that runs in place is installed, under the version
+    /// it reports. Nothing is copied and no signature is asked for: see
+    /// [`Tool`]. Earlier records of the tool are dropped, so the newest
+    /// version in the store is always the install as it is now.
+    fn record_in_place(&self, tool: Tool, entry: &Path) -> Result<Installed, StoreError> {
+        if let Some(why) = layout_problem(tool, entry) {
+            return Err(StoreError::BadSource(format!("{}: {why}", entry.display())));
+        }
+        if !entry.is_absolute() {
+            return Err(StoreError::BadSource(format!(
+                "{} is not an absolute path",
+                entry.display()
+            )));
+        }
+        let scratch = self
+            .root
+            .join(format!(".probe-{}-{}", tool.name(), std::process::id()));
+        let version = read_version(tool, entry, &scratch);
+        remove_tree(&scratch);
+        let version = version?;
+        let tool_dir = self.root.join(tool.name());
+        if tool == Tool::OpenCode
+            && let Some(why) = opencode_unsupported(&version)
+        {
+            // A record of this same install from before it upgraded itself
+            // is of a program that is no longer there: dropped, so nothing
+            // takes it for one that works.
+            if let Ok(entries) = fs::read_dir(&tool_dir) {
+                for old in entries.flatten() {
+                    let record = old.path().join(IN_PLACE_FILE);
+                    let same = fs::read(&record)
+                        .is_ok_and(|named| named == entry.as_os_str().as_encoded_bytes());
+                    if same {
+                        let _ = fs::remove_file(&record);
+                        let _ = fs::remove_dir(old.path());
+                    }
+                }
+            }
+            return Err(StoreError::Unsupported(why));
+        }
+        if let Ok(entries) = fs::read_dir(&tool_dir) {
+            for old in entries.flatten() {
+                let stale = old.file_name().to_str().is_some_and(|name| name != version)
+                    && old.path().join(IN_PLACE_FILE).is_file();
+                if stale {
+                    let _ = fs::remove_file(old.path().join(IN_PLACE_FILE));
+                    let _ = fs::remove_dir(old.path());
+                }
+            }
+        }
+        let dir = self.version_dir(tool, &version);
+        fs::create_dir_all(&dir).map_err(io_error(&dir))?;
+        let record = dir.join(IN_PLACE_FILE);
+        let staged = dir.join(format!(".{IN_PLACE_FILE}-{}", std::process::id()));
+        fs::write(&staged, entry.as_os_str().as_encoded_bytes()).map_err(io_error(&staged))?;
+        fs::rename(&staged, &record).map_err(io_error(&record))?;
+        self.verify(tool, &version)
     }
 
     fn stage_and_install(
@@ -1000,7 +1193,9 @@ fn copy_files(
         // A Claude install is one file named after its version.
         let target_name = match tool {
             Tool::Claude => PathBuf::from(tool.entry()),
-            Tool::Codex | Tool::Shell => file.clone(),
+            Tool::Codex | Tool::Pi | Tool::Antigravity | Tool::OpenCode | Tool::Shell => {
+                file.clone()
+            }
         };
         let target = copy_root.join(&target_name);
         if let Some(parent) = target.parent() {
@@ -1990,6 +2185,107 @@ mod tests {
             .unwrap();
         assert_eq!(provisioned.found, fx.root.join(r"native\claude.exe"));
         assert_eq!(provisioned.skipped.len(), 2);
+    }
+
+    #[test]
+    fn only_opencode_1_is_supported() {
+        assert_eq!(opencode_unsupported("1.19.6"), None);
+        assert_eq!(opencode_unsupported("v1.18.8\n"), None);
+        for newer in ["2.3.2", "v2.0.0", "opencode 3.1.0"] {
+            let why = opencode_unsupported(newer).unwrap();
+            assert!(why.contains("1.x") && why.contains("--version 1."), "{why}");
+        }
+        // Unreadable: its terminal says what is wrong.
+        assert_eq!(opencode_unsupported(""), None);
+        assert_eq!(opencode_unsupported("error: no"), None);
+    }
+
+    /// An OpenCode 2 is not recorded: Setup and Settings say why, and offer
+    /// nothing that could not load Connecto's plugin. A 1.x one is recorded.
+    #[cfg(unix)]
+    #[test]
+    fn an_opencode_2_is_refused_with_what_to_do_and_a_1_is_recorded() {
+        let fx = Fixture::new("opencode-major");
+        let newer = fx.script("two/.opencode/bin/opencode", "2.3.2");
+        let refused = fx
+            .store()
+            .provision(Tool::OpenCode, &newer, &FakeSignature::default())
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("not supported yet"),
+            "{refused}"
+        );
+        assert!(fx.store().newest(Tool::OpenCode).is_err());
+        let current = fx.script("one/.opencode/bin/opencode", "1.19.6");
+        let installed = fx
+            .store()
+            .provision(Tool::OpenCode, &current, &FakeSignature::default())
+            .unwrap();
+        assert_eq!(installed.entry, current);
+        // That install upgrades itself to 2: recording it again refuses it,
+        // and its record from before is dropped, not left to be trusted.
+        fx.script("one/.opencode/bin/opencode", "2.3.2");
+        assert!(matches!(
+            fx.store()
+                .provision(Tool::OpenCode, &current, &FakeSignature::default()),
+            Err(StoreError::Unsupported(_))
+        ));
+        assert!(fx.store().newest(Tool::OpenCode).is_err());
+    }
+
+    /// The same when the 2 prints its version on stderr alone: read there,
+    /// refused, and the record of the 1.x it was is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn an_opencode_2_that_prints_on_stderr_is_refused_and_its_old_record_dropped() {
+        let fx = Fixture::new("opencode-stderr");
+        let entry = fx.script("one/.opencode/bin/opencode", "1.19.6");
+        fx.store()
+            .provision(Tool::OpenCode, &entry, &FakeSignature::default())
+            .unwrap();
+        fs::write(&entry, "#!/bin/sh\necho '2.3.2' >&2\n").unwrap();
+        let refused = fx
+            .store()
+            .provision(Tool::OpenCode, &entry, &FakeSignature::default());
+        assert!(
+            matches!(&refused, Err(StoreError::Unsupported(why)) if why.contains("2.3.2")),
+            "{refused:?}"
+        );
+        assert!(fx.store().newest(Tool::OpenCode).is_err());
+    }
+
+    /// One rule for every reader: stdout when it names a version, else
+    /// stderr when that does, else stdout.
+    #[test]
+    fn a_version_is_read_from_stdout_else_from_stderr() {
+        assert_eq!(version_text("1.19.6\n", "warning\n"), "1.19.6\n");
+        assert_eq!(version_text("", "2.0.0\n"), "2.0.0\n");
+        assert_eq!(version_text("starting…\n", "2.0.0\n"), "2.0.0\n");
+        assert_eq!(version_text("1.2.3\n", "2.0.0\n"), "1.2.3\n");
+        assert_eq!(version_text("nothing\n", "neither\n"), "nothing\n");
+    }
+
+    /// Windows: Pi's `pi.cmd` is asked its version with the user's folders
+    /// set: it finds the Node.js installed for it by `%LOCALAPPDATA%`, and
+    /// without it ran an older `node` that could not start Pi.
+    #[cfg(windows)]
+    #[test]
+    fn pis_launcher_is_asked_its_version_with_the_users_folders() {
+        let fx = Fixture::new("pi-cmd-env");
+        let launcher = fx.root.join(r"bin\pi.cmd");
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        fs::write(
+            &launcher,
+            "@ECHO off\r\nIF DEFINED LOCALAPPDATA IF DEFINED SystemRoot (ECHO 1.5.2& EXIT /B 0)\r\nECHO no folders\r\nEXIT /B 1\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fx.store().probe_version(Tool::Pi, &launcher).as_deref(),
+            Some("1.5.2")
+        );
+        let env = platform::launcher_env(&fx.root);
+        assert!(env.iter().any(|(k, v)| k == "LOCALAPPDATA"
+            && Path::new(v) == fx.root.join(r"AppData\Local")));
     }
 
     /// Windows: a refused program falls through to the next one; when every

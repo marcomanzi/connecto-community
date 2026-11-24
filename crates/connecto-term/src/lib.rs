@@ -8,5 +8,5 @@ mod color;
 mod emulator;
 mod policy;
 
-pub use emulator::{Emulator, Responder};
+pub use emulator::{Emulator, Responder, effective_size};
 pub use policy::{MAX_TITLE_CHARS, sanitize_title};

@@ -14,9 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use connecto_adapter::{
-    BridgeLaunch, Claude, Codex, HookCtx, LaunchCtx, LoginCtx, Plain, ToolAdapter,
+    Antigravity, BridgeLaunch, Claude, ClaudeCuts, ClaudeProviders, Codex, HookCtx, LaunchCtx,
+    LoginCtx, OpenCode, Pi, PiProviders, Plain, ToolAdapter,
 };
-use connecto_core::{AuthState, GridSize, SessionStatus};
+use connecto_core::{AuthState, GridSize, ProviderScope, SessionStatus};
 use connecto_pty::{OpenPty, PtyError, PtySession, PtySpec, Wake};
 use connecto_store::{Installed, Store, StoreError, Tool};
 
@@ -50,6 +51,14 @@ pub enum LaunchError {
         "this project's packages are still being installed: start the terminal again in a moment"
     )]
     InstallPending,
+    /// The model provider the terminal is set up with cannot be used: said
+    /// in plain words, never with a key.
+    #[error("{0}")]
+    Providers(String),
+    /// The project's Tools setting leaves the CLI out, as saved when the
+    /// install permit was held, right before the process would start.
+    #[error("{0}")]
+    NotAllowed(String),
 }
 
 /// One session's claim on a profile. It is unbound while the session launches,
@@ -167,8 +176,15 @@ fn reserve_session(tool_root: &Path) -> Result<(ProfileClaim, PathBuf), LaunchEr
 pub(crate) fn generation_has_history(generation: &Path, tool: Tool) -> bool {
     let folder = match tool {
         Tool::Claude => "projects",
-        Tool::Codex => "sessions",
-        Tool::Shell => return false,
+        Tool::Codex | Tool::Pi => "sessions",
+        // Antigravity always runs on the user's own folder: no generation of
+        // a Connecto profile holds its conversations.
+        Tool::Antigravity | Tool::Shell => return false,
+        // OpenCode keeps its sessions in one database.
+        Tool::OpenCode => {
+            return fs::metadata(generation.join("data/opencode/opencode.db"))
+                .is_ok_and(|meta| meta.is_file() && meta.len() > 0);
+        }
     };
     fn any_jsonl(dir: &Path) -> bool {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -278,6 +294,7 @@ pub struct LaunchExtras {
     pub session_name: Option<String>,
     /// The model the terminal was added with. `None` is the tool's default.
     pub model: Option<String>,
+    pub effort: Option<String>,
     /// Base URL of a local fake model.
     #[cfg(feature = "test-endpoints")]
     pub fake_model: Option<String>,
@@ -287,7 +304,159 @@ static LAUNCH_MODES: std::sync::RwLock<connecto_core::LaunchModes> =
     std::sync::RwLock::new(connecto_core::LaunchModes {
         claude: connecto_core::AgentMode::Bypass,
         codex: connecto_core::AgentMode::Bypass,
+        pi: connecto_core::AgentMode::Bypass,
+        antigravity: connecto_core::AgentMode::Bypass,
+        opencode: connecto_core::AgentMode::Bypass,
     });
+
+static PI_PROVIDERS: std::sync::RwLock<Option<PiProviders>> = std::sync::RwLock::new(None);
+
+/// The model providers every Pi terminal is given from now on (Settings): the
+/// credentials Pi reads from its environment, and the local LM Studio server.
+/// A terminal already running keeps what it was launched with.
+pub fn set_pi_providers(providers: PiProviders) {
+    *PI_PROVIDERS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(providers);
+}
+
+/// The providers in force now; none when they were never set.
+#[must_use]
+pub fn pi_providers() -> PiProviders {
+    PI_PROVIDERS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_default()
+}
+
+/// How long a Pi launch waits for the providers to be set.
+const PI_PROVIDERS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The providers for a Pi launch. The saved terminals are restored before the
+/// secret store is set up, so a Pi terminal started that early waits a moment
+/// for its keys instead of starting without them. A process that never sets
+/// them (a test, a tool) goes on with none once the wait is over.
+fn pi_providers_for_launch() -> PiProviders {
+    let deadline = std::time::Instant::now() + PI_PROVIDERS_WAIT;
+    loop {
+        let set = PI_PROVIDERS
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match set {
+            Some(providers) => return providers,
+            None if std::time::Instant::now() >= deadline => return PiProviders::default(),
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+}
+
+/// Where a launch gets the model providers that are kept in the secret store
+/// or depend on the project: set once by the app, before any terminal starts.
+pub trait ModelProviders: Send + Sync {
+    /// How a Claude terminal with `scope`'s providers reaches its model.
+    ///
+    /// # Errors
+    /// Why it cannot start as it is set up (TogetherLink is missing), for the
+    /// person; never a key.
+    fn claude(&self, scope: &ProviderScope) -> Result<ClaudeProviders, String>;
+
+    /// The providers a Pi terminal of a project with providers of its own is
+    /// given. (The app-wide ones are [`set_pi_providers`].)
+    fn project_pi(&self, project_id: &str) -> PiProviders;
+}
+
+static MODEL_PROVIDERS: std::sync::RwLock<Option<Arc<dyn ModelProviders>>> =
+    std::sync::RwLock::new(None);
+
+/// Give every launch from now on its providers from `providers`. A process
+/// that never sets them (a test, a tool) launches Claude as usual and Pi
+/// with the app-wide providers.
+pub fn set_model_providers(providers: Arc<dyn ModelProviders>) {
+    *MODEL_PROVIDERS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(providers);
+}
+
+fn model_providers() -> Option<Arc<dyn ModelProviders>> {
+    MODEL_PROVIDERS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Whose providers the project's terminals of `tool` use: the project's own
+/// when the tool's config is Isolated and the project has chosen its own,
+/// else the app-wide ones. Read from the project's settings at each launch.
+#[must_use]
+pub fn provider_scope(data_root: &Path, project_id: &str, tool: Tool) -> ProviderScope {
+    let kind = crate::terminals::kind(tool);
+    let settings = crate::project_settings::load(data_root, project_id);
+    let isolated = match tool {
+        Tool::Claude => settings.claude_config,
+        Tool::Pi => settings.pi_config,
+        // OpenCode signs in to its providers itself.
+        Tool::Codex | Tool::Antigravity | Tool::OpenCode | Tool::Shell => {
+            return ProviderScope::Global;
+        }
+    } == connecto_core::ConfigMode::Isolated;
+    if isolated && crate::project_settings::load_providers(data_root, project_id).own(kind) {
+        ProviderScope::Project(project_id.to_owned())
+    } else {
+        ProviderScope::Global
+    }
+}
+
+/// How a Claude terminal (not a utility session) of `project_id` reaches its
+/// model.
+fn claude_providers_for_launch(
+    layout: &Layout,
+    project_id: &str,
+) -> Result<ClaudeProviders, LaunchError> {
+    let Some(providers) = model_providers() else {
+        return Ok(ClaudeProviders::default());
+    };
+    let scope = provider_scope(&layout.data_root, project_id, Tool::Claude);
+    providers.claude(&scope).map_err(LaunchError::Providers)
+}
+
+/// What a Claude terminal (not a utility session) of `project_id` leaves
+/// out: the project's Agent Token Optimization, read at each launch.
+fn claude_cuts_for_launch(layout: &Layout, project_id: &str) -> ClaudeCuts {
+    let settings = crate::project_settings::load_token_optimization(&layout.data_root, project_id);
+    ClaudeCuts {
+        plugins_off: settings.plugins_off,
+        skills_off: settings.skills_off,
+        autocompact: settings.autocompact,
+    }
+}
+
+/// Whether a Claude terminal of `project` needs no Anthropic login before it
+/// starts: it goes through TogetherLink, which reaches the model with the
+/// Together AI key. Also when the providers cannot be told (TogetherLink
+/// missing, the secret store unreadable): the launch then refuses with the
+/// reason, which a login screen would hide. Utility sessions are not asked
+/// this: they always use the Anthropic login.
+pub fn claude_login_not_needed(layout: &Layout, project: &Path) -> bool {
+    let Ok(project) = validated(layout, project) else {
+        return false;
+    };
+    match claude_providers_for_launch(layout, &project_id(&project)) {
+        Ok(providers) => providers.together.is_some(),
+        Err(_) => true,
+    }
+}
+
+/// The providers a Pi terminal of `project_id` is given.
+fn pi_providers_for_project(layout: &Layout, project_id: &str) -> PiProviders {
+    match provider_scope(&layout.data_root, project_id, Tool::Pi) {
+        ProviderScope::Global => pi_providers_for_launch(),
+        ProviderScope::Project(id) => {
+            model_providers().map_or_else(PiProviders::default, |p| p.project_pi(&id))
+        }
+    }
+}
 
 /// How each tool is launched from now on (setup). Every launch path that
 /// starts an agent (a new terminal, a restart, the relaunch at app start,
@@ -324,6 +493,9 @@ pub fn adapter(tool: Tool) -> &'static dyn ToolAdapter {
     match tool {
         Tool::Claude => &Claude,
         Tool::Codex => &Codex,
+        Tool::Pi => &Pi,
+        Tool::Antigravity => &Antigravity,
+        Tool::OpenCode => &OpenCode,
         Tool::Shell => &Plain,
     }
 }
@@ -386,7 +558,7 @@ fn plain_pid(text: &str) -> Option<i32> {
 }
 
 fn is_tool_name(text: &str) -> bool {
-    [Tool::Claude, Tool::Codex, Tool::Shell]
+    [Tool::Claude, Tool::Codex, Tool::Pi, Tool::Shell]
         .iter()
         .any(|tool| tool.name() == text)
 }
@@ -515,6 +687,24 @@ pub(crate) fn current_profile(layout: &Layout, project: &Path, tool: Tool) -> Op
     Some(generation_dir(&tool_root, generation))
 }
 
+/// The environment a Codex terminal of `project` reads its configuration
+/// with: the inherited variables, the home, and `CODEX_HOME` when it runs on
+/// a Connecto profile (none for the user's own `~/.codex`). `None` when the
+/// profile cannot be named. For `codex features list` in preflight.
+pub(crate) fn codex_config_env(
+    layout: &Layout,
+    project: &Path,
+    entry: &Path,
+) -> Option<Vec<(OsString, OsString)>> {
+    let mut env = inherited_for(layout, entry, Tool::Codex);
+    env.push(("HOME".into(), for_child(&layout.home).into_os_string()));
+    if !uses_system_config(layout, project, Tool::Codex) {
+        let profile = current_profile(layout, project, Tool::Codex)?;
+        env.push(("CODEX_HOME".into(), for_child(&profile).into_os_string()));
+    }
+    Some(env)
+}
+
 pub(crate) fn current_generation(tool_root: &Path) -> io::Result<u64> {
     match fs::read_to_string(tool_root.join(CURRENT_GENERATION)) {
         Ok(text) => text
@@ -611,19 +801,99 @@ fn uses_system_config(layout: &Layout, project: &Path, tool: Tool) -> bool {
     let mode = match tool {
         Tool::Claude => settings.claude_config,
         Tool::Codex => settings.codex_config,
+        Tool::Pi => settings.pi_config,
+        // Antigravity has no way to be pointed at another folder (docs/specs,
+        // "Antigravity specifics"): it always uses the user's own.
+        Tool::Antigravity => return true,
+        Tool::OpenCode => settings.opencode_config,
         // A shell keeps no configuration of its own.
         Tool::Shell => return false,
     };
     mode == ConfigMode::System
 }
 
+/// Every Claude configuration folder whose transcripts belong to `project`
+/// (Agent Token Optimization §3.1): the user's own `~/.claude` when the
+/// project uses the system configuration, else every generation of its
+/// isolated profile, oldest first.
+pub fn claude_profiles(layout: &Layout, project: &Path) -> Vec<PathBuf> {
+    let project = real(project).unwrap_or_else(|_| project.to_owned());
+    if uses_system_config(layout, &project, Tool::Claude) {
+        return vec![system_profile(layout, Tool::Claude)];
+    }
+    let tool_root = layout
+        .data_root
+        .join("projects")
+        .join(project_id(&project))
+        .join("profiles")
+        .join(Tool::Claude.name());
+    let mut found = generations(&tool_root).unwrap_or_default();
+    found.sort_unstable();
+    found
+        .into_iter()
+        .map(|generation| generation_dir(&tool_root, generation))
+        .filter(|dir| dir.is_dir())
+        .collect()
+}
+
+/// The configuration folder a new `tool` terminal in `project` would use now:
+/// the tool's own (`~/.codex`) when the project uses it, else the project's
+/// current Connecto profile. For reading what the tool keeps there.
+pub(crate) fn config_dir(layout: &Layout, project: &Path, tool: Tool) -> Option<PathBuf> {
+    if uses_system_config(layout, project, tool) {
+        Some(system_profile(layout, tool))
+    } else {
+        current_profile(layout, project, tool)
+    }
+}
+
+/// The folder an OpenCode terminal of `project` would keep its state in now
+/// (its favorite and recent models): the user's own, or the project's
+/// isolated profile's.
+pub(crate) fn opencode_state_dir(layout: &Layout, project: &Path) -> Option<PathBuf> {
+    let system = uses_system_config(layout, project, Tool::OpenCode);
+    let profile = if system {
+        layout.home.clone()
+    } else {
+        current_profile(layout, project, Tool::OpenCode)?
+    };
+    Some(connecto_adapter::opencode_state_dir(
+        &profile,
+        &layout.home,
+        system,
+        xdg_dir("XDG_STATE_HOME").as_deref(),
+    ))
+}
+
 /// The tool's own configuration folder in the user's home.
 fn system_profile(layout: &Layout, tool: Tool) -> PathBuf {
+    // OpenCode's sign-ins and sessions follow the XDG data folder.
+    if tool == Tool::OpenCode
+        && let Some(data) = xdg_dir("XDG_DATA_HOME")
+    {
+        return data.join("opencode");
+    }
     layout.home.join(match tool {
         Tool::Claude => ".claude",
         Tool::Codex => ".codex",
+        Tool::Pi => ".pi/agent",
+        Tool::Antigravity => ".gemini/antigravity-cli",
+        // Where its sign-ins and sessions are; its settings are in
+        // `~/.config/opencode` and its recent models in `~/.local/state`.
+        Tool::OpenCode => ".local/share/opencode",
         Tool::Shell => ".",
     })
+}
+
+/// The XDG folders OpenCode keeps its own in.
+const OPENCODE_XDG: [&str; 3] = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"];
+
+/// An XDG folder of this process: set, not empty, and absolute, as the XDG
+/// rules read one.
+fn xdg_dir(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
 }
 
 fn inherited_env() -> Vec<(OsString, OsString)> {
@@ -633,20 +903,51 @@ fn inherited_env() -> Vec<(OsString, OsString)> {
         .collect()
 }
 
+/// The inherited variables for running `entry`. The `PATH` of an app started
+/// from Finder is only the system folders: a launcher script (Pi, an npm shim)
+/// would not find `node`, and an agent's shell commands would not find the
+/// tools the user installed (Homebrew, `~/.local/bin` ...). Every terminal
+/// gets the folders the user's own login shell searches instead.
+///
+/// OpenCode also gets the XDG folders this process has: they are where its
+/// own settings, sign-ins and sessions are in System default mode, and what
+/// an isolated terminal hands back to the agent's shell.
+fn inherited_for(layout: &Layout, entry: &Path, tool: Tool) -> Vec<(OsString, OsString)> {
+    let mut inherited = inherited_env();
+    if tool == Tool::OpenCode {
+        inherited.extend(
+            OPENCODE_XDG
+                .iter()
+                .filter_map(|name| Some(((*name).into(), std::env::var_os(name)?))),
+        );
+    }
+    let path = if connecto_store::is_launcher(entry) {
+        Some(connecto_store::run_path(entry, &layout.home))
+    } else {
+        connecto_store::user_path(&layout.home)
+    };
+    if let Some(path) = path {
+        inherited.retain(|(name, _)| !name.eq_ignore_ascii_case("PATH"));
+        inherited.push(("PATH".into(), path));
+    }
+    inherited
+}
+
 fn login_ctx(
     layout: &Layout,
+    tool: Tool,
     entry: PathBuf,
     dirs: &SessionDirs,
     system: Option<PathBuf>,
 ) -> LoginCtx {
     LoginCtx {
-        entry: for_child(&entry),
         system_config: system.is_some(),
         profile: for_child(&system.unwrap_or_else(|| dirs.profile.clone())),
         run: for_child(&dirs.run.0),
         session_tmp: for_child(&dirs.tmp),
         home: for_child(&layout.home),
-        inherited: inherited_env(),
+        inherited: inherited_for(layout, &entry, tool),
+        entry: for_child(&entry),
     }
 }
 
@@ -672,6 +973,16 @@ pub fn validated(layout: &Layout, project: &Path) -> Result<PathBuf, PathError> 
 }
 
 /// The shared hold on a project's package install, or `InstallPending`.
+/// `Err` when the project's saved Tools setting leaves `tool` out.
+fn not_left_out(layout: &Layout, project: &Path, tool: Tool) -> Result<(), LaunchError> {
+    crate::project_settings::tool_refusal_in(
+        &layout.data_root,
+        project,
+        crate::terminals::kind(tool),
+    )
+    .map_or(Ok(()), |why| Err(LaunchError::NotAllowed(why)))
+}
+
 fn hold_for_install(
     layout: &Layout,
     project: &Path,
@@ -747,6 +1058,7 @@ pub fn start_resuming(
     platform::agents_supported()?;
     let project = validated(layout, project)?;
     let terminal_key = format!("{}/{}", project_id(&project), bridge.terminal);
+    let agent_mode = launch_modes().for_tool(crate::terminals::kind(tool));
     // Held until the process is spawned, and kept apart from the project's
     // package install, so the tool starts on a complete `.claude/`, `.codex/`
     // and `.agents/`. After the limit the start fails visibly; a restart works
@@ -759,8 +1071,15 @@ pub fn start_resuming(
 
     let hook_token = hex(&random_bytes::<32>()?);
     let system = uses_system_config(layout, &project, tool).then(|| system_profile(layout, tool));
+    // A utility session reaches its model as Claude always does.
+    let claude = if tool == Tool::Claude && extras.utility.is_none() {
+        claude_providers_for_launch(layout, &project_id(&project))?
+    } else {
+        ClaudeProviders::default()
+    };
     let ctx = LaunchCtx {
         entry: for_child(&installed.entry),
+        cli_version: Some(installed.version.clone()),
         hook_binary: for_child(&hook_binary),
         // The PTY's working folder too (`launch.cwd`), and Codex's `-C`.
         project: for_child(&project),
@@ -769,7 +1088,7 @@ pub fn start_resuming(
         session_tmp: for_child(&dirs.tmp),
         run: for_child(&dirs.run.0),
         home: for_child(&layout.home),
-        inherited: inherited_env(),
+        inherited: inherited_for(layout, &installed.entry, tool),
         session_id: new_uuid()?,
         resume: resume.map(str::to_owned),
         hook_socket: hook_socket.clone(),
@@ -782,14 +1101,29 @@ pub fn start_resuming(
             hooks: bridge.hooks,
             trust: bridge.trust.clone(),
         },
+        // Read after the install permit: the project's packages are settled.
+        package_text: crate::package_text::for_launch(tool, extras.utility.is_some(), &project),
         initial_prompt: extras.initial_prompt.clone(),
-        session_name: (tool == Tool::Claude)
+        session_name: matches!(tool, Tool::Claude | Tool::Pi)
             .then(|| extras.session_name.clone())
             .flatten(),
         model: extras.model.clone(),
+        effort: extras.effort.clone(),
         resume_note: extras.resume_note.clone(),
         utility: extras.utility.clone(),
-        agent_mode: launch_modes().for_tool(crate::terminals::kind(tool)),
+        agent_mode,
+        pi: if tool == Tool::Pi {
+            pi_providers_for_project(layout, &project_id(&project))
+        } else {
+            PiProviders::default()
+        },
+        claude,
+        // A utility session runs as it always did.
+        claude_cuts: if tool == Tool::Claude && extras.utility.is_none() {
+            claude_cuts_for_launch(layout, &project_id(&project))
+        } else {
+            ClaudeCuts::default()
+        },
         #[cfg(feature = "test-endpoints")]
         fake_model: extras.fake_model.clone(),
     };
@@ -797,6 +1131,9 @@ pub fn start_resuming(
     let launch = adapter.launch(&ctx);
     for (path, body) in &launch.files {
         fs::write(path, body)?;
+    }
+    if tool == Tool::Antigravity {
+        keep_antigravity_files(layout, &ctx.hook_binary)?;
     }
 
     let socket = BoundSocket::bind(&hook_socket)?;
@@ -815,6 +1152,13 @@ pub fn start_resuming(
     } else {
         None
     };
+    // The project's Tools setting, read at the last moment before the
+    // process starts: one changed while this start waited (for the install,
+    // a sign-in check, the hook trust) counts. Hidden utility sessions are
+    // not checked.
+    if extras.utility.is_none() {
+        not_left_out(layout, &project, tool)?;
+    }
     let mut session = LiveSession::start_tapped(pty, spec, wake.clone(), tap)?;
     let hook_ctx = HookCtx {
         profile: for_child(&system.unwrap_or_else(|| dirs.profile.clone())),
@@ -837,6 +1181,11 @@ pub fn start_resuming(
                 claim.bind(&session.pty());
             }
             session.attach(Some(hook), Some(hook_ctx), dirs.run, claim);
+            // The session carries how its agent was started: the bridge reads
+            // it from the session it found the caller in.
+            if extras.utility.is_none() {
+                session.set_agent_mode(agent_mode);
+            }
             Ok(session)
         }
         Err(err) => {
@@ -844,6 +1193,99 @@ pub fn start_resuming(
             session.terminate();
             Err(err)
         }
+    }
+}
+
+/// Held while a launch updates Antigravity's files in the user's home.
+static ANTIGRAVITY_FILES: Mutex<()> = Mutex::new(());
+/// Numbers this process's temporary files of those writes.
+static STAGED: AtomicU64 = AtomicU64::new(0);
+
+/// Every Antigravity launch reads and rewrites the same two files in the
+/// user's home: launches started together (Agentic Works jobs) take turns.
+fn keep_antigravity_files(layout: &Layout, hook_binary: &Path) -> Result<(), LaunchError> {
+    let _turn = ANTIGRAVITY_FILES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    keep_antigravity_hooks(&layout.home, hook_binary)?;
+    keep_antigravity_attachments_readable(layout);
+    Ok(())
+}
+
+/// A temporary file beside `path`, of this write alone, so two writers
+/// never rename each other's.
+fn staging_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "json.connecto-{}-{}",
+        std::process::id(),
+        STAGED.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Put Connecto's entry in Antigravity's global hooks file, which is the only
+/// place Antigravity reads hooks from (docs/specs, "Antigravity specifics").
+/// The user's other entries are kept, and a file that holds the entry already
+/// is not written. A file that is not a JSON object is left alone and the
+/// start fails: without its hooks a terminal would never report a turn.
+fn keep_antigravity_hooks(home: &Path, hook_binary: &Path) -> Result<(), LaunchError> {
+    let path = connecto_adapter::antigravity_hooks_path(home);
+    let existing = match fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+    let wanted = connecto_adapter::antigravity_hooks_file(existing.as_deref(), hook_binary)
+        .map_err(|err| {
+            LaunchError::Io(io::Error::other(format!(
+                "{err}: {} (Antigravity's hooks file)",
+                path.display()
+            )))
+        })?;
+    if let Some(text) = wanted {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Whole or not at all: Antigravity may read it at any moment.
+        let staged = staging_path(&path);
+        fs::write(&staged, text)?;
+        if let Err(err) = fs::rename(&staged, &path) {
+            let _ = fs::remove_file(&staged);
+            return Err(err.into());
+        }
+    }
+    Ok(())
+}
+
+/// Let Antigravity read the files a terminal is given by path (chat uploads,
+/// pasted images): they live in Connecto's data folder, outside the project,
+/// and Antigravity reads only its workspace unless a rule allows more. One
+/// read-only rule for that folder goes in its settings, beside the user's
+/// own. Best effort: a settings file Connecto cannot read or understand is
+/// left alone, and the terminal starts anyway, only without those files.
+fn keep_antigravity_attachments_readable(layout: &Layout) {
+    let folder = layout
+        .data_root
+        .join(connecto_core::session::ATTACHMENTS_DIR);
+    let rule = connecto_adapter::antigravity_read_rule(&folder);
+    let path = connecto_adapter::antigravity_settings_path(&layout.home);
+    let existing = match fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return,
+    };
+    let Ok(Some(text)) = connecto_adapter::antigravity_settings_file(existing.as_deref(), &rule)
+    else {
+        return;
+    };
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    // Whole or not at all, as for the hooks file.
+    let staged = staging_path(&path);
+    if fs::write(&staged, text).is_ok() && fs::rename(&staged, &path).is_err() {
+        let _ = fs::remove_file(&staged);
     }
 }
 
@@ -1017,18 +1459,30 @@ pub fn start_login(
     // folder that moved: the tool's sign-in is kept per config folder path, so
     // the path changing signs it out): the login runs where the conversations
     // are, and nothing is abandoned. Signed in, a login is a deliberate switch.
-    let in_place = system.is_none()
-        && !matches!(
-            auth_status(
-                adapter(tool),
-                &login_ctx(layout, installed.entry.clone(), &dirs, None),
-            ),
-            AuthState::LoggedIn { .. }
-        )
-        && generation_has_history(&dirs.profile, tool);
+    // OpenCode signs in to one provider at a time, beside the others it has:
+    // its login adds one and never starts the profile over.
+    let in_place = system.is_none() && tool == Tool::OpenCode
+        || system.is_none()
+            && !matches!(
+                auth_status(
+                    adapter(tool),
+                    &login_ctx(layout, tool, installed.entry.clone(), &dirs, None),
+                ),
+                AuthState::LoggedIn { .. }
+            )
+            && generation_has_history(&dirs.profile, tool);
+    // A login runs the CLI too: the Tools setting at the last moment, after
+    // the sign-in probe, before the login profile is reserved.
+    not_left_out(layout, &project, tool)?;
     let (claim, profile) = reserve_login(&dirs.tool_root, in_place)?;
     dirs.profile = profile;
-    let launch = adapter(tool).login(&login_ctx(layout, installed.entry.clone(), &dirs, system));
+    let launch = adapter(tool).login(&login_ctx(
+        layout,
+        tool,
+        installed.entry.clone(),
+        &dirs,
+        system,
+    ));
     let spec = PtySpec {
         program: launch.program,
         args: launch.args,
@@ -1049,11 +1503,41 @@ pub fn check_auth(
     tool: Tool,
     installed: &Installed,
 ) -> Result<AuthState, LaunchError> {
+    let system_config =
+        validated(layout, project).is_ok_and(|project| uses_system_config(layout, &project, tool));
+    check_auth_as(layout, project, tool, installed, system_config)
+}
+
+/// [`check_auth`] in the profile given rather than the one the project's
+/// settings say now: the system's when `system_config`, else the project's
+/// own. For a caller that resolved the profile once and keeps the answer
+/// under it (Agentic Works, ADR 0041).
+pub fn check_auth_as(
+    layout: &Layout,
+    project: &Path,
+    tool: Tool,
+    installed: &Installed,
+    system_config: bool,
+) -> Result<AuthState, LaunchError> {
     platform::agents_supported()?;
     let project = validated(layout, project)?;
-    let system = uses_system_config(layout, &project, tool).then(|| system_profile(layout, tool));
+    let system = system_config.then(|| system_profile(layout, tool));
     let dirs = session_dirs(layout, &project, tool, false)?;
-    let ctx = login_ctx(layout, installed.entry.clone(), &dirs, system);
+    let ctx = login_ctx(layout, tool, installed.entry.clone(), &dirs, system);
+    if tool == Tool::OpenCode {
+        // Its status is its version, asked of the program as it is now: it
+        // upgrades itself, and OpenCode 2 cannot load Connecto's plugin.
+        let Some((stdout, stderr)) = crate::auth::status_output(adapter(tool), &ctx) else {
+            return Ok(AuthState::Unknown);
+        };
+        // One output, read once for both: where the version is (stdout, or
+        // stderr when stdout says nothing).
+        let text = connecto_store::version_text(&stdout, &stderr);
+        if let Some(why) = connecto_store::opencode_unsupported(&text) {
+            return Err(LaunchError::Io(io::Error::other(why)));
+        }
+        return Ok(adapter(tool).parse_status(&text));
+    }
     Ok(auth_status(adapter(tool), &ctx))
 }
 
@@ -1069,7 +1553,7 @@ pub fn repair_empty_generations(data_root: &Path) -> usize {
         return 0;
     };
     for project in projects.flatten() {
-        for tool in [Tool::Claude, Tool::Codex] {
+        for tool in [Tool::Claude, Tool::Codex, Tool::Pi] {
             let tool_root = project.path().join("profiles").join(tool.name());
             let Ok(current) = current_generation(&tool_root) else {
                 continue;
@@ -1099,6 +1583,45 @@ pub fn repair_empty_generations(data_root: &Path) -> usize {
         }
     }
     brought
+}
+
+/// After a data folder was moved (the earlier name's copy): tell each Claude
+/// profile where its sign-in still is, so it is not signed out by the new path.
+/// A profile that has an identity already, or has no counterpart in the old
+/// folder (made since), is left alone. Runs at startup; returns how many were
+/// written.
+pub fn repair_secure_storage(data_root: &Path) -> usize {
+    let Ok(marker) = fs::read_to_string(data_root.join(".migrated-from-magneto")) else {
+        return 0;
+    };
+    let old_root = PathBuf::from(marker.trim());
+    if !old_root.is_absolute() {
+        return 0;
+    }
+    let mut written = 0;
+    let Ok(projects) = fs::read_dir(data_root.join("projects")) else {
+        return 0;
+    };
+    for project in projects.flatten() {
+        let tool_root = project.path().join("profiles").join("claude");
+        for generation in generations(&tool_root).unwrap_or_default() {
+            let dir = generation_dir(&tool_root, generation);
+            let file = dir.join(connecto_adapter::SECURE_STORAGE_FILE);
+            let old = old_root
+                .join("projects")
+                .join(project.file_name())
+                .join("profiles")
+                .join("claude")
+                .join(format!("g{generation}"));
+            if !file.exists()
+                && old.is_dir()
+                && fs::write(&file, old.to_string_lossy().as_bytes()).is_ok()
+            {
+                written += 1;
+            }
+        }
+    }
+    written
 }
 
 /// Copy the files of `from` that `to` lacks, keeping the layout. Best effort.
@@ -1142,12 +1665,7 @@ pub fn system_signin(layout: &Layout, tool: Tool, entry: &Path) -> AuthState {
     if private_dir(&tmp).is_err() {
         return AuthState::Unknown;
     }
-    let mut inherited = inherited_env();
-    if connecto_store::is_launcher(entry) {
-        // A launcher script runs `node`, which a Finder-started app's PATH lacks.
-        inherited.retain(|(name, _)| name != "PATH");
-        inherited.push(("PATH".into(), connecto_store::run_path(entry, &layout.home)));
-    }
+    let inherited = inherited_for(layout, entry, tool);
     let ctx = LoginCtx {
         entry: for_child(entry),
         system_config: true,
@@ -1182,6 +1700,97 @@ fn signin_folder(layout: &Layout, tool: Tool) -> io::Result<RunFolder> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Agentic Works starts several Antigravity jobs at once: each launch
+    /// updates the hooks file in the user's home, and none fails or leaves
+    /// it half written.
+    #[test]
+    fn antigravity_launches_together_update_its_files_one_at_a_time() {
+        let root = temp("antigravity-together");
+        let layout = Layout {
+            data_root: root.join("data"),
+            home: root.join("home"),
+        };
+        let outcomes: Vec<Result<(), String>> = std::thread::scope(|scope| {
+            let launches: Vec<_> = (0..16)
+                .map(|n| {
+                    let layout = &layout;
+                    scope.spawn(move || {
+                        // A different hook path each time, so every launch
+                        // has something to write.
+                        let hook = PathBuf::from(format!("/opt/connecto-{n}/connecto-hook"));
+                        keep_antigravity_files(layout, &hook).map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            launches.into_iter().map(|l| l.join().unwrap()).collect()
+        });
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        let path = connecto_adapter::antigravity_hooks_path(&layout.home);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+            "{text}"
+        );
+        let left: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".connecto"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// Token optimization §5.2: a Claude terminal's launch reads the project's
+    /// cuts; with none set it gets none. The profiles a project's transcripts
+    /// are read from follow its config: system, or every isolated generation.
+    #[test]
+    fn the_launch_reads_the_projects_token_cuts_and_profiles() {
+        let root = temp("token-cuts");
+        let layout = Layout {
+            data_root: root.join("data"),
+            home: root.join("home"),
+        };
+        assert_eq!(claude_cuts_for_launch(&layout, "p"), ClaudeCuts::default());
+        crate::project_settings::update_token_optimization(&layout.data_root, "p", |t| {
+            t.plugins_off = vec!["pm@synced".to_owned()];
+            t.skills_off = vec!["dataviz".to_owned()];
+            t.autocompact = Some(150_000);
+        })
+        .unwrap();
+        assert_eq!(
+            claude_cuts_for_launch(&layout, "p"),
+            ClaudeCuts {
+                plugins_off: vec!["pm@synced".to_owned()],
+                skills_off: vec!["dataviz".to_owned()],
+                autocompact: Some(150_000),
+            }
+        );
+        let project = root.join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let project = real(&project).unwrap();
+        // A new project uses the system configuration.
+        assert_eq!(
+            claude_profiles(&layout, &project),
+            [layout.home.join(".claude")]
+        );
+        let id = project_id(&project);
+        let mut settings = crate::project_settings::load(&layout.data_root, &id);
+        settings.claude_config = connecto_core::ConfigMode::Isolated;
+        crate::project_settings::save(&layout.data_root, &id, &settings).unwrap();
+        let tool_root = layout
+            .data_root
+            .join("projects")
+            .join(&id)
+            .join("profiles")
+            .join("claude");
+        for g in ["g2", "g1"] {
+            fs::create_dir_all(tool_root.join(g)).unwrap();
+        }
+        assert_eq!(
+            claude_profiles(&layout, &project),
+            [tool_root.join("g1"), tool_root.join("g2")]
+        );
+    }
 
     /// Concurrent sign-in checks of one tool each get their own folder, all
     /// exist while held, and every one is removed when its guard drops.
@@ -1369,6 +1978,50 @@ mod tests {
         assert_eq!(PathBuf::from(identity), for_child(&profile));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn a_moved_profile_is_told_where_its_sign_in_still_is() {
+        let root = temp("secure");
+        let layout = Layout {
+            data_root: root.join("connecto"),
+            home: root.join("home"),
+        };
+        let old = root.join("magneto");
+        fs::create_dir_all(&layout.data_root).unwrap();
+        fs::write(
+            layout.data_root.join(".migrated-from-magneto"),
+            format!("{}\n", old.display()),
+        )
+        .unwrap();
+        let projects = layout.data_root.join("projects/p1/profiles/claude");
+        for g in ["g1", "g2"] {
+            fs::create_dir_all(projects.join(g)).unwrap();
+        }
+        // The old folder had g1 and g2; g3 is new here and keeps its own path.
+        fs::create_dir_all(projects.join("g3")).unwrap();
+        for g in ["g1", "g2"] {
+            fs::create_dir_all(old.join("projects/p1/profiles/claude").join(g)).unwrap();
+        }
+        assert_eq!(repair_secure_storage(&layout.data_root), 2);
+        let said = fs::read_to_string(
+            projects
+                .join("g2")
+                .join(connecto_adapter::SECURE_STORAGE_FILE),
+        )
+        .unwrap();
+        assert_eq!(
+            PathBuf::from(said),
+            old.join("projects/p1/profiles/claude/g2")
+        );
+        assert!(
+            !projects
+                .join("g3")
+                .join(connecto_adapter::SECURE_STORAGE_FILE)
+                .exists()
+        );
+        assert_eq!(repair_secure_storage(&layout.data_root), 0);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(windows)]
@@ -1653,6 +2306,123 @@ mod tests {
             system_profile(&layout, Tool::Codex),
             root.join("home/.codex")
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A Claude terminal that goes through TogetherLink is not sent to the
+    /// Anthropic login, nor one whose providers cannot be told (its launch says
+    /// why); one with no Together AI key is checked as before.
+    #[test]
+    fn a_claude_terminal_through_togetherlink_needs_no_anthropic_login() {
+        use crate::project_settings::{ProjectProviders, save, save_providers};
+        use connecto_core::{ConfigMode, ProjectSettings};
+        struct Fake {
+            together: String,
+            broken: String,
+        }
+        impl ModelProviders for Fake {
+            fn claude(&self, scope: &ProviderScope) -> Result<ClaudeProviders, String> {
+                match scope {
+                    ProviderScope::Project(id) if *id == self.together => Ok(ClaudeProviders {
+                        together: Some(connecto_adapter::TogetherLink {
+                            program: PathBuf::from("/bin/togetherlink"),
+                            api_key: "tgp_v1_test".to_owned(),
+                        }),
+                    }),
+                    ProviderScope::Project(id) if *id == self.broken => {
+                        Err("TogetherLink is not installed".to_owned())
+                    }
+                    _ => Ok(ClaudeProviders::default()),
+                }
+            }
+            fn project_pi(&self, _: &str) -> PiProviders {
+                PiProviders::default()
+            }
+        }
+        let root = temp("login-not-needed");
+        let layout = Layout {
+            data_root: root.join("data"),
+            home: root.join("home"),
+        };
+        let folder = |name: &str| {
+            let dir = root.join("work").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::canonicalize(dir).unwrap()
+        };
+        let (together, broken, plain) = (folder("together"), folder("broken"), folder("plain"));
+        let own = |project: &Path| {
+            let id = project_id(project);
+            let isolated = ProjectSettings {
+                claude_config: ConfigMode::Isolated,
+                ..ProjectSettings::default()
+            };
+            save(&layout.data_root, &id, &isolated).unwrap();
+            let chose = ProjectProviders {
+                claude_own: true,
+                ..ProjectProviders::default()
+            };
+            save_providers(&layout.data_root, &id, &chose).unwrap();
+            id
+        };
+        set_model_providers(Arc::new(Fake {
+            together: own(&together),
+            broken: own(&broken),
+        }));
+        assert!(claude_login_not_needed(&layout, &together));
+        assert!(claude_login_not_needed(&layout, &broken));
+        assert!(!claude_login_not_needed(&layout, &plain));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A project's own providers count only while its tool is Isolated and
+    /// it chose them; otherwise the app-wide ones (System and the default).
+    #[test]
+    fn a_projects_own_providers_apply_only_when_its_tool_is_isolated_and_it_chose_them() {
+        use crate::project_settings::{ProjectProviders, save, save_providers};
+        use connecto_core::{ConfigMode, ProjectSettings};
+        let root = std::env::temp_dir().join(format!("mg-launch-providers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let data = root.join("data");
+        let project = Path::new("/work/providers");
+        let id = project_id(project);
+        let scope = |tool| provider_scope(&data, &id, tool);
+        let own = ProviderScope::Project(id.clone());
+        // A new project: System, nothing of its own.
+        assert_eq!(scope(Tool::Claude), ProviderScope::Global);
+        // Chosen, but System: still the app-wide ones.
+        let chose = ProjectProviders {
+            claude_own: true,
+            pi_own: true,
+            ..ProjectProviders::default()
+        };
+        save_providers(&data, &id, &chose).unwrap();
+        assert_eq!(scope(Tool::Claude), ProviderScope::Global);
+        assert_eq!(scope(Tool::Pi), ProviderScope::Global);
+        // Isolated: the project's own.
+        let isolated = ProjectSettings {
+            claude_config: ConfigMode::Isolated,
+            codex_config: ConfigMode::Isolated,
+            pi_config: ConfigMode::Isolated,
+            ..ProjectSettings::default()
+        };
+        save(&data, &id, &isolated).unwrap();
+        assert_eq!(scope(Tool::Claude), own);
+        assert_eq!(scope(Tool::Pi), own);
+        // Codex has no providers here, and a shell none at all.
+        assert_eq!(scope(Tool::Codex), ProviderScope::Global);
+        assert_eq!(scope(Tool::Shell), ProviderScope::Global);
+        // Isolated, back to the app-wide ones by choice.
+        save_providers(
+            &data,
+            &id,
+            &ProjectProviders {
+                pi_own: true,
+                ..ProjectProviders::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(scope(Tool::Claude), ProviderScope::Global);
+        assert_eq!(scope(Tool::Pi), own);
         let _ = fs::remove_dir_all(&root);
     }
 

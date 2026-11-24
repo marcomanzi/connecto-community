@@ -6,13 +6,14 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Osc52, TermMode};
 use alacritty_terminal::vte::ansi::{self, CursorShape as VteCursorShape};
 use connecto_core::{
-    Cell, CellFlags, Cursor, CursorShape, GridSize, InputModes, ResizeOutcome, SnapshotOutcome,
-    TermSnapshot,
+    Cell, CellFlags, Cursor, CursorShape, GridSize, InputModes, ResizeOutcome, SelectOp,
+    SelectedRange, SelectionText, SnapshotOutcome, TermSnapshot,
 };
 
 use crate::color;
@@ -31,6 +32,16 @@ const SCROLLBACK_LINES: usize = 10_000;
 /// Smallest grid the emulator accepts.
 const MIN_COLS: u16 = 2;
 const MIN_ROWS: u16 = 1;
+
+/// The size the emulator takes when asked for `size`: never smaller than it
+/// can draw.
+#[must_use]
+pub fn effective_size(size: GridSize) -> GridSize {
+    GridSize {
+        cols: size.cols.max(MIN_COLS),
+        rows: size.rows.max(MIN_ROWS),
+    }
+}
 
 struct Dims {
     cols: usize,
@@ -76,7 +87,9 @@ impl Screen {
         let deadline = self.parser.sync_timeout().sync_timeout()?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            let before = SelectedCells::of(&self.term);
             self.parser.stop_sync(&mut self.term);
+            drop_if_rewritten(before, &mut self.term);
             None
         } else {
             Some(remaining)
@@ -152,7 +165,9 @@ impl Emulator {
             return;
         };
         let screen = &mut *guard;
+        let before = SelectedCells::of(&screen.term);
         screen.parser.advance(&mut screen.term, bytes);
+        drop_if_rewritten(before, &mut screen.term);
         self.sync_held.store(
             screen.parser.sync_timeout().sync_timeout().is_some(),
             Ordering::Release,
@@ -238,6 +253,18 @@ impl Emulator {
         }
     }
 
+    /// Runs `f` with the screen's generation, holding the screen meanwhile:
+    /// no output is taken in until `f` returns, so what `f` does (an input
+    /// write conditional on the screen not having changed) cannot be
+    /// overtaken by a redraw. None, without running `f`, while the screen
+    /// is busy. Never blocks.
+    pub fn hold_generation<T>(&self, f: impl FnOnce(u64) -> T) -> Option<T> {
+        let Ok(Some(_screen)) = self.try_screen() else {
+            return None;
+        };
+        Some(f(self.generation.load(Ordering::Acquire)))
+    }
+
     /// Copy the screen into `out` if it changed. Never blocks.
     pub fn poll_snapshot(&self, out: &mut TermSnapshot) -> SnapshotOutcome {
         let idle =
@@ -312,6 +339,93 @@ impl Emulator {
         rows_text(term, first)
     }
 
+    /// The visible screen's rows as [`Self::text_tail`] gives them, or None
+    /// while the screen is busy. Never blocks: for a caller that would rather
+    /// go without than wait on a terminal in the middle of a redraw.
+    #[must_use]
+    pub fn try_text_screen(&self) -> Option<String> {
+        let Ok(Some(guard)) = self.try_screen() else {
+            return None;
+        };
+        let term = &guard.term;
+        let above = i32::try_from(term.screen_lines().saturating_sub(1)).unwrap_or(i32::MAX);
+        let first = term
+            .bottommost_line()
+            .0
+            .saturating_sub(above)
+            .max(term.topmost_line().0);
+        Some(rows_text(term, first))
+    }
+
+    /// The live screen and the newest history above it, read together, for a
+    /// peer that shows this terminal: `screen` as [`Self::poll_snapshot`] fills
+    /// it but always the live screen, whatever the view is scrolled to, and
+    /// `history` with up to `max_cells` cells of history in whole rows of
+    /// `screen.cols`, oldest first (only its cells are set). The alternate
+    /// screen has no history. Returns false, changing nothing, if the emulator
+    /// was busy or a synchronized update is still being held back, unless
+    /// `flush` says to end that update now (as its timeout would) and copy what
+    /// it held. Never blocks.
+    pub fn try_capture(
+        &self,
+        max_cells: usize,
+        flush: bool,
+        screen: &mut TermSnapshot,
+        history: &mut TermSnapshot,
+    ) -> bool {
+        let Ok(Some(mut guard)) = self.try_screen() else {
+            return false;
+        };
+        // Output held back by a synchronized update is already past the caller's
+        // sequence number but not on the grid yet: wait until it is.
+        if guard.flush_expired_sync().is_some() {
+            if !flush {
+                return false;
+            }
+            let screen = &mut *guard;
+            let before = SelectedCells::of(&screen.term);
+            screen.parser.stop_sync(&mut screen.term);
+            drop_if_rewritten(before, &mut screen.term);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            if !self.dirty.swap(true, Ordering::AcqRel) {
+                (self.wake)();
+            }
+        }
+        let term = &mut guard.term;
+        // The view is put back before the lock is let go, so nobody sees it move.
+        let offset = term.grid().display_offset();
+        if offset > 0 {
+            term.scroll_display(Scroll::Bottom);
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        self.fill_snapshot(term, screen, generation);
+        if offset > 0 {
+            term.scroll_display(Scroll::Delta(i32::try_from(offset).unwrap_or(i32::MAX)));
+        }
+        let cols = term.columns();
+        let lines = term
+            .history_size()
+            .min(max_cells / cols.max(1))
+            .min(usize::from(u16::MAX));
+        let colors = term.colors();
+        *history = TermSnapshot {
+            cols: u16::try_from(cols).unwrap_or(u16::MAX),
+            rows: u16::try_from(lines).unwrap_or(u16::MAX),
+            default_bg: color::BACKGROUND,
+            ..TermSnapshot::default()
+        };
+        history.cells.reserve(cols * lines);
+        for back in (1..=lines).rev() {
+            let row = &term.grid()[Line(-i32::try_from(back).unwrap_or(i32::MAX))];
+            for column in 0..cols {
+                history
+                    .cells
+                    .push(convert_cell(&row[Column(column)], colors));
+            }
+        }
+        true
+    }
+
     /// Scroll through history. Returns false if the emulator was busy.
     pub fn try_scroll(&self, lines: i32) -> bool {
         let Ok(Some(mut guard)) = self.try_screen() else {
@@ -321,6 +435,83 @@ impl Emulator {
         drop(guard);
         self.generation.fetch_add(1, Ordering::Release);
         true
+    }
+
+    /// Change the selection. Cells are given on the screen as shown and kept
+    /// in the terminal's own lines, so the selection stays on its text while
+    /// the view scrolls or output pushes it up; text that leaves history or is
+    /// erased takes the selection with it. Returns false if the emulator was
+    /// busy. Never blocks.
+    pub fn try_select(&self, op: SelectOp) -> bool {
+        let Ok(Some(mut guard)) = self.try_screen() else {
+            return false;
+        };
+        let term = &mut guard.term;
+        let offset = i32::try_from(term.grid().display_offset()).unwrap_or(i32::MAX);
+        let last_col = term.columns().saturating_sub(1);
+        let point = |row: u16, col: u16| {
+            Point::new(
+                Line(i32::from(row) - offset),
+                Column(usize::from(col).min(last_col)),
+            )
+        };
+        match op {
+            SelectOp::Start { row, col } => {
+                term.selection = Some(Selection::new(
+                    SelectionType::Simple,
+                    point(row, col),
+                    Side::Left,
+                ));
+            }
+            SelectOp::Extend { row, col } => {
+                if let Some(selection) = term.selection.as_mut() {
+                    selection.update(point(row, col), Side::Right);
+                    // Both end cells are in, whichever way the drag went.
+                    selection.include_all();
+                }
+            }
+            SelectOp::All => {
+                let bottom = u16::try_from(term.screen_lines().saturating_sub(1)).unwrap_or(0);
+                let mut selection = Selection::new(SelectionType::Simple, point(0, 0), Side::Left);
+                selection.update(point(bottom, u16::MAX), Side::Right);
+                term.selection = Some(selection);
+            }
+            SelectOp::Clear => term.selection = None,
+        }
+        drop(guard);
+        self.generation.fetch_add(1, Ordering::Release);
+        true
+    }
+
+    /// The selected text, including rows scrolled out of view. Never blocks.
+    #[must_use]
+    pub fn selection_text(&self) -> SelectionText {
+        match self.try_screen() {
+            Ok(Some(guard)) => {
+                selected_text(&guard.term).map_or(SelectionText::Nothing, SelectionText::Text)
+            }
+            Ok(None) => SelectionText::Busy,
+            Err(()) => SelectionText::Nothing,
+        }
+    }
+
+    /// The selected text as the clean copy reads it
+    /// ([`connecto_core::copy_text`]): an agent's margins dropped and the
+    /// rows it broke itself put back together. Never blocks.
+    #[must_use]
+    pub fn clean_selection_text(&self) -> SelectionText {
+        match self.try_screen() {
+            Ok(Some(guard)) => {
+                selected_lines(&guard.term).map_or(SelectionText::Nothing, |lines| {
+                    SelectionText::Text(connecto_core::copy_text::clean_copy(
+                        &lines,
+                        guard.term.columns(),
+                    ))
+                })
+            }
+            Ok(None) => SelectionText::Busy,
+            Err(()) => SelectionText::Nothing,
+        }
     }
 
     /// How many clipboard requests the policy has dropped.
@@ -369,6 +560,215 @@ fn rows_text(term: &Term<PolicyListener>, first: i32) -> String {
     out
 }
 
+/// The selected text. Trailing blanks go and wide-character spacers are
+/// skipped. A row the terminal wrapped, or one filled to its last column, joins
+/// the next without a newline, so a long login URL that a full-screen program
+/// broke over rows still copies whole.
+fn selected_text(term: &Term<PolicyListener>) -> Option<String> {
+    let range = selection_range(term)?;
+    let columns = term.columns();
+    let mut out = String::new();
+    for line in range.start.line.0..=range.end.line.0 {
+        let row = &term.grid()[Line(line)];
+        let (start, end) = row_bounds(&range, line, columns);
+        let last = columns.checked_sub(1).map(|c| &row[Column(c)]);
+        let soft_wrapped = last.is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE));
+        // Blanks are dropped only at the end of a logical line: on a row the
+        // terminal wrapped, a space in the last column is part of the text.
+        let length = if soft_wrapped {
+            columns
+        } else {
+            (0..columns)
+                .rev()
+                .find(|&column| !is_blank(&row[Column(column)]))
+                .map_or(0, |column| column + 1)
+        };
+        for column in start..end.min(length) {
+            if let Some((ch, extra)) = cell_text(&row[Column(column)]) {
+                out.push(ch);
+                out.extend(extra);
+            }
+        }
+        let joined = end == columns && (soft_wrapped || last.is_some_and(|cell| !is_blank(cell)));
+        if line != range.end.line.0 && !joined {
+            out.push('\n');
+        }
+    }
+    // Blank rows at the end, as below a short screen, are not copied.
+    let kept = out.trim_end_matches('\n').len();
+    out.truncate(kept);
+    Some(out)
+}
+
+/// The selection as logical lines (rows the terminal wrapped joined, as in
+/// [`selected_text`]), each with the column it starts at and where its last
+/// row's text ends, for the clean copy.
+fn selected_lines(term: &Term<PolicyListener>) -> Option<Vec<connecto_core::copy_text::CopyLine>> {
+    let range = selection_range(term)?;
+    let columns = term.columns();
+    let mut lines = Vec::new();
+    let mut current: Option<connecto_core::copy_text::CopyLine> = None;
+    for line in range.start.line.0..=range.end.line.0 {
+        let row = &term.grid()[Line(line)];
+        let (start, end) = row_bounds(&range, line, columns);
+        let last = columns.checked_sub(1).map(|c| &row[Column(c)]);
+        let soft_wrapped = last.is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE));
+        let content_end = (0..columns)
+            .rev()
+            .find(|&column| !is_blank(&row[Column(column)]))
+            .map_or(0, |column| column + 1);
+        let length = if soft_wrapped { columns } else { content_end };
+        let entry = current.get_or_insert_with(|| connecto_core::copy_text::CopyLine {
+            text: String::new(),
+            start,
+            lead: (0..start)
+                .filter_map(|column| cell_text(&row[Column(column)]).map(|(ch, _)| ch))
+                .collect(),
+            end: 0,
+        });
+        for column in start..end.min(length) {
+            if let Some((ch, extra)) = cell_text(&row[Column(column)]) {
+                entry.text.push(ch);
+                entry.text.extend(extra);
+            }
+        }
+        entry.end = content_end;
+        // Only rows the terminal wrapped join here; every row a program broke
+        // itself is left for the clean copy to judge.
+        let joined = end == columns && soft_wrapped;
+        if line == range.end.line.0 || !joined {
+            lines.extend(current.take());
+        }
+    }
+    // Blank rows at the end, as below a short screen, are not copied. A
+    // selection of blanks only is still a selection: its copy is empty.
+    while lines.last().is_some_and(|line| line.text.trim().is_empty()) {
+        lines.pop();
+    }
+    Some(lines)
+}
+
+/// What a cell contributes to copied text: its character and any combining
+/// characters on it. A wide character's spacer contributes nothing.
+fn cell_text(cell: &alacritty_terminal::term::cell::Cell) -> Option<(char, &[char])> {
+    if cell
+        .flags
+        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+    {
+        return None;
+    }
+    Some((cell.c, cell.zerowidth().unwrap_or(&[])))
+}
+
+fn is_blank(cell: &alacritty_terminal::term::cell::Cell) -> bool {
+    cell_text(cell).is_some_and(|(ch, extra)| ch == ' ' && extra.is_empty())
+}
+
+/// The selection's first and last cell, both included, so that the highlight,
+/// the copy and the rewrite check all use the same cells. A wide character is
+/// taken whole at either end: a first cell on its right half moves left, and
+/// a last cell on its left half moves right.
+fn selection_range(term: &Term<PolicyListener>) -> Option<SelectionRange> {
+    let mut range = term.selection.as_ref()?.to_range(term)?;
+    let grid = term.grid();
+    if range.start.column.0 > 0
+        && grid[range.start.line][range.start.column]
+            .flags
+            .contains(Flags::WIDE_CHAR_SPACER)
+    {
+        range.start.column -= 1;
+    }
+    if range.end.column.0 + 1 < term.columns()
+        && grid[range.end.line][range.end.column]
+            .flags
+            .contains(Flags::WIDE_CHAR)
+    {
+        range.end.column += 1;
+    }
+    Some(range)
+}
+
+/// The selected columns of `line`, end exclusive.
+fn row_bounds(range: &SelectionRange, line: i32, columns: usize) -> (usize, usize) {
+    let start = if line == range.start.line.0 {
+        range.start.column.0
+    } else {
+        0
+    };
+    let end = if line == range.end.line.0 {
+        range.end.column.0 + 1
+    } else {
+        columns
+    };
+    (start.min(columns), end.min(columns))
+}
+
+/// What the selected cells on the screen held before output was applied. Only
+/// screen rows can be written; history rows only move.
+struct SelectedCells {
+    /// The selection's last line, which tells how far output scrolled it.
+    end_line: i32,
+    rows: Vec<(i32, usize, Vec<CellText>)>,
+}
+
+/// A cell as [`cell_text`] reads it, kept.
+type CellText = Option<(char, Vec<char>)>;
+
+fn owned_text(cell: &alacritty_terminal::term::cell::Cell) -> CellText {
+    cell_text(cell).map(|(ch, extra)| (ch, extra.to_vec()))
+}
+
+impl SelectedCells {
+    fn of(term: &Term<PolicyListener>) -> Option<Self> {
+        let range = selection_range(term)?;
+        if range.end.line.0 < 0 {
+            return None;
+        }
+        let columns = term.columns();
+        let rows = (range.start.line.0.max(0)..=range.end.line.0)
+            .map(|line| {
+                let (start, end) = row_bounds(&range, line, columns);
+                let row = &term.grid()[Line(line)];
+                let chars = (start..end)
+                    .map(|column| owned_text(&row[Column(column)]))
+                    .collect();
+                (line, start, chars)
+            })
+            .collect();
+        Some(Self {
+            end_line: range.end.line.0,
+            rows,
+        })
+    }
+}
+
+/// Clear the selection if output wrote other text into any of its cells, so a
+/// copy never returns text the user did not select. Output that only appends,
+/// or scrolls the selection up, leaves it.
+fn drop_if_rewritten(before: Option<SelectedCells>, term: &mut Term<PolicyListener>) {
+    let Some(before) = before else { return };
+    let Some(range) = selection_range(term) else {
+        return;
+    };
+    let shift = before.end_line - range.end.line.0;
+    let (top, bottom) = (term.topmost_line().0, term.bottommost_line().0);
+    let columns = term.columns();
+    let rewritten = before.rows.iter().any(|(line, start, chars)| {
+        let line = line - shift;
+        if line < top || line > bottom {
+            return true;
+        }
+        let row = &term.grid()[Line(line)];
+        chars
+            .iter()
+            .enumerate()
+            .any(|(i, text)| start + i >= columns || owned_text(&row[Column(start + i)]) != *text)
+    });
+    if rewritten {
+        term.selection = None;
+    }
+}
+
 fn copy_screen(term: &Term<PolicyListener>, out: &mut TermSnapshot) {
     let content = term.renderable_content();
     let cols = term.columns();
@@ -403,6 +803,19 @@ fn copy_screen(term: &Term<PolicyListener>, out: &mut TermSnapshot) {
             *slot = convert_cell(indexed.cell, colors);
         }
     }
+
+    out.selection = selection_range(term).map(|range| {
+        let at = |point: Point| {
+            (
+                point.line.0 + offset as i32,
+                u16::try_from(point.column.0).unwrap_or(u16::MAX),
+            )
+        };
+        SelectedRange {
+            first: at(range.start),
+            last: at(range.end),
+        }
+    });
 
     out.cursor = convert_cursor(content.cursor.shape).and_then(|shape| {
         let row = content.cursor.point.line.0 + offset as i32;
@@ -455,7 +868,13 @@ fn convert_cell(
         (Flags::STRIKEOUT, CellFlags::STRIKEOUT),
         (Flags::WIDE_CHAR, CellFlags::WIDE),
         (Flags::WIDE_CHAR_SPACER, CellFlags::WIDE_SPACER),
+        (
+            Flags::LEADING_WIDE_CHAR_SPACER,
+            CellFlags::LEADING_WIDE_SPACER,
+        ),
         (Flags::WRAPLINE, CellFlags::WRAPPED),
+        (Flags::DIM, CellFlags::DIM),
+        (Flags::INVERSE, CellFlags::INVERSE),
     ] {
         if flags.contains(source) {
             out_flags.insert(target);
@@ -710,6 +1129,19 @@ mod tests {
         let cell = snapshot.row(0)[0];
         assert_eq!(cell.fg, color::BACKGROUND);
         assert_eq!(cell.bg, color::FOREGROUND);
+        assert!(cell.flags.contains(CellFlags::INVERSE));
+    }
+
+    #[test]
+    fn faint_text_is_flagged_and_normal_text_is_not() {
+        let h = harness();
+        h.emulator.feed(b"a\x1b[2mb\x1b[22mc");
+        let snapshot = h.snapshot();
+        let row = snapshot.row(0);
+        assert!(!row[0].flags.contains(CellFlags::DIM));
+        assert!(row[1].flags.contains(CellFlags::DIM));
+        assert!(!row[2].flags.contains(CellFlags::DIM));
+        assert!(!row[1].flags.contains(CellFlags::INVERSE));
     }
 
     #[test]
@@ -1016,6 +1448,263 @@ mod tests {
         let snapshot = h.snapshot();
         assert_eq!(snapshot.display_offset, 3);
         assert_eq!(row_text(&snapshot, 0), "line 12");
+    }
+
+    fn select(h: &Harness, op: SelectOp) {
+        assert!(h.emulator.try_select(op));
+    }
+
+    fn selected(h: &Harness) -> String {
+        match h.emulator.selection_text() {
+            SelectionText::Text(text) => text,
+            other => panic!("no selection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_selection_stays_on_its_text_while_the_view_scrolls_and_copies_it_all() {
+        let h = harness();
+        for i in 0..20 {
+            h.emulator.feed(format!("line {i}\r\n").as_bytes());
+        }
+        // Back to the top: "line 0" is the first row shown.
+        assert!(h.emulator.try_scroll(100));
+        assert_eq!(row_text(&h.snapshot(), 0), "line 0");
+        select(&h, SelectOp::Start { row: 0, col: 0 });
+        // The view scrolls down six lines while the drag goes on.
+        assert!(h.emulator.try_scroll(-6));
+        let snapshot = h.snapshot();
+        assert_eq!(row_text(&snapshot, 5), "line 11");
+        select(&h, SelectOp::Extend { row: 5, col: 6 });
+        let snapshot = h.snapshot();
+        // The start is still on "line 0", now six rows above the view.
+        assert_eq!(
+            snapshot.selection,
+            Some(SelectedRange {
+                first: (-6, 0),
+                last: (5, 6)
+            })
+        );
+        let expected: Vec<String> = (0..12).map(|i| format!("line {i}")).collect();
+        assert_eq!(selected(&h), expected.join("\n"));
+        // New output moves nothing under the selection.
+        h.emulator.feed(b"more\r\nand more\r\n");
+        assert_eq!(selected(&h), expected.join("\n"));
+        // Back at the live screen the selection is above the view.
+        assert!(h.emulator.try_scroll(-1000));
+        let range = h.snapshot().selection.unwrap();
+        assert!(range.last.0 < 0, "{range:?}");
+        assert!(range.spans(SIZE.rows, SIZE.cols).is_empty());
+    }
+
+    #[test]
+    fn a_backward_drag_selects_both_end_cells() {
+        let h = harness();
+        h.emulator.feed(b"abcde\r\nuvwxyz");
+        select(&h, SelectOp::Start { row: 1, col: 1 });
+        select(&h, SelectOp::Extend { row: 0, col: 4 });
+        assert_eq!(selected(&h), "e\nuv");
+        // A press with no movement selects nothing.
+        select(&h, SelectOp::Start { row: 0, col: 1 });
+        assert_eq!(h.emulator.selection_text(), SelectionText::Nothing);
+        select(&h, SelectOp::Extend { row: 0, col: 1 });
+        assert_eq!(selected(&h), "b");
+    }
+
+    #[test]
+    fn a_selection_whose_text_is_gone_is_cleared() {
+        let h = harness();
+        h.emulator.feed(b"keep me\r\n");
+        select(&h, SelectOp::Start { row: 0, col: 0 });
+        select(&h, SelectOp::Extend { row: 0, col: 3 });
+        assert_eq!(selected(&h), "keep");
+        // The screen is erased: the selection goes with its text.
+        h.emulator.feed(b"\x1b[2J\x1b[H");
+        assert_eq!(h.emulator.selection_text(), SelectionText::Nothing);
+        assert_eq!(h.snapshot().selection, None);
+
+        // Text pushed out of history takes its selection with it.
+        h.emulator.feed(b"oldest\r\n");
+        select(&h, SelectOp::Start { row: 0, col: 0 });
+        select(&h, SelectOp::Extend { row: 0, col: 5 });
+        assert_eq!(selected(&h), "oldest");
+        for i in 0..(SCROLLBACK_LINES + 10) {
+            h.emulator.feed(format!("{i}\r\n").as_bytes());
+        }
+        assert_eq!(h.emulator.selection_text(), SelectionText::Nothing);
+    }
+
+    #[test]
+    fn a_carriage_return_redraw_over_the_selection_clears_it() {
+        let h = harness();
+        h.emulator.feed(b"original");
+        select(&h, SelectOp::Start { row: 0, col: 0 });
+        select(&h, SelectOp::Extend { row: 0, col: 7 });
+        assert_eq!(selected(&h), "original");
+        h.emulator.feed(b"\rreplaced");
+        assert_eq!(h.emulator.selection_text(), SelectionText::Nothing);
+        assert_eq!(h.snapshot().selection, None);
+    }
+
+    #[test]
+    fn erasing_selected_characters_clears_the_selection() {
+        for erase in [&b"\r\x1b[3X"[..], b"\r\x1b[2P", b"\x08\x08 "] {
+            let h = harness();
+            h.emulator.feed(b"keep this");
+            select(&h, SelectOp::Start { row: 0, col: 0 });
+            select(&h, SelectOp::Extend { row: 0, col: 8 });
+            h.emulator.feed(erase);
+            assert_eq!(
+                h.emulator.selection_text(),
+                SelectionText::Nothing,
+                "{erase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_text_redrawn_or_output_below_keeps_the_selection() {
+        let h = harness();
+        h.emulator.feed(b"title\r\n");
+        select(&h, SelectOp::Start { row: 0, col: 0 });
+        select(&h, SelectOp::Extend { row: 0, col: 4 });
+        // A program redraws the line with the same text.
+        h.emulator.feed(b"\x1b[H\x1b[1mtitle\x1b[m\r\n");
+        assert_eq!(selected(&h), "title");
+        // Streaming output below, enough to scroll the selection into history.
+        for i in 0..30 {
+            h.emulator.feed(format!("stream {i}\r\n").as_bytes());
+        }
+        assert_eq!(selected(&h), "title");
+    }
+
+    #[test]
+    fn the_clean_copy_puts_an_agents_cut_rows_back_together() {
+        let h = harness();
+        assert_eq!(
+            h.emulator.try_resize(GridSize { cols: 24, rows: 6 }),
+            ResizeOutcome::Applied
+        );
+        // An agent's own wrapping: hard breaks, an indented continuation.
+        h.emulator
+            .feed("\u{23fa} see https://a.io/lo\r\n  ng/path now\r\n".as_bytes());
+        select(&h, SelectOp::Start { row: 0, col: 0 });
+        select(&h, SelectOp::Extend { row: 1, col: 23 });
+        assert_eq!(selected(&h), "\u{23fa} see https://a.io/lo\n  ng/path now");
+        match h.emulator.clean_selection_text() {
+            SelectionText::Text(text) => assert_eq!(text, "see https://a.io/long/path now"),
+            other => panic!("no selection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_clean_copy_joins_a_token_cut_at_the_last_column_without_the_margin() {
+        let h = harness();
+        assert_eq!(
+            h.emulator.try_resize(GridSize { cols: 12, rows: 6 }),
+            ResizeOutcome::Applied
+        );
+        // Exactly 12 columns, then a hard break and an indented rest.
+        h.emulator.feed(b"  https://a.\r\n  io/x\r\n");
+        select(&h, SelectOp::Start { row: 0, col: 2 });
+        select(&h, SelectOp::Extend { row: 1, col: 5 });
+        match h.emulator.clean_selection_text() {
+            SelectionText::Text(text) => assert_eq!(text, "https://a.io/x"),
+            other => panic!("no selection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_selection_of_blanks_copies_as_empty_not_as_nothing() {
+        let h = harness();
+        h.emulator.feed(b"a    b");
+        select(&h, SelectOp::Start { row: 0, col: 1 });
+        select(&h, SelectOp::Extend { row: 0, col: 3 });
+        assert_eq!(
+            h.emulator.clean_selection_text(),
+            SelectionText::Text(String::new())
+        );
+    }
+
+    #[test]
+    fn a_space_where_a_row_wrapped_is_kept() {
+        let h = harness();
+        assert_eq!(
+            h.emulator.try_resize(GridSize { cols: 12, rows: 6 }),
+            ResizeOutcome::Applied
+        );
+        h.emulator.feed(b"ab cd ef gh ijk   \r\nnext");
+        select(&h, SelectOp::Start { row: 0, col: 0 });
+        select(&h, SelectOp::Extend { row: 2, col: 11 });
+        assert_eq!(selected(&h), "ab cd ef gh ijk\nnext");
+        // Inner spaces of an unwrapped row stay too.
+        select(&h, SelectOp::Start { row: 0, col: 1 });
+        select(&h, SelectOp::Extend { row: 0, col: 3 });
+        assert_eq!(selected(&h), "b c");
+    }
+
+    #[test]
+    fn a_selection_starting_on_half_a_wide_character_takes_it_whole() {
+        let h = harness();
+        h.emulator.feed("A\u{754c}B".as_bytes());
+        select(&h, SelectOp::Start { row: 0, col: 2 });
+        select(&h, SelectOp::Extend { row: 0, col: 3 });
+        assert_eq!(selected(&h), "\u{754c}B");
+        // The same cells dragged the other way.
+        select(&h, SelectOp::Start { row: 0, col: 3 });
+        select(&h, SelectOp::Extend { row: 0, col: 2 });
+        assert_eq!(selected(&h), "\u{754c}B");
+        assert_eq!(
+            h.snapshot().selection,
+            Some(SelectedRange {
+                first: (0, 1),
+                last: (0, 3)
+            })
+        );
+    }
+
+    #[test]
+    fn a_combining_mark_added_to_a_selected_cell_clears_the_selection() {
+        let h = harness();
+        h.emulator.feed(b"e");
+        select(&h, SelectOp::Start { row: 0, col: 0 });
+        select(&h, SelectOp::Extend { row: 0, col: 0 });
+        assert_eq!(selected(&h), "e");
+        h.emulator.feed("\u{301}".as_bytes());
+        assert_eq!(h.emulator.selection_text(), SelectionText::Nothing);
+        // A mark already there when it was selected is copied with it.
+        h.emulator.feed("\r\na\u{301}".as_bytes());
+        select(&h, SelectOp::Start { row: 1, col: 0 });
+        select(&h, SelectOp::Extend { row: 1, col: 0 });
+        assert_eq!(selected(&h), "a\u{301}");
+    }
+
+    #[test]
+    fn a_selection_ending_on_half_a_wide_character_takes_it_whole() {
+        let h = harness();
+        h.emulator.feed("A\u{754c}B".as_bytes());
+        let whole = Some(SelectedRange {
+            first: (0, 0),
+            last: (0, 2),
+        });
+        select(&h, SelectOp::Start { row: 0, col: 0 });
+        select(&h, SelectOp::Extend { row: 0, col: 1 });
+        assert_eq!(selected(&h), "A\u{754c}");
+        assert_eq!(h.snapshot().selection, whole);
+        select(&h, SelectOp::Start { row: 0, col: 1 });
+        select(&h, SelectOp::Extend { row: 0, col: 0 });
+        assert_eq!(selected(&h), "A\u{754c}");
+        assert_eq!(h.snapshot().selection, whole);
+    }
+
+    #[test]
+    fn select_all_takes_the_screen_as_shown_and_clear_drops_it() {
+        let h = harness();
+        h.emulator.feed(b"first\r\nsecond");
+        select(&h, SelectOp::All);
+        assert_eq!(selected(&h), "first\nsecond");
+        select(&h, SelectOp::Clear);
+        assert_eq!(h.emulator.selection_text(), SelectionText::Nothing);
     }
 
     #[test]

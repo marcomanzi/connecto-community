@@ -141,7 +141,14 @@ ship_readme > "$STAGE/README.txt"
 rm -f "$DMG"
 hdiutil create -quiet -volname "Connecto ${VERSION}" -srcfolder "$STAGE" -format UDZO -ov "$DMG"
 if [ "$SIGNED" = yes ]; then
-  codesign --force --timestamp --sign "$CONNECTO_SIGN_IDENTITY" "$DMG"
+  # Apple's timestamp server fails now and then ("A timestamp was expected but
+  # was not found"): try again before giving up.
+  for try in 1 2 3; do
+    codesign --force --timestamp --sign "$CONNECTO_SIGN_IDENTITY" "$DMG" && break
+    [ "$try" = 3 ] && die "could not sign $DMG"
+    log "signing the disk image failed; trying again in 20s"
+    sleep 20
+  done
 fi
 
 # ---- notarization ----------------------------------------------------------

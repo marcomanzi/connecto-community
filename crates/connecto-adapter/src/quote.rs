@@ -2,7 +2,7 @@
 //!
 //! macOS: `sh -c`. Windows: Codex runs hook commands as
 //! `pwsh.exe -NoProfile -Command "<cmd>"` (or Windows PowerShell), checked on
-//! Codex 0.167.2. Claude's Windows hooks need no
+//! Codex 0.167.2 (`docs/windows-port.md` 4.8.3). Claude's Windows hooks need no
 //! quoting: they use the exec form.
 
 /// Why a word cannot be quoted safely. Nothing is ever built from such a word.
@@ -56,10 +56,45 @@ pub(crate) fn powershell_quote(word: &str) -> Result<String, QuoteError> {
     Ok(out)
 }
 
+/// Quote a program path for `cmd /c`, in double quotes. Antigravity runs its
+/// hook commands that way on Windows, exactly as written.
+///
+/// Refused: control characters, `"` (it would end the quotes) and `%` (`cmd`
+/// expands `%NAME%` even inside them). No Windows path holds a `"`, and a
+/// Connecto data folder with a `%` in it gets no Antigravity hooks.
+pub(crate) fn cmd_quote(word: &str) -> Result<String, QuoteError> {
+    let refuse = |reason| QuoteError {
+        shell: "cmd",
+        value: word.to_owned(),
+        reason,
+    };
+    if word.chars().any(char::is_control) {
+        return Err(refuse("it holds a control character"));
+    }
+    if word.contains('"') {
+        return Err(refuse("it holds a double quote"));
+    }
+    if word.contains('%') {
+        return Err(refuse("it holds a percent sign"));
+    }
+    Ok(format!("\"{word}\""))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_paths_are_quoted_for_cmd_and_what_it_would_expand_is_refused() {
+        assert_eq!(
+            cmd_quote(r"C:\Users\Jane O'Neil\connecto-hook.exe").unwrap(),
+            r#""C:\Users\Jane O'Neil\connecto-hook.exe""#
+        );
+        for bad in [r"C:\a%PATH%\x", "C:\\a\nb", r#"C:\a"b"#] {
+            assert_eq!(cmd_quote(bad).unwrap_err().shell, "cmd", "{bad:?}");
+        }
+    }
 
     #[test]
     fn words_are_quoted_for_sh_whatever_they_hold() {

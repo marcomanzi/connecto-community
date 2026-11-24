@@ -43,8 +43,10 @@ impl Signature for AnySignature {
 #[derive(Clone, Copy)]
 enum SinkMode {
     Plain,
-    /// Takes 120 ms to write it (under the Gate's 200 ms wait), and says when it
-    /// has started, so a test can act inside the wait.
+    /// Says when it has started, then holds the write until the test has
+    /// acted inside the wait ([`Scene::release`]), at most 120 ms (under the
+    /// Gate's 200 ms wait). A fixed 120 ms left too little margin on a busy
+    /// CI runner, where the Gate then gave up on the audit first.
     Slow,
     /// Cannot write it.
     Fail,
@@ -54,18 +56,36 @@ struct TestSink {
     file: fs::File,
     mode: SinkMode,
     entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// While not zero, each cross-project record takes this many
+    /// milliseconds: past the Gate's 200 ms wait the log is behind, as under
+    /// backpressure (ADR 0035).
+    slow_cross: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Set when a slowed cross-project record starts.
+    cross_entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl connecto_audit::Sink for TestSink {
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
         use std::io::Write;
+        let slow = self.slow_cross.load(std::sync::atomic::Ordering::SeqCst);
+        if slow > 0 && line.contains(r#""action":"cross_project_"#) {
+            self.cross_entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(slow));
+        }
         if line.contains(r#""action":"type""#) && line.contains(r#""decision":"allow""#) {
             match self.mode {
                 SinkMode::Plain => {}
                 SinkMode::Slow => {
                     self.entered
                         .store(true, std::sync::atomic::Ordering::SeqCst);
-                    thread::sleep(Duration::from_millis(120));
+                    let until = Instant::now() + Duration::from_millis(120);
+                    while !self.released.load(std::sync::atomic::Ordering::SeqCst)
+                        && Instant::now() < until
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
                 }
                 SinkMode::Fail => return Err(std::io::Error::other("disk full")),
             }
@@ -75,7 +95,10 @@ impl connecto_audit::Sink for TestSink {
 }
 
 struct Scene {
+    slow_cross: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    cross_entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
     entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _permit: common::Permit,
     root: PathBuf,
     project: PathBuf,
@@ -260,6 +283,22 @@ impl Scene {
         )
     }
 
+    /// As [`Scene::seeded`], for a project whose saved Tools setting is
+    /// `allowed` before anything starts.
+    fn seeded_with_tools(name: &str, list: &str, allowed: connecto_core::ProjectTools) -> Self {
+        Self::build_tools(
+            name,
+            vec![Tool::Claude; 2],
+            "2.1.318",
+            false,
+            SinkMode::Plain,
+            &[],
+            false,
+            Some(list),
+            Some(allowed),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_full(
         name: &str,
@@ -270,6 +309,23 @@ impl Scene {
         boot: &[(&str, &str)],
         wait_ready: bool,
         seed: Option<&str>,
+    ) -> Self {
+        Self::build_tools(
+            name, tools, version, untrusted, mode, boot, wait_ready, seed, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_tools(
+        name: &str,
+        tools: Vec<Tool>,
+        version: &str,
+        untrusted: bool,
+        mode: SinkMode,
+        boot: &[(&str, &str)],
+        wait_ready: bool,
+        seed: Option<&str>,
+        allowed: Option<connecto_core::ProjectTools>,
     ) -> Self {
         let permit = common::permit();
         let root = std::env::temp_dir().join(format!("mg-bridge-{name}-{}", std::process::id()));
@@ -303,6 +359,12 @@ impl Scene {
         // These tests are about turns read from the tool's own profile folder, so
         // the project is isolated (a new project is on the system configuration).
         pin_isolated(&layout.data_root, &project);
+        if let Some(allowed) = allowed {
+            let id = connecto_session::launch::project_id(&fs::canonicalize(&project).unwrap());
+            let mut settings = connecto_session::project_settings::load(&layout.data_root, &id);
+            settings.tools = allowed;
+            connecto_session::project_settings::save(&layout.data_root, &id, &settings).unwrap();
+        }
         if let Some(list) = seed {
             let id = connecto_session::launch::project_id(&fs::canonicalize(&project).unwrap());
             let dir = layout_data_projects(&root).join(id);
@@ -311,6 +373,9 @@ impl Scene {
         }
         let audit_file = root.join("audit.jsonl");
         let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let slow_cross = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cross_entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let relay = Relay::start(RelayConfig {
             layout,
             project: Some(project.clone()),
@@ -323,6 +388,9 @@ impl Scene {
                     .unwrap(),
                 mode,
                 entered: std::sync::Arc::clone(&entered),
+                released: std::sync::Arc::clone(&released),
+                slow_cross: std::sync::Arc::clone(&slow_cross),
+                cross_entered: std::sync::Arc::clone(&cross_entered),
             })
             .unwrap(),
             wake: no_wake(),
@@ -330,10 +398,14 @@ impl Scene {
             pause: None,
             utility_settings: None,
             auto_title: false,
+            after_update: false,
         })
         .unwrap();
         let scene = Self {
+            slow_cross,
+            cross_entered,
             entered,
+            released,
             _permit: permit,
             root,
             current: std::sync::Mutex::new(project.clone()),
@@ -372,6 +444,12 @@ impl Scene {
 
     fn pane(&self, id: &str) -> Option<std::sync::Arc<ManagedPane>> {
         self.relay.pane(id)
+    }
+
+    /// Let a [`SinkMode::Slow`] audit write finish now.
+    fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn wait_for(&self, what: &str, done: impl Fn(&Self) -> bool) {
@@ -618,6 +696,45 @@ fn list_shows_every_terminal_with_state_and_marks() {
     assert!(row.contains("working") || row.contains("idle"), "{run:?}");
 }
 
+/// The CONTEXT cell of `id` in `connecto list` output.
+fn context_cell(list: &str, id: &str) -> String {
+    let row = list
+        .lines()
+        .find(|line| line.starts_with(&format!("{id} ")))
+        .unwrap_or_else(|| panic!("no row for {id}: {list}"));
+    row.split_whitespace().nth(3).unwrap().to_owned()
+}
+
+/// `list` shows the context use an agent's footer prints at the bottom of its
+/// screen, and "-" for one that prints none. A footer the user typed, echoed
+/// in the history, is not one.
+#[test]
+fn list_shows_context_use_from_the_footer() {
+    let scene = Scene::new("list-context");
+    scene.user_types(
+        "claude-2",
+        "Opus 5.5 · high  |  [████░░░░░░░░░░░░░░░░] 45% (450k/1M)  |  $1",
+    );
+    scene.wait_for("the echoed prompt", |s| {
+        s.screen("claude-2").contains("45% (450k/1M)")
+    });
+    let run = scene.connecto("claude", "list");
+    assert_eq!(run.code, 0, "{run:?}");
+    assert!(
+        run.out.lines().next().unwrap().contains("CONTEXT"),
+        "{run:?}"
+    );
+    assert_eq!(context_cell(&run.out, "claude-2"), "-", "{run:?}");
+    // Now the fake prints a footer, below a rule, as Claude does.
+    scene.user_types("claude-2", "FOOTER");
+    scene.wait_for("the footer", |s| {
+        s.screen("claude-2").contains("23% (230k/1M)")
+    });
+    let run = scene.connecto("claude", "list");
+    assert_eq!(context_cell(&run.out, "claude-2"), "23%", "{run:?}");
+    assert_eq!(context_cell(&run.out, "claude"), "-", "{run:?}");
+}
+
 /// AC10: `read` returns the screen and scrollback as text, audits who read
 /// what and never the contents.
 #[test]
@@ -740,6 +857,279 @@ fn an_agent_adds_starts_and_closes_terminals_and_close_removes_them() {
     assert_eq!(scene.connecto("claude", "remove claude-2").code, 2);
 }
 
+/// An agent cannot add a CLI the project's Tools setting leaves out: it is
+/// told which ones the project uses, and nothing is started. Read at each
+/// add, so a change in the settings counts at once.
+#[test]
+fn an_agent_cannot_add_a_cli_the_project_leaves_out() {
+    use connecto_core::{ProjectTools, ToolKind};
+    let scene = Scene::new("toolset");
+    let data_root = scene.root.join("data");
+    let id = connecto_session::launch::project_id(&fs::canonicalize(&scene.project).unwrap());
+    let mut settings = connecto_session::project_settings::load(&data_root, &id);
+    settings.tools = ProjectTools::from_tools([ToolKind::Claude, ToolKind::Pi]).unwrap();
+    connecto_session::project_settings::save(&data_root, &id, &settings).unwrap();
+    let refused = scene.connecto("claude", "add codex");
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.err.contains("not_allowed"), "{refused:?}");
+    assert!(
+        refused.err.contains("allows only claude, pi"),
+        "{refused:?}"
+    );
+    assert_eq!(scene.ids(), ["claude", "claude-2"], "nothing was added");
+    let added = scene.connecto("claude", "add claude");
+    assert_eq!(added.code, 0, "{added:?}");
+}
+
+/// A stopped terminal of a CLI the project has since left out is not
+/// started again: its owner is told which CLIs the project uses.
+#[test]
+fn a_stopped_terminal_of_a_cli_since_left_out_does_not_start_again() {
+    use connecto_core::{ProjectTools, ToolKind};
+    let scene = Scene::new("toolset-start");
+    let added = scene.connecto("claude", "add claude");
+    assert_eq!(added.code, 0, "{added:?}");
+    scene.wait_for("claude-3 to be ready", |s| {
+        s.screen("claude-3").contains("FAKE-READY")
+    });
+    let pane = scene.pane("claude-3").unwrap();
+    pane.request_stop();
+    scene.wait_for("claude-3 to stop", |s| {
+        !s.pane("claude-3").unwrap().is_live()
+    });
+    let before = pane.attempt();
+    let data_root = scene.root.join("data");
+    let id = connecto_session::launch::project_id(&fs::canonicalize(&scene.project).unwrap());
+    let mut settings = connecto_session::project_settings::load(&data_root, &id);
+    settings.tools = ProjectTools::from_tools([ToolKind::Codex, ToolKind::Pi]).unwrap();
+    connecto_session::project_settings::save(&data_root, &id, &settings).unwrap();
+    let refused = scene.connecto("claude", "start claude-3");
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.err.contains("not_allowed"), "{refused:?}");
+    assert!(refused.err.contains("allows only codex, pi"), "{refused:?}");
+    std::thread::sleep(Duration::from_millis(300));
+    let pane = scene.pane("claude-3").unwrap();
+    assert!(!pane.is_live() && pane.attempt() == before, "not started");
+}
+
+/// The project's Tools setting is checked where every terminal is added or
+/// started, whoever asks: the window's add is refused and makes no entry; a
+/// restart, the window's start and a saved terminal brought back at launch
+/// end failed with the reason, nothing launched; a shell and an allowed CLI
+/// still go. A terminal that was running keeps running.
+#[test]
+fn the_tools_setting_is_checked_wherever_a_terminal_starts() {
+    use connecto_core::{PaneControl, PaneStage, ProjectTools, ToolKind};
+    let codex_only = ProjectTools::Codex;
+    // Brought back at launch: the working one was to resume.
+    let scene = Scene::seeded_with_tools("tools-everywhere", SEEDED, codex_only);
+    let failed = |s: &Scene, id: &str| {
+        matches!(
+            s.pane(id).unwrap().stage(),
+            PaneStage::Failed { ref reason } if reason.contains("allows only codex")
+        )
+    };
+    scene.wait_for("the restored claude to be refused", |s| failed(s, "claude"));
+    assert!(scene.launch_args("claude").is_empty(), "nothing launched");
+    // The window's add: refused, no entry.
+    let control = scene.relay.terminals();
+    let before = scene.ids();
+    control.add(ToolKind::Claude, None).unwrap();
+    scene.wait_for("the window's add to be refused", |s| {
+        s.relay
+            .terminals()
+            .view()
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("allows only codex"))
+    });
+    assert_eq!(scene.ids(), before, "no entry was made");
+    // The add every app helper uses (Operations, Agentic Works, packages,
+    // automations): refused, no entry.
+    let refused = control
+        .add_with(ToolKind::Claude, None, Some("fix it".into()), None, None)
+        .unwrap_err();
+    assert!(refused.contains("allows only codex"), "{refused}");
+    assert_eq!(scene.ids(), before, "no entry was made");
+    // The window's start (restart) of a stopped one: refused the same way.
+    control.restart("claude-2").unwrap();
+    scene.wait_for("claude-2 to be refused", |s| failed(s, "claude-2"));
+    assert!(scene.launch_args("claude-2").is_empty());
+    scene.pane("claude-3").unwrap().request_start();
+    scene.wait_for("claude-3 to be refused", |s| failed(s, "claude-3"));
+    // A shell, and the CLI the project uses, still go.
+    control.add(ToolKind::Shell, None).unwrap();
+    control.add(ToolKind::Codex, None).unwrap();
+    let want = before.len() + 2;
+    scene.wait_for("the shell and codex to be added", |s| s.ids().len() == want);
+}
+
+/// `connecto agents --roles` offers only the CLIs the project's Tools allow,
+/// and, until the app has said which are ready, starts none of them for a
+/// role (ADR 0045).
+#[test]
+fn agents_lists_what_the_tools_setting_allows_and_picks_only_ready_ones() {
+    use connecto_core::{ProjectTools, ToolKind};
+    let allowed = ProjectTools::from_tools([ToolKind::Claude, ToolKind::Pi]).unwrap();
+    let scene = Scene::build_tools(
+        "agents-roster",
+        vec![Tool::Claude; 2],
+        "2.1.318",
+        false,
+        SinkMode::Plain,
+        &[],
+        true,
+        None,
+        Some(allowed),
+    );
+    let run = scene.connecto("claude", "agents --roles");
+    assert_eq!(run.code, 0, "{run:?}");
+    let row = |tool: &str| {
+        run.out
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(tool))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(row("codex").contains("not allowed"), "{}", run.out);
+    assert!(row("antigravity").contains("not allowed"), "{}", run.out);
+    assert!(row("claude").contains("checking"), "{}", run.out);
+    assert!(row("pi").contains("checking"), "{}", run.out);
+    assert!(row("reviewer").contains("none"), "{}", run.out);
+    assert!(!run.out.contains("connecto add"), "{}", run.out);
+    let bad = scene.connecto("claude", "agents --json");
+    assert_ne!(bad.code, 0, "{bad:?}");
+}
+
+/// A terminal refused by the project's Tools setting is not brought back by
+/// itself: its saved "running" and "interrupted" are cleared (its
+/// conversation stays), so the next launch leaves it stopped instead of
+/// refusing it again.
+#[test]
+fn a_refused_terminal_is_not_brought_back_at_the_next_launch() {
+    use connecto_core::{PaneControl, PaneStage, ProjectTools};
+    let saved = {
+        let scene = Scene::seeded_with_tools("tools-norestore", SEEDED, ProjectTools::Codex);
+        scene.wait_for("the restored claude to be refused", |s| {
+            s.pane("claude").is_some_and(|pane| pane.tools_refused())
+        });
+        scene.wait_for("its intent to start to be cleared", |s| {
+            s.entry("claude").is_some_and(|e| !e.desired_running)
+                && !s.saved_list().contains(r#""interrupted": true"#)
+                && !s.saved_list().contains(r#""working": true"#)
+        });
+        let saved = scene.saved_list();
+        assert!(
+            saved.contains("aaaa-1111"),
+            "its conversation stays: {saved}"
+        );
+        saved
+    };
+    // The next launch: nothing is started, nothing refused again.
+    let scene = Scene::seeded_with_tools("tools-norestore2", &saved, ProjectTools::Codex);
+    scene.wait_for("the list", |s| s.pane("claude").is_some());
+    std::thread::sleep(Duration::from_millis(600));
+    let pane = scene.pane("claude").unwrap();
+    assert_eq!(pane.stage(), PaneStage::Stopped, "left stopped");
+    assert!(!pane.tools_refused());
+    assert!(scene.launch_args("claude").is_empty());
+}
+
+/// A start that waits for the project's package install checks the Tools
+/// setting again once it may go on: a CLI left out meanwhile does not start.
+/// What that start took (the saved session to resume) is put back, so a
+/// start once the CLI is allowed again resumes it as this one would have.
+#[test]
+fn a_cli_left_out_while_its_start_waits_does_not_start() {
+    use connecto_core::{PaneControl, PaneStage, ProjectTools};
+    use connecto_session::install_gate;
+    // claude-3 waits, stopped, with a saved session to resume.
+    let scene = Scene::seeded("tools-permit", SEEDED, &[]);
+    scene.wait_for("the list", |s| s.pane("claude-3").is_some());
+    let pane = scene.pane("claude-3").unwrap();
+    let before = pane.attempt();
+    let data_root = scene.root.join("data");
+    let id = connecto_session::launch::project_id(&fs::canonicalize(&scene.project).unwrap());
+    let set_tools = |tools| {
+        let mut settings = connecto_session::project_settings::load(&data_root, &id);
+        settings.tools = tools;
+        connecto_session::project_settings::save(&data_root, &id, &settings).unwrap();
+    };
+    // The install holds the project: a start waits for it.
+    install_gate::enable(&data_root);
+    let lease = install_gate::lease(&data_root, &id, Duration::from_secs(5)).unwrap();
+    let (reached, at) = std::sync::mpsc::channel();
+    let reached = std::sync::Mutex::new(reached);
+    pane.set_probe(move |point| {
+        if point == "before_spawn" {
+            let _ = reached.lock().unwrap().send(());
+        }
+    });
+    let control = scene.relay.terminals();
+    control.restart("claude-3").unwrap();
+    at.recv_timeout(Duration::from_secs(20))
+        .expect("the start reached its spawn");
+    // Left out while the start waits for the install.
+    set_tools(ProjectTools::Codex);
+    drop(lease);
+    install_gate::finish(&data_root, &id);
+    scene.wait_for("claude-3 to be refused", |s| {
+        matches!(
+            s.pane("claude-3").unwrap().stage(),
+            PaneStage::Failed { ref reason } if reason.contains("allows only codex")
+        )
+    });
+    assert_eq!(pane.attempt(), before, "no process started");
+    assert!(scene.launch_args("claude-3").is_empty());
+    install_gate::disable(&data_root);
+    // Allowed again: the next start resumes the saved session.
+    set_tools(ProjectTools::All);
+    control.restart("claude-3").unwrap();
+    scene.wait_for("claude-3 to be ready", |s| {
+        s.screen("claude-3").contains("FAKE-READY")
+    });
+    let args = scene.launch_args("claude-3");
+    let at = args.iter().position(|a| a == "--resume");
+    assert_eq!(
+        at.map(|at| args[at + 1].as_str()),
+        Some("bbbb-2222"),
+        "{args:?}"
+    );
+}
+
+/// A login runs the CLI too: refused before it runs, and again once the
+/// CLI's copy is verified, so one left out meanwhile does not log in.
+#[test]
+fn a_cli_left_out_while_its_login_is_prepared_does_not_log_in() {
+    use connecto_core::{PaneControl, PaneStage, ProjectTools};
+    let scene = Scene::new("tools-login");
+    // No Claude session runs, so nothing else would stop the login.
+    for id in ["claude", "claude-2"] {
+        scene.pane(id).unwrap().request_stop();
+        scene.wait_for(&format!("{id} to stop"), |s| !s.pane(id).unwrap().is_live());
+    }
+    let pane = scene.pane("claude-2").unwrap();
+    let data_root = scene.root.join("data");
+    let id = connecto_session::launch::project_id(&fs::canonicalize(&scene.project).unwrap());
+    // Left out while the login's copy is verified.
+    pane.set_probe(move |point| {
+        if point == "login_verified" {
+            let mut settings = connecto_session::project_settings::load(&data_root, &id);
+            settings.tools = ProjectTools::Codex;
+            connecto_session::project_settings::save(&data_root, &id, &settings).unwrap();
+        }
+    });
+    pane.request_login();
+    let until = Instant::now() + Duration::from_secs(2);
+    let mut logged_in = false;
+    while Instant::now() < until {
+        logged_in |= matches!(pane.stage(), PaneStage::LoggingIn);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!logged_in, "the login ran: {:?}", pane.stage());
+    assert!(pane.tools_refused(), "{:?}", pane.stage());
+}
+
 /// R8: the last terminal goes like any other. The project ends with none.
 #[test]
 fn closing_the_last_terminal_removes_it_too() {
@@ -854,8 +1244,12 @@ fn a_non_watcher_gets_notices_as_context_and_is_never_woken() {
         text.starts_with("[connecto] You are terminal claude. Terminals: claude-2 (claude, "),
         "{text}"
     );
-    assert!(text.contains("claude-2 began working."), "{text}");
-    assert!(text.contains("claude-2 finished."), "{text}");
+    // An unwatched terminal's older events fold into its newest one.
+    assert!(
+        text.contains("- claude-2 finished. (+1 earlier change)"),
+        "{text}"
+    );
+    assert!(!text.contains("claude-2 began working."), "{text}");
     assert!(!text.contains("You are watching it"), "{text}");
 }
 
@@ -874,6 +1268,41 @@ fn background_work_holds_the_result_until_it_is_done() {
     assert_eq!(pending.code, 4, "{pending:?}");
     assert!(pending.out.starts_with("pending"), "{pending:?}");
     assert!(pending.out.contains("background"), "{pending:?}");
+    // What runs is named, with its type and age.
+    assert!(
+        pending.out.contains("Still running: sleep 10 (shell, "),
+        "{pending:?}"
+    );
+    assert!(
+        pending.out.contains("connecto tasks claude-2"),
+        "{pending:?}"
+    );
+    let list = scene.connecto("claude", "list");
+    let row = list
+        .out
+        .lines()
+        .find(|line| line.starts_with("claude-2"))
+        .unwrap_or_default();
+    assert!(row.contains("background"), "{list:?}");
+    assert!(row.contains("1 task, oldest "), "{list:?}");
+    let tasks = scene.connecto("claude", "tasks claude-2");
+    assert_eq!(tasks.code, 0, "{tasks:?}");
+    assert!(tasks.out.starts_with("claude-2 background\n"), "{tasks:?}");
+    let task = tasks
+        .out
+        .lines()
+        .find(|line| line.starts_with("b1"))
+        .unwrap_or_default();
+    assert!(
+        task.contains("shell") && task.ends_with("sleep 10"),
+        "{tasks:?}"
+    );
+    // The fake tool runs no real background shell: nothing is found to stop.
+    let stop = scene.connecto("claude", "tasks claude-2 --stop");
+    assert_eq!(stop.code, 1, "{stop:?}");
+    assert!(stop.err.contains("not_stopped"), "{stop:?}");
+    let other = scene.connecto("claude", "tasks claude-2 --stop a9");
+    assert!(other.err.contains("nothing_to_stop"), "{other:?}");
     let done = scene.result_of("claude", "r1");
     assert_eq!(done.code, 0, "{done:?}");
     assert_eq!(
@@ -881,6 +1310,63 @@ fn background_work_holds_the_result_until_it_is_done() {
         Some("background finished"),
         "{done:?}"
     );
+}
+
+/// The desktop's stop of one of two background shells that run the same
+/// command: it cannot tell them apart, so neither is signalled, and the
+/// reason, found on the stop's thread after the click was answered, reaches
+/// the tab strip. Stopping all then takes both.
+#[test]
+fn a_desktop_stop_of_one_of_two_identical_shells_is_refused_on_the_tab_strip() {
+    let scene = Scene::new("twins");
+    let sent = scene.connecto("claude", "send claude-2 'TWINS please'");
+    assert_eq!(sent.code, 0, "{sent:?}");
+    let terminals = scene.relay.terminals();
+    let tasks = |s: &Scene| {
+        s.relay
+            .terminals()
+            .view()
+            .terminals
+            .iter()
+            .find(|entry| entry.id == "claude-2")
+            .map_or(0, |entry| entry.background.len())
+    };
+    scene.wait_for("claude-2's two background shells", |s| tasks(s) == 2);
+    let twins = |s: &Scene| {
+        let out = std::process::Command::new("/bin/ps")
+            .args(["-axww", "-o", "command="])
+            .output()
+            .unwrap();
+        let root = s.root.display().to_string();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| line.contains("eval 'sleep 30 ; true'") && line.contains(&root))
+            .count()
+    };
+    scene.wait_for("both shells to run", |s| twins(s) == 2);
+    // What a peer's request calls: it waits, and answers with the refusal.
+    let now = terminals.stop_background_now("claude-2", Some("b1"));
+    assert!(
+        now.as_ref()
+            .is_err_and(|why| why.contains("cannot be told apart")),
+        "{now:?}"
+    );
+    assert_eq!(twins(&scene), 2, "neither shell was signalled");
+    let started = terminals.stop_background("claude-2", Some("b1"));
+    assert!(started.is_ok(), "{started:?}");
+    scene.wait_for("the refusal on the tab strip", |s| {
+        s.relay
+            .terminals()
+            .view()
+            .last_error
+            .as_deref()
+            .is_some_and(|why| why.starts_with("claude-2:") && why.contains("cannot be told apart"))
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(twins(&scene), 2, "neither shell was signalled");
+    let all = terminals.stop_background("claude-2", None);
+    assert!(all.is_ok(), "{all:?}");
+    scene.wait_for("both shells to end", |s| twins(s) == 0);
 }
 
 #[test]
@@ -964,13 +1450,28 @@ const STATE_GUARDS: [&str; 9] = [
 ];
 
 fn library_test_binary() -> PathBuf {
-    let deps = std::env::current_exe()
+    // Next to this binary in deps/; in cargo's newer layout each binary has
+    // its own build/<package>/<hash>/out/ folder, so every sibling's is read.
+    let here = std::env::current_exe()
         .unwrap()
         .parent()
         .unwrap()
         .to_owned();
-    let mut found: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(&deps)
-        .unwrap()
+    let mut folders = vec![here.clone()];
+    if here.file_name().is_some_and(|name| name == "out")
+        && let Some(package) = here.parent().and_then(Path::parent)
+    {
+        folders.extend(
+            fs::read_dir(package)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path().join("out")),
+        );
+    }
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = folders
+        .iter()
+        .filter_map(|folder| fs::read_dir(folder).ok())
+        .flatten()
         .flatten()
         .filter(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -1811,6 +2312,7 @@ fn guard_pause_during_the_audit_wait_stops_the_paste() {
         s.entered.load(std::sync::atomic::Ordering::SeqCst)
     });
     scene.relay.pause_switch().pause();
+    scene.release();
     scene.wait_for("the send to answer", |s| !s.runs("claude").is_empty());
     let run = scene.runs("claude").remove(0);
     assert_eq!(run.code, 1, "{run:?}");
@@ -1889,6 +2391,7 @@ fn guard_an_attempt_that_goes_stale_during_the_audit_wait_types_nothing() {
         });
         // A restart completes inside the wait.
         pane.force_attempt(attempt + 1);
+        scene.release();
         typing.join().unwrap()
     });
     assert_eq!(
@@ -2160,6 +2663,44 @@ fn an_ask_sender_ends_its_turn_and_is_woken_with_the_reply_in_its_context() {
     assert_eq!(scene.runs("claude").len(), 2);
 }
 
+/// An agent asked to work with another one runs the exchange itself: the ask
+/// that started it stays open while it waits on its own ask, so the first
+/// asker is woken once, with the answer of the turn that ended the exchange.
+#[test]
+fn an_ask_stays_open_while_its_target_waits_on_its_own_ask() {
+    let scene = Scene::with_tools("hold", vec![Tool::Claude; 3], "2.1.318");
+    let sent = scene.connecto(
+        "claude",
+        "send claude-2 --ask \"RUN connecto send claude-3 --ask 'SLEEP 4 inner'\"",
+    );
+    assert_eq!(sent.code, 0, "{sent:?}");
+    // claude-2's own turn has ended, but it waits on claude-3: still pending.
+    scene.wait_for("claude-2 to ask claude-3", |s| {
+        !s.runs("claude-2").is_empty()
+    });
+    scene.wait_for("claude-2's turn to end", |s| {
+        s.state_of("claude-2") != Some(connecto_core::TermActivity::Working)
+    });
+    let pending = scene.connecto("claude", "result r1");
+    assert_eq!(pending.code, 4, "{pending:?}");
+    assert!(
+        pending.out.contains("working with other agents"),
+        "{pending:?}"
+    );
+    assert!(
+        notices(&scene, "claude").is_empty(),
+        "the asker was woken early"
+    );
+
+    // claude-3 answers, claude-2 is woken with it and ends a turn with no ask
+    // left: now r1 ends, with that turn's reply.
+    let done = scene.result_of("claude", "r1");
+    assert_eq!(done.code, 0, "{done:?}");
+    assert!(done.out.contains("Request r2 ended"), "{done:?}");
+    scene.wait_for("the wake", |s| !notices(s, "claude").is_empty());
+    assert_eq!(notices(&scene, "claude").len(), 1, "woken once");
+}
+
 /// A request someone else asked is not steered: `result` is how that reader
 /// gets it, and it is not told a delivery is coming.
 #[test]
@@ -2390,6 +2931,75 @@ fn an_agents_add_records_parent_name_and_flattens_grandchildren() {
         .unwrap();
     scene.wait_for("the user's terminal", |s| s.entry("claude-5").is_some());
     assert_eq!(scene.entry("claude-5").unwrap().parent, None);
+}
+
+/// A terminal an agent started belongs to that agent: another agent can read
+/// it but not type into it, press keys there, start it or close it. A terminal
+/// the user opened stays open to all, and a child can write to its starter.
+#[test]
+fn a_terminal_an_agent_started_is_used_only_by_that_agent() {
+    let scene = Scene::new("ownership");
+    let added = scene.connecto("claude", "add claude");
+    assert_eq!(added.code, 0, "{added:?}");
+    scene.wait_for("claude-3 to be ready", |s| {
+        s.screen("claude-3").contains("FAKE-READY")
+    });
+
+    for command in [
+        "send claude-3 'take this over'",
+        "send claude-3 --ask 'take this over'",
+        "keys claude-3 enter",
+        "close claude-3",
+        "start claude-3",
+    ] {
+        let refused = scene.connecto("claude-2", command);
+        assert_eq!(refused.code, 1, "{command}: {refused:?}");
+        assert!(refused.err.contains("not_yours"), "{command}: {refused:?}");
+        assert!(
+            refused.err.contains("connecto add"),
+            "{command}: {refused:?}"
+        );
+    }
+    assert!(scene.entry("claude-3").is_some(), "it was not closed");
+    assert!(scene.prompts("claude-3").is_empty(), "nothing was typed");
+
+    // Looking is open to all, and the list says whose it is.
+    assert_eq!(scene.connecto("claude-2", "read claude-3").code, 0);
+    let list = scene.connecto("claude-2", "list");
+    assert!(list.out.contains("belongs to claude"), "{list:?}");
+    let list = scene.connecto("claude", "list");
+    assert!(list.out.contains("yours"), "{list:?}");
+
+    // The starter uses it, and it can write back to its starter.
+    let sent = scene.connecto("claude", "send claude-3 'your task'");
+    assert_eq!(sent.code, 0, "{sent:?}");
+    let back = scene.connecto("claude-3", "send claude 'a question'");
+    assert_eq!(back.code, 0, "{back:?}");
+    // A terminal the user opened belongs to nobody.
+    let open = scene.connecto("claude-3", "send claude-2 'hello'");
+    assert_eq!(open.code, 0, "{open:?}");
+
+    // Two terminals the same agent started work with each other directly.
+    assert_eq!(scene.connecto("claude", "add claude").code, 0);
+    scene.wait_for("claude-4 to be ready", |s| {
+        s.screen("claude-4").contains("FAKE-READY")
+    });
+    let sibling = scene.connecto("claude-3", "send claude-4 'your move'");
+    assert_eq!(sibling.code, 0, "{sibling:?}");
+    let sibling = scene.connecto("claude-4", "send claude-3 'your move'");
+    assert_eq!(sibling.code, 0, "{sibling:?}");
+    assert_eq!(scene.connecto("claude", "close claude-4").code, 0);
+    scene.wait_for("claude-4 to close", |s| s.entry("claude-4").is_none());
+
+    // A grandchild belongs to the agent that asked for it, not to the tree's root.
+    assert_eq!(scene.connecto("claude-3", "add claude").code, 0);
+    scene.wait_for("claude-5 to be ready", |s| {
+        s.screen("claude-5").contains("FAKE-READY")
+    });
+    let refused = scene.connecto("claude", "send claude-5 'mine?'");
+    assert!(refused.err.contains("not_yours"), "{refused:?}");
+    assert_eq!(scene.connecto("claude-3", "close claude-5").code, 0);
+    assert_eq!(scene.connecto("claude", "close claude-3").code, 0);
 }
 
 /// R6: without `--name`, the first `--ask` body names the child: its first
@@ -3337,4 +3947,956 @@ fn a_shell_is_never_typed_a_rename() {
     let view = scene.relay.terminals().view();
     let entry = view.terminals.iter().find(|e| e.id == "shell").unwrap();
     assert_eq!(entry.name.as_deref(), Some("my shell"));
+}
+
+// ---- project memory (spec §6, §6.1)
+
+/// A memory engine stand-in, on for the projects listed, set once for this
+/// test binary. Every other scene's project stays off, so their launch texts
+/// and drains are as before.
+#[derive(Default)]
+struct FakeMemory {
+    on: std::sync::Mutex<std::collections::HashSet<String>>,
+    versions: std::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
+    #[allow(clippy::type_complexity)]
+    asked: std::sync::Mutex<
+        Vec<(
+            String,
+            connecto_core::memory::MemoryCaller,
+            String,
+            Option<String>,
+        )>,
+    >,
+}
+
+impl connecto_core::memory::MemoryBridge for FakeMemory {
+    fn command(
+        &self,
+        project_id: &str,
+        caller: &connecto_core::memory::MemoryCaller,
+        command: &connecto_core::memory::MemoryCommand,
+        text: Option<&str>,
+    ) -> String {
+        self.asked.lock().unwrap().push((
+            project_id.to_owned(),
+            caller.clone(),
+            command.verb().word().to_owned(),
+            text.map(str::to_owned),
+        ));
+        format!("FAKE PAGE for {}", command.verb().word())
+    }
+
+    fn enabled(&self, project_id: &str) -> bool {
+        self.on.lock().unwrap().contains(project_id)
+    }
+
+    fn take_version_notice(&self, project_id: &str, terminal: &str) -> Option<u64> {
+        self.versions
+            .lock()
+            .unwrap()
+            .remove(&(project_id.to_owned(), terminal.to_owned()))
+    }
+}
+
+fn fake_memory() -> std::sync::Arc<FakeMemory> {
+    static FAKE: std::sync::OnceLock<std::sync::Arc<FakeMemory>> = std::sync::OnceLock::new();
+    std::sync::Arc::clone(FAKE.get_or_init(|| {
+        let fake = std::sync::Arc::new(FakeMemory::default());
+        connecto_session::set_memory_bridge(std::sync::Arc::clone(&fake) as _);
+        fake
+    }))
+}
+
+/// The id a scene's project will have, before the scene is built.
+fn scene_project_id(name: &str) -> String {
+    let tmp = fs::canonicalize(std::env::temp_dir()).unwrap();
+    let project = tmp
+        .join(format!("mg-bridge-{name}-{}", std::process::id()))
+        .join("home/project");
+    connecto_session::launch::project_id(&project)
+}
+
+#[test]
+fn memory_commands_reach_the_engine_as_the_bridge_names_the_caller() {
+    let fake = fake_memory();
+    let project_id = scene_project_id("memory");
+    fake.on.lock().unwrap().insert(project_id.clone());
+    let scene = Scene::new("memory");
+    assert_eq!(
+        connecto_session::launch::project_id(&fs::canonicalize(&scene.project).unwrap()),
+        project_id
+    );
+    fs::create_dir_all(scene.project.join(".git")).unwrap();
+    fs::write(
+        scene.project.join(".git/HEAD"),
+        "ref: refs/heads/feature-x\n",
+    )
+    .unwrap();
+    // The launch text carries the fixed memory section, and nothing else of it.
+    let args = scene.log("args-claude.txt");
+    assert!(
+        args.contains("BEFORE YOU START ANY WORK, run `connecto memory brief`"),
+        "{args}"
+    );
+    assert!(!args.contains("FAKE PAGE"));
+
+    let run = scene.connecto("claude", "memory brief --budget 300");
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.out, "FAKE PAGE for brief\n");
+    // The terminal named in the environment is not believed.
+    let run = scene.agent_runs(
+        "claude",
+        "CONNECTO_TERMINAL=claude-2 connecto memory status",
+    );
+    assert_eq!(run.code, 0, "{run:?}");
+    let run = scene.agent_runs(
+        "claude-2",
+        "printf 'Next: ship it.' | connecto memory propose --type task",
+    );
+    assert_eq!(run.out, "FAKE PAGE for propose\n", "{run:?}");
+    // A usage mistake is refused by the bridge, before the engine.
+    let run = scene.connecto("claude", "memory brief --budget 1");
+    assert_eq!(run.code, 1, "{run:?}");
+    assert!(run.err.contains("--budget must be a number"), "{run:?}");
+    let asked = fake.asked.lock().unwrap().clone();
+    let verbs: Vec<&str> = asked.iter().map(|(_, _, verb, _)| verb.as_str()).collect();
+    assert_eq!(verbs, ["brief", "status", "propose"]);
+    for (project, caller, _, _) in &asked {
+        assert_eq!(project, &project_id);
+        assert_eq!(caller.branch.as_deref(), Some("feature-x"));
+        assert!(caller.tool_session.is_some(), "{caller:?}");
+    }
+    assert_eq!(asked[0].1.terminal, "claude");
+    assert_eq!(asked[1].1.terminal, "claude", "from the process tree");
+    assert_eq!(asked[2].1.terminal, "claude-2");
+    assert_eq!(asked[2].3.as_deref(), Some("Next: ship it."));
+
+    // A new version waits for claude's next prompt: nothing is typed into it.
+    let before = scene.prompts("claude").len();
+    fake.versions
+        .lock()
+        .unwrap()
+        .insert((project_id.clone(), "claude".to_owned()), 7);
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(scene.prompts("claude").len(), before, "nobody was woken");
+    scene.user_types("claude", "hello");
+    scene.wait_for("the next prompt", |s| s.prompts("claude").len() > before);
+    let n = scene.prompts("claude").len();
+    scene.wait_for("its context", |s| !context_of(s, "claude", n).is_empty());
+    let context = context_of(&scene, "claude", n);
+    assert_eq!(
+        context
+            .matches("[connecto notice] project memory updated to version 7")
+            .count(),
+        1,
+        "{context}"
+    );
+    assert!(notices(&scene, "claude").is_empty());
+}
+
+// ---- the user's draft: Connecto types into a terminal the user is typing in
+
+impl Scene {
+    /// Two Claude terminals whose stand-ins edit their input line as a TUI
+    /// does: typed characters, Backspace, Left and Right.
+    fn composing(name: &str) -> Self {
+        Self::build_full(
+            name,
+            vec![Tool::Claude; 2],
+            "2.1.318",
+            false,
+            SinkMode::Plain,
+            &[("composer-claude", ""), ("composer-claude-2", "")],
+            true,
+            None,
+        )
+    }
+
+    /// The user presses keys in a terminal, through its pane, as the window
+    /// sends them: one write per key.
+    fn user_keys(&self, id: &str, bytes: &[u8]) {
+        self.pane(id).unwrap().send_input(bytes.to_vec()).unwrap();
+    }
+
+    fn user_text(&self, id: &str, text: &str) {
+        for ch in text.chars() {
+            self.user_keys(id, ch.to_string().as_bytes());
+        }
+    }
+
+    /// Connecto types `text` into `id`, as a `connecto send` would.
+    fn inject(&self, id: &str, text: &str) -> connecto_session::WriteOutcome {
+        self.relay.agent_type_raw(id, text, None).unwrap()
+    }
+
+    fn input_given_back(&self, id: &str) {
+        self.wait_for("the user's input given back", |s| {
+            !s.pane(id).unwrap().injecting()
+        });
+    }
+}
+
+const TYPED: connecto_session::WriteOutcome = connecto_session::WriteOutcome::Typed;
+
+/// The states a terminal shows over `secs`, each change once, sampled as the
+/// app's list sees them.
+fn states_over(scene: &Scene, id: &str, secs: u64) -> Vec<connecto_core::TermActivity> {
+    let mut seen: Vec<connecto_core::TermActivity> = Vec::new();
+    let until = Instant::now() + common::scaled(Duration::from_secs(secs));
+    while Instant::now() < until {
+        if let Some(state) = scene.state_of(id)
+            && seen.last() != Some(&state)
+        {
+            seen.push(state);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    seen
+}
+
+/// Review round 7, finding 1, through the relay's real log polling: after a
+/// turn's `Stop`, another `Stop` hook keeps it going. With nothing open the
+/// log is still read after a `Stop`, so the work it shows a second later is
+/// seen and the terminal reads `working` again until the turn's next `Stop`.
+#[test]
+fn a_turn_kept_going_after_its_stop_reads_working_through_the_relay() {
+    use connecto_core::TermActivity;
+    let scene = Scene::new("keptgoing");
+    // The turn itself runs a second, so its own `working` is seen too.
+    scene.user_types("claude-2", "SLEEP 1 CONTINUE x");
+    let states = states_over(&scene, "claude-2", 10);
+    let working = |s: &TermActivity| *s == TermActivity::Working;
+    let first = states.iter().position(working);
+    let resumed = first.and_then(|at| {
+        let idle = at + states[at..].iter().position(|s| !working(s))?;
+        Some(idle + states[idle..].iter().position(working)?)
+    });
+    assert!(
+        resumed.is_some(),
+        "never working again after its Stop: {states:?}"
+    );
+    assert!(
+        !working(states.last().unwrap()),
+        "settled at the end: {states:?}"
+    );
+}
+
+/// The real API-error lifecycle through the relay: an error record and
+/// `StopFailure`, never a `Stop`. The ask ends `unavailable`, not with the
+/// error text as a reply, and the terminal settles.
+#[test]
+fn an_api_error_turn_ends_its_ask_unavailable_through_the_relay() {
+    let scene = Scene::new("apifail");
+    let sent = scene.connecto("claude", "send claude-2 --ask 'APIFAIL now'");
+    assert_eq!(sent.code, 0, "{sent:?}");
+    // The asker is woken when the ask ends; then the result is read once.
+    scene.wait_for("the ask to end", |s| {
+        s.prompts("claude")
+            .iter()
+            .any(|p| p.contains("Request r1 ended"))
+            || (1..=9).any(|n| {
+                s.log(&format!("context-claude-{n}.txt"))
+                    .contains("Request r1 ended")
+            })
+    });
+    let result = scene.connecto("claude", "result r1");
+    assert!(result.out.contains("unavailable"), "{result:?}");
+    assert!(!result.out.contains("API Error"), "{result:?}");
+    scene.wait_for("claude-2 to settle", |s| {
+        s.state_of("claude-2") != Some(connecto_core::TermActivity::Working)
+    });
+}
+
+/// `StopFailure` with its error record written 3 s later and a message
+/// queued into the failed turn: the ask ends `unavailable` at once, the late
+/// record, read by the relay's polling, settles the queued one, and nothing
+/// stays `working`.
+#[test]
+fn a_failed_turn_with_a_late_error_record_settles_through_the_relay() {
+    let scene = Scene::new("faillate");
+    let sent = scene.connecto("claude", "send claude-2 --ask 'APIFAIL LATEEND MERGE now'");
+    assert_eq!(sent.code, 0, "{sent:?}");
+    // The asker is woken when the ask ends; then the result is read once.
+    scene.wait_for("the ask to end", |s| {
+        s.prompts("claude")
+            .iter()
+            .any(|p| p.contains("Request r1 ended"))
+            || (1..=9).any(|n| {
+                s.log(&format!("context-claude-{n}.txt"))
+                    .contains("Request r1 ended")
+            })
+    });
+    let result = scene.connecto("claude", "result r1");
+    assert!(result.out.contains("unavailable"), "{result:?}");
+    let states = states_over(&scene, "claude-2", 6);
+    assert_ne!(
+        states.last(),
+        Some(&connecto_core::TermActivity::Working),
+        "{states:?}"
+    );
+}
+
+/// An end record written 3 s after the `Stop` (past the wait), with a
+/// message queued into the turn: the `Stop` closes the ask by count, the
+/// late end record, read by the relay's polling, settles the queued one,
+/// and nothing stays `working`.
+#[test]
+fn a_late_end_record_settles_the_turn_through_the_relay() {
+    let scene = Scene::new("lateend");
+    let sent = scene.connecto("claude", "send claude-2 --ask 'LATEEND MERGE now'");
+    assert_eq!(sent.code, 0, "{sent:?}");
+    // The asker is woken when the ask ends; then the result is read once.
+    scene.wait_for("the ask to end", |s| {
+        s.prompts("claude")
+            .iter()
+            .any(|p| p.contains("Request r1 ended"))
+            || (1..=9).any(|n| {
+                s.log(&format!("context-claude-{n}.txt"))
+                    .contains("Request r1 ended")
+            })
+    });
+    // The ask is closed by count: its reply is the turn's.
+    let result = scene.connecto("claude", "result r1");
+    assert!(result.out.contains("echo: LATEEND MERGE now"), "{result:?}");
+    let states = states_over(&scene, "claude-2", 6);
+    assert_ne!(
+        states.last(),
+        Some(&connecto_core::TermActivity::Working),
+        "{states:?}"
+    );
+}
+
+/// The stuck-wake bug, its typing half. A turn that starts by itself between
+/// a wake's paste and its Enter (a background task's notification) would take
+/// the notice as a message queued into that turn. The wake is taken back off
+/// the input line instead, and its notice wakes the terminal once that turn
+/// has ended.
+#[test]
+fn a_wake_is_taken_back_when_a_turn_starts_before_its_enter() {
+    let scene = Scene::build_full(
+        "wakerace",
+        vec![Tool::Claude; 2],
+        "2.1.318",
+        false,
+        SinkMode::Plain,
+        &[
+            ("composer-claude", ""),
+            ("composer-claude-2", ""),
+            ("selfstart-claude", ""),
+        ],
+        true,
+        None,
+    );
+    assert_eq!(scene.connecto("claude", "watch claude-2").code, 0);
+    thread::sleep(Duration::from_millis(800));
+    scene.user_types("claude-2", "SLEEP 4 work");
+    scene.wait_for("the turn that started by itself", |s| {
+        s.prompts("claude")
+            .iter()
+            .any(|p| p.starts_with("<task-notification>"))
+    });
+    scene.wait_for("a wake after that turn ended", |s| {
+        s.prompts("claude")
+            .iter()
+            .skip_while(|p| !p.starts_with("<task-notification>"))
+            .any(|p| p.starts_with("[connecto notice]"))
+    });
+    assert_eq!(
+        scene.log("midturn-claude.log"),
+        "",
+        "nothing was entered into the running turn"
+    );
+    for prompt in scene.prompts("claude") {
+        assert_eq!(
+            prompt.matches("[connecto notice]").count(),
+            prompt.starts_with("[connecto notice]") as usize,
+            "no leftover of the withdrawn text: {prompt:?}"
+        );
+    }
+}
+
+/// An empty input line is typed into as always. A draft is taken out, the
+/// message is entered alone, and the draft goes back unsent with the cursor
+/// where it was.
+#[test]
+fn a_message_moves_the_users_draft_aside_and_puts_it_back() {
+    let scene = Scene::composing("draftaside");
+    assert_eq!(scene.inject("claude-2", "MSG empty"), TYPED);
+    scene.wait_for("the first message", |s| {
+        s.prompts("claude-2") == ["MSG empty"]
+    });
+    scene.input_given_back("claude-2");
+    scene.user_text("claude-2", "hello world");
+    for _ in 0..5 {
+        scene.user_keys("claude-2", b"\x1b[D");
+    }
+    assert_eq!(scene.inject("claude-2", "MSG draft"), TYPED);
+    scene.wait_for("the message", |s| s.prompts("claude-2").len() == 2);
+    assert_eq!(scene.prompts("claude-2")[1], "MSG draft");
+    scene.input_given_back("claude-2");
+    // Back, unsent, with the cursor before "world".
+    scene.user_keys("claude-2", b"X");
+    scene.user_keys("claude-2", b"\r");
+    scene.wait_for("the draft", |s| s.prompts("claude-2").len() == 3);
+    assert_eq!(scene.prompts("claude-2")[2], "hello Xworld");
+}
+
+/// A draft of several lines comes back whole after several messages that
+/// arrive together, and each message is entered alone.
+#[test]
+fn a_multi_line_draft_survives_several_messages_in_a_row() {
+    let scene = Scene::composing("draftrow");
+    let modes = InputModes {
+        bracketed_paste: true,
+        ..InputModes::default()
+    };
+    scene.user_keys("claude-2", &encode_paste("line one\nline two", modes));
+    scene.user_keys("claude-2", b"\x1b\r");
+    scene.user_text("claude-2", "line three");
+    thread::scope(|scope| {
+        let sends: Vec<_> = (0..3)
+            .map(|n| {
+                let scene = &scene;
+                scope.spawn(move || scene.inject("claude-2", &format!("MSG {n}")))
+            })
+            .collect();
+        for send in sends {
+            assert_eq!(send.join().unwrap(), TYPED);
+        }
+    });
+    scene.wait_for("three messages", |s| s.prompts("claude-2").len() == 3);
+    let mut prompts = scene.prompts("claude-2");
+    prompts.sort();
+    assert_eq!(prompts, ["MSG 0", "MSG 1", "MSG 2"]);
+    scene.input_given_back("claude-2");
+    scene.user_keys("claude-2", b"\r");
+    scene.wait_for("the draft", |s| s.prompts("claude-2").len() == 4);
+    assert_eq!(
+        scene.prompts("claude-2")[3],
+        "line one\nline two\nline three"
+    );
+}
+
+/// Keys the user types while Connecto types are held and go in after, at the
+/// end of the draft put back. A busy terminal gets the message at once, as
+/// before, and the draft typed during the turn is kept the same way.
+#[test]
+fn keys_typed_meanwhile_join_the_draft_and_a_busy_terminal_is_typed_into_at_once() {
+    let scene = Scene::composing("draftkeys");
+    scene.user_text("claude-2", "draft");
+    thread::scope(|scope| {
+        let send = scope.spawn(|| scene.inject("claude-2", "MSG during"));
+        scene.wait_for("Connecto to type", |s| {
+            s.pane("claude-2").unwrap().injecting()
+        });
+        scene.user_text("claude-2", " more");
+        assert_eq!(send.join().unwrap(), TYPED);
+    });
+    scene.wait_for("the message", |s| !s.prompts("claude-2").is_empty());
+    assert_eq!(scene.prompts("claude-2"), ["MSG during"]);
+    scene.input_given_back("claude-2");
+    scene.user_keys("claude-2", b"\r");
+    scene.wait_for("the draft", |s| s.prompts("claude-2").len() == 2);
+    assert_eq!(scene.prompts("claude-2")[1], "draft more");
+
+    // In a turn: the tool reads its input only when the turn ends.
+    scene.user_types("claude-2", "SLEEP 3");
+    scene.wait_for("the turn", |s| s.prompts("claude-2").len() == 3);
+    scene.user_text("claude-2", "later");
+    let sent = Instant::now();
+    assert_eq!(scene.inject("claude-2", "MSG busy"), TYPED);
+    assert!(
+        sent.elapsed() < Duration::from_secs(3),
+        "the send waited for the turn"
+    );
+    scene.input_given_back("claude-2");
+    scene.wait_for("the message", |s| s.prompts("claude-2").len() == 4);
+    assert_eq!(scene.prompts("claude-2")[3], "MSG busy");
+    scene.user_keys("claude-2", b"\r");
+    scene.wait_for("the draft", |s| s.prompts("claude-2").len() == 5);
+    assert_eq!(scene.prompts("claude-2")[4], "later");
+}
+
+/// A draft Connecto cannot follow (here, after a Tab, which may complete it) is
+/// never typed into. The sender is told at once that the message waits; it
+/// waits past the usual 25 s limit, for the draft limit, and goes in once the
+/// user sends the line, or is refused at that limit, never typed.
+#[cfg(feature = "test-endpoints")]
+#[test]
+fn a_draft_that_cannot_be_followed_holds_the_message_until_the_user_sends_it() {
+    let scene = Scene::composing("draftheld");
+    // The two limits are separate: the short one must not end the wait.
+    scene.relay.set_hold_limit(Duration::from_secs(1));
+    scene.relay.set_draft_limit(Duration::from_secs(30));
+    scene.user_text("claude-2", "mine");
+    scene.user_keys("claude-2", b"\t");
+    let began = Instant::now();
+    match scene.inject("claude-2", "MSG held") {
+        connecto_session::WriteOutcome::Waiting { note } => {
+            assert!(note.contains("send or clear their line"), "{note}");
+            assert!(note.contains("30 s"), "{note}");
+        }
+        other => panic!("not told it waits: {other:?}"),
+    }
+    assert!(began.elapsed() < Duration::from_secs(5));
+    scene.wait_for("the pane to say a message waits", |s| {
+        s.pane("claude-2").unwrap().message_waiting()
+    });
+    thread::sleep(Duration::from_secs(3));
+    assert!(scene.prompts("claude-2").is_empty());
+    scene.user_keys("claude-2", b"\r");
+    scene.wait_for("both", |s| s.prompts("claude-2").len() == 2);
+    assert_eq!(scene.prompts("claude-2"), ["mine", "MSG held"]);
+    scene.wait_for("the hint to go", |s| {
+        !s.pane("claude-2").unwrap().message_waiting()
+    });
+
+    scene.input_given_back("claude-2");
+    scene.relay.set_draft_limit(Duration::from_secs(2));
+    scene.user_text("claude-2", "again");
+    scene.user_keys("claude-2", b"\t");
+    assert!(matches!(
+        scene.inject("claude-2", "MSG late"),
+        connecto_session::WriteOutcome::Waiting { .. }
+    ));
+    scene.wait_for("the hint", |s| {
+        s.pane("claude-2").unwrap().message_waiting()
+    });
+    scene.wait_for("the wait to end", |s| {
+        !s.pane("claude-2").unwrap().message_waiting()
+    });
+    scene.user_keys("claude-2", b"\r");
+    scene.wait_for("the draft", |s| s.prompts("claude-2").len() == 3);
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(scene.prompts("claude-2"), ["mine", "MSG held", "again"]);
+}
+
+/// What an agent's `connecto send --ask` sees while the target's user is
+/// typing: an answer at once that the message waits and why, no timeout, no
+/// "did not start a turn" while it waits, and the usual end notice after.
+#[cfg(feature = "test-endpoints")]
+#[test]
+fn an_ask_to_a_terminal_the_user_is_typing_in_is_told_it_waits() {
+    let scene = Scene::composing("draftask");
+    scene.relay.set_hold_limit(Duration::from_secs(1));
+    scene.relay.set_draft_limit(Duration::from_secs(60));
+    scene.user_text("claude-2", "mine");
+    scene.user_keys("claude-2", b"\t");
+    let began = Instant::now();
+    let sent = scene.connecto("claude", "send claude-2 --ask 'MSG asked'");
+    assert_eq!(sent.code, 0, "{sent:?}");
+    assert!(sent.out.contains("waiting"), "{sent:?}");
+    assert!(sent.out.contains("send or clear their line"), "{sent:?}");
+    assert!(began.elapsed() < Duration::from_secs(20), "{sent:?}");
+    let id = sent
+        .out
+        .lines()
+        .find(|line| line.contains(" waiting"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap()
+        .to_owned();
+    // Past the 15 s in which a typed text must start a turn: still pending.
+    thread::sleep(Duration::from_secs(17));
+    let result = scene.connecto("claude", &format!("result {id}"));
+    assert!(result.out.contains("pending"), "{result:?}");
+    assert!(notices(&scene, "claude").is_empty());
+    scene.user_keys("claude-2", b"\r");
+    scene.wait_for("the message", |s| {
+        s.prompts("claude-2")
+            .iter()
+            .any(|p| p.ends_with("MSG asked"))
+    });
+    scene.wait_for("the end notice", |s| !notices(s, "claude").is_empty());
+    let notice = notices(&scene, "claude").remove(0);
+    assert!(notice.contains(&id), "{notice}");
+    assert!(!notice.contains("not typed"), "{notice}");
+}
+
+/// A request's end notice is typed into the sender the same way: the draft the
+/// user started meanwhile is not sent with it, and comes back after.
+#[test]
+fn a_request_notice_leaves_the_senders_draft_unsent() {
+    let scene = Scene::composing("draftnotice");
+    let sent = scene.connecto("claude", "send claude-2 --ask 'SLEEP 3 slowly'");
+    assert_eq!(sent.code, 0, "{sent:?}");
+    scene.wait_for("claude-2 to begin", |s| !s.prompts("claude-2").is_empty());
+    scene.user_text("claude", "half a thought");
+    scene.wait_for("the end of the request", |s| {
+        !notices(s, "claude").is_empty()
+    });
+    let notice = notices(&scene, "claude").remove(0);
+    assert!(!notice.contains("half a thought"), "{notice}");
+    scene.input_given_back("claude");
+    let before = scene.prompts("claude").len();
+    scene.user_keys("claude", b"\r");
+    scene.wait_for("the draft", |s| s.prompts("claude").len() == before + 1);
+    assert_eq!(scene.prompts("claude").pop().unwrap(), "half a thought");
+}
+
+/// ADR 0035: two projects in one Connecto. Without `--project` a command
+/// stays in the caller's own project; with it, an agent lists, reads and asks
+/// in the other one, and the reply comes back to it as for an ask at home.
+/// Everything but talking and reading is refused across projects, so are
+/// terminals another agent started, and a Pause in either project refuses;
+/// both projects' audits record what crossed. One test, so it never holds two
+/// of the scene permits while another test waits for its second.
+#[test]
+fn an_agent_talks_to_another_project_only_when_it_names_it() {
+    use connecto_session::{ProjectDirectory, ProjectEntry};
+    let alpha = Scene::new("cross-alpha");
+    let beta = Scene::new("cross-beta");
+    // A third project whose terminals have the same ids, slots and attempts
+    // as alpha's: an answer must still reach the project that asked.
+    let gamma = Scene::new("cross-gamma");
+    let entry = |scene: &Scene, name: &str| ProjectEntry {
+        id: connecto_session::launch::project_id(&fs::canonicalize(&scene.project).unwrap()),
+        name: name.into(),
+        path: scene.project.clone(),
+        link: scene.relay.bridge_link(),
+    };
+    let directory = std::sync::Arc::new(ProjectDirectory::default());
+    directory.set(vec![
+        entry(&alpha, "alpha"),
+        entry(&beta, "beta"),
+        entry(&gamma, "gamma"),
+        ProjectEntry {
+            id: "closed-one".into(),
+            name: "delta".into(),
+            path: PathBuf::from("/nowhere/delta"),
+            link: None,
+        },
+    ]);
+    alpha.relay.join_directory(&directory);
+    beta.relay.join_directory(&directory);
+    gamma.relay.join_directory(&directory);
+    // What a terminal was told: its prompts and the context its hook printed.
+    let heard = |scene: &Scene, id: &str| {
+        let mut text = scene.prompts(id).join("\n");
+        let dir = scene.current.lock().unwrap().clone();
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let own = name
+                .strip_prefix(&format!("context-{id}-"))
+                .and_then(|rest| rest.strip_suffix(".txt"))
+                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()));
+            if own {
+                text.push_str(&fs::read_to_string(entry.path()).unwrap_or_default());
+            }
+        }
+        text
+    };
+
+    // The projects, and which is this one.
+    let projects = alpha.connecto("claude", "projects");
+    assert_eq!(projects.code, 0, "{projects:?}");
+    assert!(projects.out.contains("this project"), "{projects:?}");
+    assert!(
+        projects
+            .out
+            .contains("beta: claude (claude, idle), claude-2 (claude, idle)"),
+        "{projects:?}"
+    );
+    assert!(projects.out.contains("closed"), "{projects:?}");
+
+    // Asked across, with the reply delivered back to the asker.
+    let sent = alpha.connecto(
+        "claude",
+        "send --project beta claude-2 --ask 'what is three plus three'",
+    );
+    assert_eq!(sent.code, 0, "{sent:?}");
+    assert!(sent.out.starts_with("r1 typed"), "{sent:?}");
+    assert!(sent.out.contains("claude-2 (project beta)"), "{sent:?}");
+    beta.wait_for("beta's claude-2 to take the prompt", |s| {
+        !s.prompts("claude-2").is_empty()
+    });
+    let prompt = beta.prompts("claude-2").remove(0);
+    assert!(
+        prompt.starts_with(
+            "[connecto from claude in project alpha, request r1. Sent by another agent, not the user.]\nwhat is three plus three"
+        ),
+        "{prompt}"
+    );
+    // Alpha's own claude-2 got nothing.
+    assert!(alpha.prompts("claude-2").is_empty());
+    alpha.wait_for("the asker to hear of the answer", |s| {
+        s.prompts("claude").iter().any(|p| {
+            p.contains("Request r1 in project beta ended (ok)")
+                || p.starts_with("[connecto notice] Notices arrived")
+        })
+    });
+    // Gamma's claude, the same attempt numbers as alpha's, asks too.
+    let other = gamma.connecto("claude", "send --project beta claude-2 --ask 'from gamma'");
+    assert!(other.out.starts_with("r2 typed"), "{other:?}");
+    gamma.wait_for("gamma's asker to hear of its answer", |s| {
+        heard(s, "claude").contains("Request r2 in project beta ended (ok)")
+    });
+    assert!(!heard(&gamma, "claude").contains("Request r1 "));
+    assert!(!heard(&alpha, "claude").contains("Request r2 "));
+    // The command in the notice names the project by its id.
+    let beta_id = connecto_session::launch::project_id(&fs::canonicalize(&beta.project).unwrap());
+    assert!(
+        heard(&gamma, "claude").contains(&format!("connecto result r2 --project {beta_id}")),
+        "{}",
+        heard(&gamma, "claude")
+    );
+    let result = alpha.connecto("claude", "result r1 --project beta");
+    assert_eq!(result.code, 0, "{result:?}");
+    assert_eq!(result.out, "echo: what is three plus three");
+    // Without the flag, the same id is looked up at home, where it is not.
+    let home = alpha.connecto("claude", "result r1");
+    assert_ne!(home.code, 0, "{home:?}");
+    assert!(home.err.contains("unknown_request"), "{home:?}");
+
+    // Read and list across; list without the flag stays at home.
+    let listed = alpha.connecto("claude", "list --project beta");
+    assert_eq!(listed.code, 0, "{listed:?}");
+    assert!(
+        listed.out.starts_with("Terminals of project beta:"),
+        "{listed:?}"
+    );
+    assert!(!listed.out.contains("self"), "{listed:?}");
+    let own = alpha.connecto("claude", "list");
+    assert!(own.out.contains("self"), "{own:?}");
+    let read = alpha.connecto("claude", "read claude-2 --project beta");
+    assert_eq!(read.code, 0, "{read:?}");
+    assert!(read.out.contains("three plus three"), "{read:?}");
+    // A relative path is read from the folder the command runs in (alpha's
+    // project), not from the app's: it names beta.
+    let beta_folder = beta.project.strip_prefix(std::env::temp_dir()).unwrap();
+    let relative = format!("../../../{}", beta_folder.display());
+    let by_path = alpha.connecto("claude", &format!("read claude-2 --project {relative}"));
+    assert_eq!(by_path.code, 0, "{by_path:?}");
+    assert!(by_path.out.contains("three plus three"), "{by_path:?}");
+
+    // Not across projects: the CLI refuses, and so does the app.
+    let keys = alpha.connecto("claude", "keys --project beta claude-2 esc");
+    assert_eq!(keys.code, 2, "{keys:?}");
+    assert!(keys.err.contains("works only in this project"), "{keys:?}");
+    for (args, code) in [
+        ("send --project delta claude 'hi'", "project_closed"),
+        ("send --project nowhere claude 'hi'", "unknown_project"),
+    ] {
+        let run = alpha.connecto("claude", args);
+        assert_eq!(run.code, 1, "{args}: {run:?}");
+        assert!(run.err.contains(code), "{args}: {run:?}");
+    }
+
+    // A terminal an agent of beta started is not open to everyone.
+    let added = beta.connecto("claude", "add shell");
+    assert_eq!(added.code, 0, "{added:?}");
+    let shell = added.out.split_whitespace().next().unwrap().to_owned();
+    for args in [
+        format!("read --project beta {shell}"),
+        format!("send --project beta {shell} 'ls'"),
+    ] {
+        let run = alpha.connecto("claude", &args);
+        assert_eq!(run.code, 1, "{args}: {run:?}");
+        assert!(run.err.contains("not_yours"), "{args}: {run:?}");
+    }
+    // Context use across projects comes only from a terminal open to
+    // everyone: one an agent of beta started shows "-", as it can't be read.
+    let owned = beta.connecto("claude", "add claude");
+    assert_eq!(owned.code, 0, "{owned:?}");
+    let owned = owned.out.split_whitespace().next().unwrap().to_owned();
+    beta.wait_for("the started terminal to be ready", |s| {
+        s.pane(&owned).is_some() && s.screen(&owned).contains("FAKE-READY")
+    });
+    beta.user_types("claude-2", "FOOTER");
+    beta.user_types(&owned, "FOOTER");
+    beta.wait_for("both footers", |s| {
+        s.screen("claude-2").contains("23% (230k/1M)") && s.screen(&owned).contains("23% (230k/1M)")
+    });
+    let home = beta.connecto("claude", "list");
+    assert_eq!(context_cell(&home.out, &owned), "23%", "{home:?}");
+    let across = alpha.connecto("claude", "list --project beta");
+    assert_eq!(context_cell(&across.out, "claude-2"), "23%", "{across:?}");
+    assert_eq!(context_cell(&across.out, &owned), "-", "{across:?}");
+
+    // A helper an agent started at home, as an app session starts one for a
+    // check, reads and asks in another project itself: only the target must
+    // be open to everyone, never the caller.
+    let helper = alpha.connecto("claude", "add claude --name checker");
+    assert_eq!(helper.code, 0, "{helper:?}");
+    let helper = helper.out.split_whitespace().next().unwrap().to_owned();
+    alpha.wait_for("the helper to be ready", |s| {
+        s.pane(&helper).is_some() && s.screen(&helper).contains("FAKE-READY")
+    });
+    let read = alpha.connecto(&helper, "read claude-2 --project beta");
+    assert_eq!(read.code, 0, "{read:?}");
+    assert!(read.out.contains("three plus three"), "{read:?}");
+    let asked = alpha.connecto(
+        &helper,
+        "send --project beta claude-2 --ask 'from the helper'",
+    );
+    assert_eq!(asked.code, 0, "{asked:?}");
+    let request = asked.out.split_whitespace().next().unwrap().to_owned();
+    alpha.wait_for("the helper to hear of its answer", |s| {
+        heard(s, &helper).contains(&format!("Request {request} in project beta ended (ok)"))
+    });
+    // Still nothing but talking and reading for it across projects.
+    let close = alpha.connecto(&helper, "close --project beta claude-2");
+    assert_eq!(close.code, 2, "{close:?}");
+
+    // A watch across projects wakes the watcher at home, named with its
+    // project; an unwatch ends it.
+    let watch = alpha.connecto("claude", "watch --project beta claude");
+    assert_eq!(watch.code, 0, "{watch:?}");
+    assert_eq!(watch.out.trim(), "watching claude");
+    // An unwatch under Pause is refused and leaves the watch as it was.
+    beta.relay.pause_switch().pause();
+    let refused = alpha.connecto("claude", "unwatch --project beta claude");
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.err.contains("paused"), "{refused:?}");
+    beta.relay.pause_switch().resume();
+    let listed = alpha.connecto("claude", "list --project beta");
+    let row = listed
+        .out
+        .lines()
+        .find(|line| line.starts_with("claude "))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(row.contains("watched"), "{listed:?}");
+    beta.user_types("claude", "hello from the user");
+    alpha.wait_for("the watched event across projects", |s| {
+        s.prompts("claude").iter().any(|p| {
+            p.starts_with("[connecto notice] claude in project beta")
+                || p.starts_with("[connecto notice] Notices arrived")
+        })
+    });
+    // Each wake is a turn of the watcher (a later event may also ride in as
+    // the context of one): let them settle before typing, so a late wake
+    // does not run into the next command.
+    let mut seen = alpha.prompts("claude").len();
+    loop {
+        thread::sleep(Duration::from_millis(1500));
+        let now = alpha.prompts("claude").len();
+        if now == seen {
+            break;
+        }
+        seen = now;
+    }
+    let unwatch = alpha.connecto("claude", "unwatch --project beta claude");
+    assert_eq!(unwatch.out.trim(), "not watching claude", "{unwatch:?}");
+
+    // A Pause in the target project refuses, and so does one at home.
+    beta.relay.pause_switch().pause();
+    let paused = alpha.connecto("claude", "send --project beta claude-2 'hi'");
+    assert_eq!(paused.code, 1, "{paused:?}");
+    assert!(paused.err.contains("paused"), "{paused:?}");
+    beta.relay.pause_switch().resume();
+    alpha.relay.pause_switch().pause();
+    let paused = alpha.connecto("claude", "list --project beta");
+    assert_eq!(paused.code, 1, "{paused:?}");
+    assert!(paused.err.contains("paused"), "{paused:?}");
+    alpha.relay.pause_switch().resume();
+
+    // A forbidden op sent straight to the socket, as an older or forged
+    // command would: refused, and recorded in both projects.
+    fs::write(
+        alpha.current.lock().unwrap().join("raw_keys.py"),
+        r#"import json, os, socket, struct
+p = json.dumps({"v": 1, "op": "in_project", "project": "beta",
+                "inner": {"v": 1, "op": "keys", "target": "claude-2", "keys": ["esc"]}}).encode()
+s = socket.socket(socket.AF_UNIX)
+s.connect(os.environ["CONNECTO_BRIDGE_SOCK"])
+s.sendall(struct.pack(">I", len(p) + 1) + b"\0" + p)
+out = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    out += chunk
+print(out)
+"#,
+    )
+    .unwrap();
+    let raw = alpha.agent_runs("claude", "python3 raw_keys.py");
+    assert!(raw.out.contains("not_across_projects"), "{raw:?}");
+    assert!(beta.keys_seen("claude-2").is_empty());
+
+    // An audit log that cannot take the intent in time: nothing is done.
+    use std::sync::atomic::Ordering::SeqCst;
+    beta.slow_cross.store(400, SeqCst);
+    let late = alpha.connecto("claude", "read claude-2 --project beta");
+    assert_eq!(late.code, 1, "{late:?}");
+    assert!(late.err.contains("audit_failed"), "{late:?}");
+    assert!(late.out.is_empty(), "{late:?}");
+    // Nor a refusal: one the log cannot take in time says so.
+    beta.relay.pause_switch().pause();
+    let refused = alpha.connecto("claude", "send --project beta claude-2 'hi'");
+    beta.relay.pause_switch().resume();
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.err.contains("audit_failed"), "{refused:?}");
+    assert!(refused.err.contains("paused"), "{refused:?}");
+
+    // A Pause while the intent is being written, in time but slowly: the
+    // read is refused when it would act, and nothing is read.
+    beta.slow_cross.store(150, SeqCst);
+    beta.cross_entered.store(false, SeqCst);
+    let pauser = {
+        let entered = std::sync::Arc::clone(&beta.cross_entered);
+        let pause = beta.relay.pause_switch();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !entered.load(SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            pause.pause();
+        })
+    };
+    let during = alpha.connecto("claude", "read claude-2 --project beta");
+    pauser.join().unwrap();
+    beta.relay.pause_switch().resume();
+    beta.slow_cross.store(0, SeqCst);
+    assert_eq!(during.code, 1, "{during:?}");
+    assert!(during.err.contains("paused"), "{during:?}");
+    assert!(during.out.is_empty(), "{during:?}");
+
+    // Both audits name what crossed.
+    let alpha_audit = alpha.audit();
+    let beta_audit = beta.audit();
+    assert!(
+        alpha_audit.contains(r#""action":"cross_project_send""#)
+            && alpha_audit.contains(r#""source":"claude""#),
+        "{alpha_audit}"
+    );
+    assert!(
+        beta_audit.contains(r#""action":"cross_project_send""#)
+            && beta_audit.contains(r#""action":"cross_project_read""#)
+            && beta_audit.contains(r#""decision":"deny""#),
+        "{beta_audit}"
+    );
+    // A closed project has no gate, but its record is in the one log: the
+    // refusal is kept under its id as well as under the caller's.
+    let closed: Vec<&str> = alpha_audit
+        .lines()
+        .filter(|line| {
+            line.contains(r#""action":"cross_project_send""#)
+                && line.contains(r#""decision":"deny""#)
+                && line.contains(r#""reason":"project_closed""#)
+        })
+        .collect();
+    assert!(
+        closed
+            .iter()
+            .any(|line| line.contains(r#""project":"closed-one""#)
+                && line.contains(r#""target":"claude""#)),
+        "{alpha_audit}"
+    );
+    assert!(
+        closed
+            .iter()
+            .any(|line| !line.contains(r#""project":"closed-one""#)
+                && line.contains(r#""target":"closed-one/claude""#)),
+        "{alpha_audit}"
+    );
+    for audit in [&alpha_audit, &beta_audit] {
+        assert!(
+            audit
+                .lines()
+                .any(|line| line.contains(r#""action":"cross_project_keys""#)
+                    && line.contains(r#""decision":"deny""#)),
+            "{audit}"
+        );
+    }
 }

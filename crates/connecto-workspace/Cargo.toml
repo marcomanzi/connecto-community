@@ -17,3 +17,22 @@ connecto-core.workspace = true
 connecto-session.workspace = true
 connecto-store.workspace = true
 serde_json.workspace = true
+
+# Stopping a cancelled clone with what git started (its process group), and
+# publishing a finished clone with a rename that never replaces anything
+# (`renameat_with` + NOREPLACE: renameatx_np on macOS, renameat2 on Linux).
+# Both already in Cargo.lock.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs"] }
+
+# The local date and time a freedesktop trash entry records. Already in
+# Cargo.lock.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Moving a deleted project's folder to the Trash (NSFileManager). Already in
+# Cargo.lock.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSFileManager", "NSURL", "NSError", "NSString"] }

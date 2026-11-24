@@ -4,11 +4,13 @@
 
 use connecto_core::{
     AgentBusy, AgentMode, AgentsView, HomeMigration, HostLink, HostingStatus, LaunchModes,
-    MachineRow, PAIRING_CODE_DIGITS, PackagesView, RemoteView, ToolKind,
+    MachineRow, PAIRING_CODE_DIGITS, PackagesView, ProviderScope, RemoteView, ToolKind,
 };
 use egui::{Id, Key, Rect, RichText, TextEdit, Ui};
 
 use crate::forms::{self, Out, heading, muted, problem, warning};
+use crate::providers::{ProvidersAction, ProvidersDialog};
+use crate::vault_ui::{ProjectName, VaultAction, VaultForm};
 use crate::{platform, theme};
 
 /// The sections of Settings, in the order of the tab row.
@@ -18,11 +20,20 @@ pub(crate) enum SettingsTab {
     Home,
     Agents,
     Launch,
+    Secrets,
     Remote,
+    Cli,
 }
 
 impl SettingsTab {
-    pub(crate) const ALL: [Self; 4] = [Self::Home, Self::Agents, Self::Launch, Self::Remote];
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Home,
+        Self::Agents,
+        Self::Launch,
+        Self::Secrets,
+        Self::Remote,
+        Self::Cli,
+    ];
 
     /// The tab's name, which is also the section's wording.
     pub(crate) fn label(self) -> &'static str {
@@ -30,7 +41,9 @@ impl SettingsTab {
             Self::Home => "Connecto Home",
             Self::Agents => "Agents",
             Self::Launch => "How Coding CLIs are launched",
+            Self::Secrets => "Secrets",
             Self::Remote => "Remote Access",
+            Self::Cli => "CLI improvements",
         }
     }
 
@@ -40,7 +53,9 @@ impl SettingsTab {
             Self::Home => "tab-home",
             Self::Agents => "tab-agents",
             Self::Launch => "tab-launch",
+            Self::Secrets => "tab-secrets",
             Self::Remote => "tab-remote",
+            Self::Cli => "tab-cli",
         }
     }
 }
@@ -58,6 +73,10 @@ pub(crate) struct SettingsSheet {
     pub(crate) relay_error: Option<String>,
     /// Why an agent's sign-in could not be opened.
     pub(crate) agents_error: Option<String>,
+    /// The dialog that sets Claude's or Pi's providers up, when open.
+    pub(crate) providers: Option<ProvidersDialog>,
+    /// Settings > Secrets.
+    pub(crate) vault: VaultForm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,8 +100,10 @@ pub(crate) enum SettingsAction {
     },
     /// Keep secrets in the system store from the next launch on.
     SetSecretsInSystemStore(bool),
-    /// Check for updates at launch and daily, or not.
+    /// Check for updates at launch and every minute, or not.
     SetAutoUpdate(bool),
+    /// Install ready updates by themselves, or wait for the person.
+    SetAutoInstall(bool),
     /// Check for updates now.
     CheckForUpdates,
     SetRelay {
@@ -94,10 +115,33 @@ pub(crate) enum SettingsAction {
     ActivateAgent(ToolKind),
     /// Stop offering the agent in new terminals; nothing is uninstalled.
     DeactivateAgent(ToolKind),
+    /// The person agreed to install Node.js for the agent, then the agent.
+    InstallNode(ToolKind),
+    /// The person declined Node.js: the agent is not installed.
+    DeclineNode(ToolKind),
     /// Open the agent's sign-in.
     SignInAgent(ToolKind),
     /// Look again at what is installed and signed in.
     RefreshAgents,
+    /// A change in the model providers dialog.
+    Providers(ProvidersAction),
+    /// A change to the person's secrets.
+    Vault(VaultAction),
+    /// Start a Claude terminal on Opus that runs `/insights` and applies
+    /// its suggestions (CLI improvements).
+    ApplyClaudeInsights,
+}
+
+impl From<ProvidersAction> for SettingsAction {
+    fn from(action: ProvidersAction) -> Self {
+        Self::Providers(action)
+    }
+}
+
+impl From<VaultAction> for SettingsAction {
+    fn from(action: VaultAction) -> Self {
+        Self::Vault(action)
+    }
 }
 
 /// What the sheet shows, read from the controls once per frame.
@@ -112,6 +156,27 @@ pub(crate) struct Inputs<'a> {
     pub(crate) secrets_in_system_store: bool,
     /// Connecto updating itself.
     pub(crate) updates: &'a connecto_core::UpdateView,
+    /// The person's secrets, without values.
+    pub(crate) vault: &'a connecto_core::VaultView,
+    /// The open projects, for a project's own secrets.
+    pub(crate) projects: &'a [ProjectName],
+    /// CLI improvements: the project a terminal they start opens in (the
+    /// active one of this machine), and what the last start came to.
+    pub(crate) cli: CliInputs<'a>,
+}
+
+/// What Settings > CLI improvements shows.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CliInputs<'a> {
+    /// The name of the project a terminal opens in.
+    pub(crate) project: Option<&'a str>,
+    /// Why no terminal can be started now (no project of this machine on
+    /// show, Claude deactivated or turned off in the project).
+    pub(crate) unavailable: Option<&'a str>,
+    /// Why the last start failed.
+    pub(crate) error: Option<&'a str>,
+    /// A start is on its way.
+    pub(crate) starting: bool,
 }
 
 pub(crate) fn sheet(
@@ -127,6 +192,22 @@ pub(crate) fn sheet(
     });
     if closed {
         out.actions.push(SettingsAction::Close);
+    }
+    if let Some(dialog) = &mut state.providers {
+        let mut closed = false;
+        crate::dialog::card(ctx, "providers-dialog", |ui| {
+            crate::providers::dialog(
+                ui,
+                dialog,
+                &inputs.agents.claude,
+                &inputs.agents.pi,
+                out,
+                &mut closed,
+            );
+        });
+        if closed {
+            state.providers = None;
+        }
     }
 }
 
@@ -145,9 +226,15 @@ fn body(
         tab,
         secrets_in_system_store,
         updates,
+        vault,
+        projects,
+        cli,
     } = inputs;
     if ui.input(|i| i.key_pressed(Key::Escape)) {
-        out.actions.push(SettingsAction::Close);
+        // Escape closes what is on top: the setup dialog, then the sheet.
+        if state.providers.take().is_none() {
+            out.actions.push(SettingsAction::Close);
+        }
     }
     forms::column(ui, rect, |ui| {
         tab_row(ui, tab, out);
@@ -161,26 +248,75 @@ fn body(
                 }
                 SettingsTab::Agents => agents_section(ui, state, agents, out),
                 SettingsTab::Launch => launch_section(ui, modes, out),
-                SettingsTab::Remote => {
-                    remote_section(ui, state, remote, out);
+                SettingsTab::Secrets => {
+                    crate::vault_ui::section(ui, &mut state.vault, vault, projects, out);
                     secrets_section(ui, secrets_in_system_store, out);
                 }
+                SettingsTab::Remote => remote_section(ui, state, remote, out),
+                SettingsTab::Cli => cli_section(ui, agents, cli, out),
             });
     });
+}
+
+/// CLI improvements: tasks a coding CLI does on itself. Each shows only
+/// when its CLI is installed; with none, the section says what it needs.
+fn cli_section(ui: &mut Ui, agents: &AgentsView, cli: CliInputs, out: &mut Out<SettingsAction>) {
+    out.say(ui, heading("CLI IMPROVEMENTS"));
+    out.say(
+        ui,
+        muted("A coding CLI improves how it is set up for you, from what it learned of your work. It asks you whenever it is in doubt and before anything risky."),
+    );
+    let claude = agents
+        .rows
+        .iter()
+        .any(|row| row.tool == ToolKind::Claude && row.installed);
+    if !claude {
+        out.say(
+            ui,
+            muted("Nothing to do here yet: these work through an installed coding CLI. Install Claude Code in Settings > Agents."),
+        );
+        return;
+    }
+    forms::separator(ui);
+    out.say(
+        ui,
+        RichText::new("Claude auto apply insights").color(theme::TEXT),
+    );
+    out.say(
+        ui,
+        muted("Opens a Claude Code terminal on Opus that runs /insights, reads the report and applies its suggestions: settings, hooks, CLAUDE.md, skills. What is about you goes in the Claude config folder the terminal runs on (~/.claude, or the project's isolated one), what is about the project in the project."),
+    );
+    match (cli.project, cli.unavailable) {
+        (Some(name), _) => out.say(ui, muted(format!("The terminal opens in {name}."))),
+        (None, Some(why)) => out.say(ui, warning(why)),
+        (None, None) => out.say(
+            ui,
+            warning("Open a project first: the terminal opens in it."),
+        ),
+    }
+    if let Some(why) = cli.error {
+        out.say(ui, problem(why));
+    }
+    if cli.starting {
+        out.say(ui, muted("Starting the terminal…"));
+    }
+    if out.button(
+        ui,
+        "claude-insights",
+        "Claude auto apply insights",
+        cli.project.is_some() && !cli.starting,
+    ) {
+        out.actions.push(SettingsAction::ApplyClaudeInsights);
+    }
 }
 
 /// The row of section tabs. It wraps onto a second line when the sheet is
 /// narrow, and the selected one is highlighted.
 fn tab_row(ui: &mut Ui, current: SettingsTab, out: &mut Out<SettingsAction>) {
-    ui.horizontal_wrapped(|ui| {
-        for tab in SettingsTab::ALL {
-            let on = tab == current;
-            if out.choice(ui, tab.key(), on, tab.label()) && !on {
-                out.actions.push(SettingsAction::SelectTab(tab));
-            }
-        }
-    });
-    ui.add_space(6.0);
+    let tabs = SettingsTab::ALL.map(|tab| (tab, tab.key(), tab.label()));
+    if let Some(tab) = forms::tab_row(ui, out, current, tabs) {
+        out.actions.push(SettingsAction::SelectTab(tab));
+    }
 }
 
 fn home_section(
@@ -248,6 +384,12 @@ fn updates_section(ui: &mut Ui, view: &connecto_core::UpdateView, out: &mut Out<
         UpdateStatus::Checking => Some("Checking…".to_owned()),
         UpdateStatus::UpToDate => Some("It is the newest version.".to_owned()),
         UpdateStatus::Downloading { version } => Some(format!("Downloading {version}…")),
+        UpdateStatus::Ready { version } if view.auto_install => Some(match &view.held {
+            Some(held) => {
+                format!("{version} is ready and installs itself when nothing holds it back. {held}")
+            }
+            None => format!("{version} is ready and installs itself in a moment."),
+        }),
         UpdateStatus::Ready { version } => Some(format!(
             "{version} is ready: restart from the strip at the top to install it."
         )),
@@ -266,7 +408,17 @@ fn updates_section(ui: &mut Ui, view: &connecto_core::UpdateView, out: &mut Out<
     }
     out.say(
         ui,
-        muted("At launch and then daily. A new version is downloaded in the background, checked, and installed only when you choose Update and restart."),
+        muted("At launch and then every minute. A new version is downloaded in the background and checked before it is installed."),
+    );
+    let mut auto = view.auto_install;
+    let toggle = ui.checkbox(&mut auto, "Install updates automatically");
+    out.mark("auto-install", toggle.rect);
+    if toggle.changed() {
+        out.actions.push(SettingsAction::SetAutoInstall(auto));
+    }
+    out.say(
+        ui,
+        muted("Connecto restarts by itself once nothing holds it back (a pairing, a file transfer, typing in a terminal), and agents that were in a turn are told \"continua\" to carry on. Off: it waits for Update and restart."),
     );
     if out.button(ui, "check-updates", "Check now", true) {
         out.actions.push(SettingsAction::CheckForUpdates);
@@ -303,13 +455,41 @@ fn agents_section(
             };
             out.say(ui, muted(installed));
             let signed_in_here = format!("Signed in on {}", platform::THIS_COMPUTER);
+            let providers = crate::providers::pi_providers_line(&agents.pi);
             let (sign, color) = match (row.installed, row.signed_in) {
+                // Pi has no account: what it can reach is its providers.
+                _ if row.tool == ToolKind::Pi => (
+                    providers.as_str(),
+                    if agents.pi.usable() || agents.pi.undecided() {
+                        theme::TEXT_MUTED
+                    } else {
+                        theme::AMBER
+                    },
+                ),
                 (false, _) => ("Sign-in: not yet", theme::TEXT_MUTED),
+                // Its sign-in is in the system keychain and is not asked:
+                // its terminal shows the sign-in screen when it needs one.
+                (true, None) if row.tool == ToolKind::Antigravity => (
+                    "Signs in with Google in its own terminal",
+                    theme::TEXT_MUTED,
+                ),
+                // It signs in to each model provider on its own, and has
+                // free models without any.
+                (true, _) if row.tool == ToolKind::OpenCode => (
+                    "Signs in to its providers with /connect in its own terminal",
+                    theme::TEXT_MUTED,
+                ),
                 (true, Some(true)) => (signed_in_here.as_str(), theme::GREEN),
                 (true, Some(false)) => ("Not signed in", theme::AMBER),
                 (true, None) => ("Sign-in: could not be checked", theme::TEXT_MUTED),
             };
             out.say(ui, RichText::new(sign).size(11.5).color(color));
+            if row.tool == ToolKind::Claude
+                && crate::providers::CLAUDE_SUPPORTED
+                && let Some((line, color)) = crate::providers::claude_providers_line(&agents.claude)
+            {
+                out.say(ui, RichText::new(line).size(11.5).color(color));
+            }
             if !row.active {
                 out.say(ui, muted("Hidden from new terminals."));
             }
@@ -321,12 +501,54 @@ fn agents_section(
             if let Some(error) = &row.error {
                 out.say(ui, problem(error.clone()));
             }
+            if let Some(prompt) = &row.node_prompt {
+                out.say(ui, warning(prompt.clone()));
+            }
             if !row.installed && row.busy.is_none() {
                 out.say(ui, muted(format!("Installs from {}.", row.source)));
             }
             let idle = row.busy.is_none();
+            // Pi that is installed and has no provider that works is not a
+            // thing to activate: it is a thing to set up.
+            let needs_setup = row.tool == ToolKind::Pi
+                && row.installed
+                && !agents.pi.usable()
+                && !agents.pi.undecided();
             ui.horizontal_wrapped(|ui| {
-                if !row.installed || !row.active {
+                if row.tool == ToolKind::Pi
+                    && row.installed
+                    && out.button(ui, "pi-setup-open", "Set up model providers…", true)
+                {
+                    state.providers =
+                        Some(ProvidersDialog::new(ProviderScope::Global, ToolKind::Pi));
+                }
+                if row.tool == ToolKind::Claude
+                    && crate::providers::claude_setup_offered(
+                        crate::providers::CLAUDE_SUPPORTED,
+                        row.installed,
+                    )
+                    && out.button(ui, "claude-setup-open", "Set up model providers…", true)
+                {
+                    state.providers = Some(ProvidersDialog::new(
+                        ProviderScope::Global,
+                        ToolKind::Claude,
+                    ));
+                }
+                if row.node_prompt.is_some() {
+                    // The install waits for an answer.
+                    if out.button(
+                        ui,
+                        &format!("agent-node-install:{key}"),
+                        "Install Node.js and continue",
+                        idle,
+                    ) {
+                        out.actions.push(SettingsAction::InstallNode(row.tool));
+                    }
+                    if out.button(ui, &format!("agent-node-decline:{key}"), "Not now", idle) {
+                        out.actions.push(SettingsAction::DeclineNode(row.tool));
+                    }
+                } else if needs_setup {
+                } else if !row.installed || !row.active {
                     let label = if row.installed {
                         "Activate"
                     } else {
@@ -339,6 +561,7 @@ fn agents_section(
                     out.actions.push(SettingsAction::DeactivateAgent(row.tool));
                 }
                 if row.installed
+                    && row.tool != ToolKind::Pi
                     && row.signed_in != Some(true)
                     && out.button(ui, &format!("agent-signin:{key}"), "Sign in", idle)
                 {
@@ -394,17 +617,56 @@ fn launch_section(ui: &mut Ui, modes: LaunchModes, out: &mut Out<SettingsAction>
                 "Ask before acting: Codex's normal approvals  (no flag)",
             ],
         ),
+        (
+            ToolKind::Pi,
+            "Pi",
+            // Pi never asks before a tool call. Its one question is whether a
+            // project's own `.pi` resources may load, so it has two choices.
+            [
+                "Load a project's own .pi resources without asking  (--approve)",
+                "Ask before loading a project's own .pi resources  (no flag)",
+                "",
+            ],
+        ),
+        (
+            ToolKind::Antigravity,
+            "Antigravity",
+            [
+                "Skip permission prompts  (--dangerously-skip-permissions)",
+                "Auto mode, where your account offers it  (--mode auto)",
+                "Ask before acting: Antigravity's normal permission prompts  (no flag)",
+            ],
+        ),
+        (
+            ToolKind::OpenCode,
+            "OpenCode",
+            // OpenCode has no reviewing mode: approve, or ask.
+            [
+                "Approve every permission your config does not deny  (--auto)",
+                "",
+                "Ask before acting: OpenCode's permission prompts  (no flag)",
+            ],
+        ),
     ] {
         out.say(ui, RichText::new(name).color(theme::TEXT));
         for (mode, label) in AgentMode::ALL.into_iter().zip(labels) {
-            let on = modes.for_tool(tool) == mode;
+            if label.is_empty() {
+                continue;
+            }
+            let chosen = modes.for_tool(tool);
+            // Pi's two choices: the third mode launches as the second does.
+            let on = chosen == mode
+                || (tool == ToolKind::Pi && mode == AgentMode::Auto && chosen == AgentMode::Prompt);
             let key = format!("mode:{}:{}", name.to_lowercase(), mode.cli_value());
             if out.choice(ui, &key, on, label) && !on {
                 out.actions.push(SettingsAction::SetLaunchMode(tool, mode));
             }
         }
     }
-    if modes.claude != AgentMode::Bypass || modes.codex != AgentMode::Bypass {
+    if modes.claude != AgentMode::Bypass
+        || modes.codex != AgentMode::Bypass
+        || modes.antigravity != AgentMode::Bypass
+    {
         out.say(
             ui,
             warning("A coding CLI that is not skipping its checks can stop and wait at a permission prompt. The terminal then shows it (Claude also marks it as needing you); answer it in the terminal, here or from a remote machine. Messages sent to that terminal wait behind it."),
@@ -515,10 +777,10 @@ fn secrets_section(ui: &mut Ui, in_system_store: bool, out: &mut Out<SettingsAct
         return;
     };
     forms::separator(ui);
-    out.say(ui, heading("SECRETS"));
+    out.say(ui, heading("WHERE SECRETS ARE KEPT"));
     out.say(
         ui,
-        muted("Device keys, the relay token and the Jev key are kept in a file only you can read, in Connecto's data folder. No system prompts."),
+        muted("These secrets, device keys, the relay token and the Jev key are kept in a file only you can read, in Connecto's data folder. No system prompts."),
     );
     let mut on = in_system_store;
     let toggle = ui.checkbox(&mut on, label);

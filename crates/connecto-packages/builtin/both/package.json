@@ -1,5 +1,5 @@
 {
   "name": "Connecto",
-  "description": "Connecto's team workflows (dev, daily and brainstorm teams) for Claude and Codex: each side is reviewed by the other tool.",
-  "version": 1
+  "description": "Connecto's team workflows (dev, daily and brainstorm teams) and a second opinion: every role runs in its own Connecto terminal, on the coding CLIs the project allows and can start (`connecto agents --roles`), coders on Claude and reviewers on Codex when both are ready. Also how to set up a project's Agentic Works.",
+  "version": 10
 }

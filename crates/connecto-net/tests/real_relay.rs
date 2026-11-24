@@ -152,9 +152,16 @@ fn serve(node: &Arc<IrohNode>, allowed: &PrivateKey) {
     );
     let host = Arc::new(HostService::new(
         Arc::new(FixedTerminals(Mutex::new(vec![HostTerminal {
+            entry: None,
+            ran: true,
+            owner: None,
+            background: Vec::new(),
             id: 1,
             name: "echo".into(),
             tool: 3,
+            project_id: "p".into(),
+            project_name: "Project".into(),
+            parent: None,
             attempt: 1,
             activity: 0,
             session: session as Arc<dyn TerminalSession>,

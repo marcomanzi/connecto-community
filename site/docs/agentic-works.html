@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agentic Works · Connecto docs</title>
+<meta name="description" content="A PostgreSQL job queue for a project: insert a row, an agent does the work, validated JSON comes back.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="agentic-works">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Agentic Works</h1>
+<p class="lead">Agentic Works turns a project into a job queue. Any program that can write a row to PostgreSQL asks for a piece of work. An agent in the project does it, and the answer comes back in the same row as JSON that matches a schema you chose.</p>
+
+<p>Use it to give agents work from things that are not you:</p>
+<ul>
+  <li><strong>Your own app.</strong> A backend inserts "summarize this ticket" or "extract the fields from this invoice" and reads the result later.</li>
+  <li><strong>Workflow tools and schedulers.</strong> n8n, a cron job, or a CI step inserts a job and waits for its row to finish.</li>
+  <li><strong>Batches.</strong> Insert a row per file, page or customer and let the project work through them while you do something else.</li>
+</ul>
+<p>The work runs in your project, with its files, its <a href="packages.html">skills and plugins</a> and its <a href="isolation.html">launch mode</a>, on your own agent accounts.</p>
+
+<h2 id="how">How it works</h2>
+<ol>
+  <li>You link the project to a PostgreSQL database. Connecto creates a private <code>connecto_works</code> schema there.</li>
+  <li>You publish <strong>work types</strong>. A work type is instructions with a <code>{{prompt}}</code> placeholder, and the JSON Schema of the answer. It can also have <a href="#commands">setup and prepare commands</a> that Connecto runs itself.</li>
+  <li>A producer inserts a job: the project name, a work type and a prompt.</li>
+  <li>Connecto claims the job, runs the type's prepare command if it has one, opens a terminal in the project, and gives the agent the instructions with the prompt filled in.</li>
+  <li>When the agent's turn ends, Connecto checks its final answer against the schema. It writes the JSON to the row, or the reason it failed, and closes the terminal.</li>
+</ol>
+
+<h2 id="link">Link a database</h2>
+<p>You need a PostgreSQL database that Connecto can reach, and a role that can create a schema in it. Connecto must be running, with the project open.</p>
+<ol>
+  <li>In <strong>Settings → Secrets</strong>, add a secret <strong>under the project</strong> whose value is the connection string, such as <code>postgresql://works@db.example.com/app</code>. Under <strong>How it may be used</strong>, choose <strong>Agentic Works database</strong>. Only Connecto reads it; no terminal ever sees it.</li>
+  <li>Open the project and choose <strong>Terminal → Agentic Works…</strong>. Under <strong>Database</strong>, choose <strong>PostgreSQL connection string</strong> and enter the secret's name. (For Google Cloud SQL, see <a href="#cloudsql">below</a>.)</li>
+  <li>Click <strong>Create queue and link</strong> for a new database. Use <strong>Validate existing queue</strong> to link a database whose queue already exists, such as one this project was linked to before.</li>
+</ol>
+<ul>
+  <li>A project can link several databases, each under a name (such as <code>dev</code>, <code>staging</code> or <code>production</code>; a link made without a name is <code>default</code>). A queue belongs to one project and is linked under one name only. A work type serves every linked database unless it is published for a list of them.</li>
+  <li>A database on another machine must accept TLS with a certificate this Mac trusts. Only <code>localhost</code> and loopback addresses may connect without it.</li>
+  <li>The schema, its tables and its sequence must belong to the role in the connection string. Connecto refuses a queue where anyone else can write. Granting <code>SELECT</code> to other roles is allowed.</li>
+</ul>
+
+<h2 id="cloudsql">Google Cloud SQL</h2>
+<p>A Cloud SQL for PostgreSQL instance can be linked without opening it to this Mac's IP address. Under <strong>Database</strong>, choose <strong>Google Cloud SQL</strong>. Connecto then connects the way Google's Cloud SQL connectors and the Cloud SQL Auth Proxy do:</p>
+<ul>
+  <li>A Google identity authorises the connection through IAM (<code>roles/cloudsql.client</code>). The instance's <em>Authorized networks</em> list is not used, so the same Mac works from home, the office or a phone hotspot.</li>
+  <li>Each connection is mutual TLS. Connecto presents a short-lived client certificate issued by the Cloud SQL Admin API, and checks the server against the instance's own CA and the instance's name.</li>
+  <li>No proxy runs, and <code>gcloud</code> is not needed once it is set up.</li>
+</ul>
+<p>The form asks for:</p>
+<ul>
+  <li><strong>Instance connection name</strong>, such as <code>my-project:europe-west2:my-instance</code>, shown on the instance's Overview page in the Cloud console.</li>
+  <li><strong>Database</strong> and <strong>Database user</strong>, and the user's <strong>Password</strong>. The password is kept in Connecto's vault, under the project, and never shown again. With <strong>Sign in to the database with IAM</strong> on, there is no password: the user is the service account's IAM user and Connecto signs in with an OAuth token.</li>
+  <li><strong>Google credential</strong>: a <strong>Service account key</strong> (click <strong>Import key file…</strong>; the key goes into the vault, and Connecto offers to move the downloaded file to the Trash), or <strong>My gcloud login</strong> (your own <code>gcloud auth application-default login</code>, used while it is valid).</li>
+  <li><strong>IP type</strong>: Public, Private or Private Service Connect. The private types work only while this Mac is on that network, through a VPN for instance.</li>
+</ul>
+<p><strong>Test connection</strong> reports each step on its own line: credential loaded (with the identity's email), instance found, ephemeral certificate issued, TLS to the server verified, signed in, and whether the queue schema is there. Then use <strong>Create queue and link</strong> or <strong>Validate existing queue</strong> as for any database.</p>
+
+<h3 id="cloudsql-setup">How to set it up</h3>
+<p>The sheet shows these steps under <strong>How to set this up</strong>, filled in with what you typed and ready to copy. <code>&lt;PROJECT&gt;</code>, <code>&lt;INSTANCE&gt;</code>, <code>&lt;DB&gt;</code> and <code>&lt;USER&gt;</code> stand for your Google project, instance, database and database user.</p>
+<p><strong>1. Create a service account for Connecto</strong> (once per Google project):</p>
+<pre><code>gcloud iam service-accounts create connecto-agentic-works \
+  --project=&lt;PROJECT&gt; --display-name="Connecto Agentic Works"
+gcloud projects add-iam-policy-binding &lt;PROJECT&gt; \
+  --member="serviceAccount:connecto-agentic-works@&lt;PROJECT&gt;.iam.gserviceaccount.com" \
+  --role="roles/cloudsql.client"</code></pre>
+<p><strong>2. Create its key and import it:</strong></p>
+<pre><code>gcloud iam service-accounts keys create ~/Downloads/connecto-&lt;PROJECT&gt;.json \
+  --iam-account=connecto-agentic-works@&lt;PROJECT&gt;.iam.gserviceaccount.com</code></pre>
+<p>Then click <strong>Import key file…</strong> and choose that file. Connecto keeps the key in its encrypted vault, and you can delete the downloaded copy.</p>
+<p><strong>3. Create the database role that owns the queue.</strong> Run this once, connected as an administrator of <code>&lt;DB&gt;</code> (Cloud SQL Studio in the console works):</p>
+<pre><code>CREATE ROLE &lt;USER&gt; LOGIN PASSWORD '&lt;a long password&gt;';
+GRANT CREATE ON DATABASE &lt;DB&gt; TO &lt;USER&gt;;
+-- Let your application write jobs without sharing its own credentials:
+GRANT &lt;USER&gt; TO &lt;your application's database role&gt;;</code></pre>
+<p>Connecto accepts a queue only when the role it connects with owns it and no other role has write grants on it. Role membership is not a grant, so the application can still write jobs through it.</p>
+<p><strong>4. Make sure the Cloud SQL Admin API is enabled</strong> (it usually already is):</p>
+<pre><code>gcloud services enable sqladmin.googleapis.com --project=&lt;PROJECT&gt;</code></pre>
+<p>You do <strong>not</strong> need to add this computer's IP to <em>Authorized networks</em>: access is granted by the service account.</p>
+
+<p><strong>With Sign in to the database with IAM</strong>, the service account also needs the Cloud SQL Instance User role, the instance needs IAM sign-in turned on, and the database user is an IAM user:</p>
+<pre><code>gcloud projects add-iam-policy-binding &lt;PROJECT&gt; \
+  --member="serviceAccount:connecto-agentic-works@&lt;PROJECT&gt;.iam.gserviceaccount.com" \
+  --role="roles/cloudsql.instanceUser"
+gcloud sql instances patch &lt;INSTANCE&gt; --project=&lt;PROJECT&gt; \
+  --database-flags=cloudsql.iam_authentication=on   # keep the instance's other flags!
+gcloud sql users create connecto-agentic-works@&lt;PROJECT&gt;.iam \
+  --instance=&lt;INSTANCE&gt; --project=&lt;PROJECT&gt; --type=cloud_iam_service_account</code></pre>
+<div class="note warn"><p><code>--database-flags</code> <b>replaces</b> the instance's flags: list the existing ones too. See them with <code>gcloud sql instances describe &lt;INSTANCE&gt; --format='value(settings.databaseFlags)'</code>.</p></div>
+<p>The database user is then <code>connecto-agentic-works@&lt;PROJECT&gt;.iam</code> (leave <strong>Database user</strong> empty to use it). Grant it <code>CREATE ON DATABASE</code> as in step 3, and grant it to the application role.</p>
+
+<p><strong>With My gcloud login</strong> instead of a key, run only:</p>
+<pre><code>gcloud auth application-default login</code></pre>
+<p>Your own Google account needs <code>roles/cloudsql.client</code> on <code>&lt;PROJECT&gt;</code>. Connecto uses that login while it is valid. A service account key keeps working without it.</p>
+
+<h3 id="cloudsql-errors">When it does not connect</h3>
+<ul>
+  <li><em>"… needs the role Cloud SQL Client"</em>: grant <code>roles/cloudsql.client</code> on the project to that identity (step 1).</li>
+  <li><em>"Enable the Cloud SQL Admin API"</em>: run step 4.</li>
+  <li><em>"Instance … not found"</em>: check the project, region and instance in the connection name.</li>
+  <li><em>"The instance has no public IP"</em>: choose Private or Private Service Connect, and connect this Mac to that network.</li>
+  <li><em>"The server is not …"</em>: the server's certificate is for another instance. Connecto stops there.</li>
+</ul>
+
+<h2 id="types">Define a work type</h2>
+<p>In the same sheet, under <strong>Work types</strong>:</p>
+<ol>
+  <li><strong>Discuss.</strong> Name the type (such as <code>summary</code>), choose Claude or Codex, and click <strong>Open authoring session</strong>. A terminal opens where the agent asks what the work should do, what the prompt will contain and what JSON you need. When you agree, it replies with the instructions and the schema.</li>
+  <li><strong>Review.</strong> Back in <strong>Terminal → Agentic Works…</strong>, enter the same work type and click <strong>Import author reply</strong>. Read and edit the fields. The instructions must contain <code>{{prompt}}</code> and the schema must be a valid JSON Schema. The setup and prepare fields are optional: see <a href="#commands">Setup and prepare commands</a>.</li>
+  <li><strong>Publish.</strong> Click <strong>Publish reviewed definition</strong>. If the type has a setup command, it runs first, and the type is published only when it succeeds. To change a type later, import or edit it again and click <strong>Replace published definition</strong>.</li>
+</ol>
+<p>A small example. Instructions:</p>
+<pre>Read {{prompt}} and summarize it in three sentences for a new developer.</pre>
+<p>Schema:</p>
+<pre>{
+  "type": "object",
+  "required": ["summary"],
+  "properties": { "summary": { "type": "string" } }
+}</pre>
+<p>Connecto adds the schema to the prompt itself and asks for one JSON value as the final answer, so your instructions need not repeat it.</p>
+
+<h3 id="commands">Setup and prepare commands</h3>
+<p>Some work needs the machine ready, or files made, before an agent can start: a Python environment, a tool such as <code>ffmpeg</code>, a video cut into pieces. A work type can name two commands for that. <strong>Connecto runs them, not the agent</strong>, so the agent needs no shell access and no approvals for them.</p>
+<pre>{
+  "setup":   { "argv": ["tool/connecto_setup.sh"] },
+  "prepare": { "argv": [".venv/bin/python", "tool/connecto_prepare.py"], "timeout_s": 900 }
+}</pre>
+<ul>
+  <li><strong>setup</strong> runs when you publish the type, and again when you click <strong>Re-run setup</strong> next to the type. It runs in a shell terminal named <code>setup &lt;type&gt; · &lt;project&gt;</code>, in the <strong>agentic jobs</strong> project: the <code>agentic jobs</code> folder of your <a href="packages.html#connecto-home">Connecto Home</a>, which Connecto opens in the <strong>Connecto Internal</strong> sidebar group, next to Automations. Watch it there and answer it if it asks for something, such as a password. It has no time limit. If it succeeds, its terminal closes and the type is published; if not, the type is not published and the terminal stays open so you can read why. The sheet shows when setup last succeeded. Setup needs Connecto Home to be chosen in Settings.</li>
+  <li><strong>prepare</strong> runs before each job, before the agent's terminal opens. It reads the job's <code>prompt</code> on standard input and must print one JSON value (at most 256 KiB). That JSON replaces <code>{{prepared}}</code> in the instructions. If it exits with an error, the job fails with the end of its error output as the reason, and no agent starts.</li>
+  <li>If prepare exits with code <strong>75</strong> (prerequisites missing), Connecto runs setup once more, in its terminal, and then prepare once more. This setup must finish within the job's 30 minutes.</li>
+  <li>prepare gets <code>CONNECTO_JOB_ID</code>, <code>CONNECTO_WORK_TYPE</code>, and <code>CONNECTO_JOB_DIR</code>: a new, empty folder under <code>.connecto/works/</code> in the project for the job's files. The agent can read it, since it is inside the project. Connecto deletes it when the job ends, and deletes any left over the next time it starts.</li>
+</ul>
+<p>The rules:</p>
+<ul>
+  <li><code>argv</code> is a list of strings, never a shell line. Its first item is a program name looked up on <code>PATH</code>, such as <code>ffmpeg</code>, or a path relative to the project, such as <code>tool/setup.sh</code>. Absolute paths and <code>..</code> are refused.</li>
+  <li><code>timeout_s</code> limits prepare: 1 to 1800 seconds, 600 if left out. Prepare also stops when the job's 30 minutes run out. Setup has no limit, so it ignores <code>timeout_s</code>.</li>
+  <li>The instructions contain <code>{{prepared}}</code> exactly when the type has a prepare command.</li>
+  <li>Both run in the work type's project folder. Prepare gets only <code>PATH</code>, <code>HOME</code>, <code>LANG</code> and <code>TMPDIR</code> from Connecto's environment, so no secret reaches it; Pause, Stop and closing the project end it along with everything it started. Setup runs in your login shell, with the environment your shell's startup files give it, plus <code>CONNECTO_WORK_TYPE</code>; closing its terminal ends it.</li>
+  <li>argv items may not contain control characters, such as a line break.</li>
+  <li>Each run is written to the <a href="safety.html">audit log</a> with its exit code and duration, never its output.</li>
+</ul>
+<div class="note warn"><p><b>These commands run with your rights, outside the agent's permissions.</b> Read every argument before publishing. A command that names a file in the project runs whatever that file contains when the job starts, so treat changes to those files like changes to the type.</p></div>
+
+<h2 id="queue">Queue a job</h2>
+<p>Insert a row with the project's name as the sidebar shows it, and a published work type:</p>
+<pre>INSERT INTO connecto_works.connecto_jobs (project_name, work_type, prompt)
+VALUES ('My Project', 'summary', 'the README in this project')
+RETURNING id;</pre>
+<p>Then read its outcome:</p>
+<pre>SELECT status, result, reason
+FROM connecto_works.connecto_jobs
+WHERE id = 42;</pre>
+<p>Always write the schema name: the table is <code>connecto_works.connecto_jobs</code>, not in <code>public</code>.</p>
+
+<h3 id="columns">The columns</h3>
+<table>
+  <tr><th>Column</th><th>You set it</th><th>Meaning</th></tr>
+  <tr><td><code>project_name</code></td><td>yes</td><td>The project, by its name in Connecto. If you rename the project, update its pending rows.</td></tr>
+  <tr><td><code>work_type</code></td><td>yes</td><td>A published work type.</td></tr>
+  <tr><td><code>prompt</code></td><td>yes</td><td>What replaces <code>{{prompt}}</code> in the instructions.</td></tr>
+  <tr><td><code>session_cli</code></td><td>optional</td><td>The agent that does the work: <code>claude</code>, <code>codex</code>, <code>pi</code> or <code>opencode</code>. Blank or <code>agy</code> (the default) gives the project's <strong>Agent for jobs</strong>: Automatic uses Antigravity when the project can, and otherwise a stand-in (Codex, Claude Code, Pi or OpenCode, the first usable).</td></tr>
+  <tr><td><code>model</code></td><td>optional</td><td>A model that agent accepts, such as <code>sonnet</code>. Empty or <code>default</code> uses the agent's default. Used when the job names its agent, or Antigravity runs it; an agent the project chose for jobs uses the model set there, and a stand-in its fixed model: Codex runs <code>gpt-6.1-terra</code> and Claude runs <code>haiku</code>, while Pi and OpenCode use their defaults.</td></tr>
+  <tr><td><code>effort</code></td><td>optional</td><td>A reasoning effort that agent accepts, such as <code>low</code> or <code>high</code>. Empty or <code>default</code> leaves it alone. Used when the job names its agent, or Antigravity runs it; a stand-in, or another agent the project chose for jobs, gets none.</td></tr>
+  <tr><td><code>status</code></td><td>no</td><td>See below.</td></tr>
+  <tr><td><code>result</code></td><td>no</td><td>The agent's answer, as JSON that matched the schema.</td></tr>
+  <tr><td><code>reason</code></td><td>no</td><td>Why a job failed or timed out.</td></tr>
+  <tr><td><code>id</code>, <code>created_at</code>, <code>claimed_at</code>, <code>attempt</code></td><td>no</td><td>Kept by the database and by Connecto.</td></tr>
+</table>
+<p>A job for Claude on a chosen model:</p>
+<pre>INSERT INTO connecto_works.connecto_jobs
+  (project_name, work_type, prompt, session_cli, model, effort)
+VALUES ('My Project', 'summary', 'docs/architecture.md', 'claude', 'sonnet', 'low');</pre>
+
+<h3 id="status">Statuses</h3>
+<table>
+  <tr><th>Status</th><th>Meaning</th></tr>
+  <tr><td><code>to_do</code></td><td>Waiting to be claimed.</td></tr>
+  <tr><td><code>doing</code></td><td>Claimed: an agent is working on it.</td></tr>
+  <tr><td><code>done_from_agent</code></td><td>Finished. <code>result</code> holds the JSON.</td></tr>
+  <tr><td><code>failed</code></td><td>Ended without a valid answer. <code>reason</code> says why.</td></tr>
+  <tr><td><code>timeout</code></td><td>Not finished within 30 minutes of being claimed.</td></tr>
+</table>
+
+<h2 id="running">Order and timing</h2>
+<ul>
+  <li>About every <strong>five seconds</strong>, while Connecto runs, the project is open and nothing is paused, Connecto looks for a job.</li>
+  <li>Within each database, Connecto claims the <strong>newest</strong> available pending job for the project first.</li>
+  <li>A project runs <strong>one job at a time</strong> unless you raise <strong>Jobs at once</strong> in the sheet (1 to 32, or <code>connecto works parallel &lt;n&gt;</code>). With more, several jobs run side by side, from one database or several; the databases share the places fairly, and Connecto looks again as soon as a job ends.</li>
+  <li>Each job runs in its own terminal, named <code>agentic_works_&lt;id&gt;_…</code>, which appears in the project while it works. It is closed when the job ends.</li>
+  <li>A job has <strong>30 minutes</strong> from its claim. A job whose agent leaves <a href="terminals.html#background">background work</a> running is not finished until that work ends.</li>
+</ul>
+
+<h3 id="failures">What ends a job early</h3>
+<ul>
+  <li><strong>Pause</strong>, Stop, closing the project, or closing its terminal.</li>
+  <li>The agent's CLI stops at an approval prompt, a choice on screen or a login. Nobody is there to answer it, so the job fails. Use a launch mode without prompts for projects that take jobs. (A question the agent asks you with <code>connecto works ask</code> is different: the job waits for your answer and goes on.)</li>
+  <li>The agent fails to start, its turn is interrupted, or the session ends.</li>
+  <li>The type's prepare command fails, times out, or prints something other than one JSON value.</li>
+  <li>The final answer is not JSON, or does not match the schema. The reason names where it did not match.</li>
+</ul>
+<p>Connecto records each outcome on this Mac before writing it to the database. If the database cannot be reached, the outcome is delivered once it can. A job is never started again on its own: an uncertain attempt stays failed or timed out, and you can insert it again yourself. If the connection drops while a claim is being saved, that row can stay <code>doing</code> until its 30 minutes run out.</p>
+
+<h2 id="agent">Set it up from an agent</h2>
+<p>An agent in one of the project's terminals can do all of the above with the <code>connecto works</code> command, without the sheet: ask it to "set up an agentic work that …". It reaches only its own project. The built-in Connecto package gives Claude and Codex the <strong>agentic-works</strong> skill, which walks through these steps.</p>
+<pre><code>connecto works show                                   # link, work types, last outcome
+connecto secret request WORKS_DB --agentic-works --reason '…'
+connecto works test-db --secret WORKS_DB              # each step, changes nothing
+connecto works link --secret WORKS_DB --create        # or without --create to validate
+connecto works publish summary --file summary.json    # {"instructions", "schema", "setup"?, "prepare"?}
+connecto works test summary --prompt 'the README'     # queues a job, prints its id
+connecto works job 42                                 # status, result JSON, reason</code></pre>
+<h3 id="agent-rights">What an agent may do</h3>
+<p>Linking a database, publishing a type, running setup, queuing a job and importing a key make Connecto run commands, start agents or replace a credential with your rights. From the command line only an agent that Connecto started in <strong>Bypass</strong> mode may do them: it can already run any command without asking, so this gives it nothing new. Connecto reads the mode from the agent's own launch, not from anything the agent says.</p>
+<ul>
+  <li>An agent started in <strong>Auto</strong> or <strong>Prompt</strong> mode, or a shell, may only read: <code>show</code>, <code>check</code>, <code>test-db</code>, <code>guide</code> and <code>job</code>. When it publishes, nothing is published: Connecto only records its terminal as the work type's author, so that the sheet can import its reply. The agent ends its turn with the definition as its reply, and you click <strong>Import author reply</strong> for that work type in the sheet, review it and publish it. Linking, setup, jobs and key imports it leaves to you.</li>
+  <li>The agent of a job, in an <code>agentic_works_…</code> terminal, can never change Agentic Works: its prompt comes from the queue. Nor can a terminal it started with <code>connecto add</code>, or one those started: Connecto marks each when it makes it, in the project's saved terminal list, and the mark stays whoever closes the job's terminal, through restarts and a new parent.</li>
+  <li>The mode is the one of the very session that runs the command: a restart in another mode does not carry it over.</li>
+  <li>Each <code>connecto works</code> command that changes something goes in the audit log with the terminal that ran it.</li>
+  <li>Under <a href="safety.html">Pause</a>, only the reading commands work, and <code>test-db</code> only for the linked database.</li>
+</ul>
+<h3 id="agent-secrets">Secrets</h3>
+<ul>
+  <li>Secret values never reach the agent. It asks you for a connection string with <code>connecto secret request &lt;NAME&gt; --agentic-works</code>. You type it in Connecto, and it is kept as an <strong>Agentic Works database</strong> secret of the project.</li>
+  <li>A Cloud SQL password is asked for by Connecto itself: the first <code>test-db</code> or <code>link</code> for a user and instance shows you a request naming both. That password is used for that user on that instance only, never as a connection string, and no other secret stands in for it.</li>
+  <li><code>connecto works key-import &lt;file.json&gt;</code> (Bypass only, since it replaces the key kept for that account) reads the key file with the terminal's own rights, as the agent could, and only a regular file up to 64 KiB. The key goes into the vault and is never printed.</li>
+  <li>Replies never show a vault value: results, reasons and notices are cleaned of them, and JSON stays JSON.</li>
+</ul>
+<p>For Google Cloud SQL, <code>connecto works guide --cloudsql …</code> prints the setup steps above and the <code>link</code> command that fits them. <code>link</code> takes <code>--cloudsql</code>, <code>--database</code>, <code>--user</code>, <code>--key</code> or <code>--adc</code>, <code>--ip public|private|psc</code> and <code>--iam</code>. <code>connecto works check</code> validates a definition without publishing it: a definition is the same JSON object an authoring session replies with. A type with a setup command starts setup in its terminal, as from the sheet. <code>publish</code> waits a few seconds for it, then says that setup is still running, and <code>connecto works show</code> tells when the type is published.</p>
+
+<h2 id="safety">Who may write to the queue</h2>
+<div class="note warn"><p><b>Writing a job starts an agent in your project.</b> It runs with the project's launch mode, including <strong>Bypass</strong> when the project uses it, and can read and change the project's files. Give write access to the queue only to programs you would trust with that.</p></div>
+<ul>
+  <li>Producers use the role that owns the queue, or a connection you control that runs as it. Connecto checks the grants before every claim and stops if any other role can write.</li>
+  <li>Readers that only need results can be granted <code>SELECT</code>.</li>
+  <li>A job's <code>prompt</code> reaches a prepare command only as standard input: never as an argument, an environment variable or a file name.</li>
+  <li><a href="safety.html">Pause</a> stops a running job and keeps new ones from being claimed.</li>
+</ul>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>

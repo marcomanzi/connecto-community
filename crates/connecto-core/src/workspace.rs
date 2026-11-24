@@ -32,6 +32,8 @@ pub struct ProjectView {
     pub expanded: bool,
     /// The terminal last shown in this project, restored at launch.
     pub active_terminal: Option<String>,
+    /// The id of the sidebar group it is in ([`WorkspaceView::groups`]), if any.
+    pub group: Option<String>,
 }
 
 impl fmt::Debug for ProjectView {
@@ -44,8 +46,18 @@ impl fmt::Debug for ProjectView {
             .field("error", &self.error)
             .field("expanded", &self.expanded)
             .field("active_terminal", &self.active_terminal)
+            .field("group", &self.group)
             .finish()
     }
+}
+
+/// A named group of projects in the sidebar. Only a label: a project in a
+/// group runs as any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectGroup {
+    /// Stable while the group exists (`group-1`, `group-2` ...).
+    pub id: String,
+    pub name: String,
 }
 
 /// A project in File > Open Recent.
@@ -60,6 +72,8 @@ pub struct RecentProject {
 pub struct WorkspaceView {
     /// In sidebar order.
     pub projects: Vec<ProjectView>,
+    /// The sidebar's project groups, in the order they are shown.
+    pub groups: Vec<ProjectGroup>,
     /// The project shown, by id.
     pub active: Option<String>,
     /// Newest first, at most ten. Open projects are included.
@@ -70,6 +84,8 @@ pub struct WorkspaceView {
     /// A standing warning, such as an unreadable `workspace.json` kept aside.
     pub warning: Option<String>,
 }
+
+const GROUPS_UNAVAILABLE: &str = "Project groups are not available here.";
 
 /// User commands on the workspace. Each returns promptly and is persisted by
 /// the workspace, so a relaunch restores it.
@@ -96,6 +112,30 @@ pub trait WorkspaceControl: Send + Sync {
     fn move_project(&self, project: &str, index: usize);
 
     fn set_expanded(&self, project: &str, expanded: bool);
+
+    /// Make a group named `name` (one line, not empty). It shows at once,
+    /// empty; projects are put in it with [`Self::set_project_group`].
+    fn create_group(&self, name: &str) -> Result<(), String> {
+        let _ = name;
+        Err(GROUPS_UNAVAILABLE.to_owned())
+    }
+
+    fn rename_group(&self, group: &str, name: &str) -> Result<(), String> {
+        let _ = (group, name);
+        Err(GROUPS_UNAVAILABLE.to_owned())
+    }
+
+    /// Remove a group. Its projects stay open, with no group.
+    fn delete_group(&self, group: &str) -> Result<(), String> {
+        let _ = group;
+        Err(GROUPS_UNAVAILABLE.to_owned())
+    }
+
+    /// Put a project in a group, or take it out of its group (`None`).
+    fn set_project_group(&self, project: &str, group: Option<&str>) -> Result<(), String> {
+        let _ = (project, group);
+        Err(GROUPS_UNAVAILABLE.to_owned())
+    }
 
     fn set_sidebar_collapsed(&self, collapsed: bool);
 
@@ -143,4 +183,53 @@ pub trait WorkspaceControl: Send + Sync {
     fn set_secrets_in_system_store(&self, on: bool) {
         let _ = on;
     }
+
+    /// Clone the git repository at `url` into a new folder inside `parent`,
+    /// named after the repository, with the system's git (its credential
+    /// helpers and SSH agent; Connecto never asks for a password). The folder
+    /// must not exist yet. Returns at once, before any disk work (a refusal
+    /// found then ends the task as failed); once the task is done, open
+    /// [`crate::project_files::ProjectTask::published`], the folder it was
+    /// published to by its real path.
+    fn clone_project(
+        &self,
+        url: &str,
+        parent: &Path,
+    ) -> Result<crate::project_files::Cloning, String> {
+        let _ = (url, parent);
+        Err(PROJECT_FILES_UNAVAILABLE.to_owned())
+    }
+
+    /// What deleting `project` would remove, or why it is refused (home, a
+    /// system folder, a folder holding other projects or Connecto's data, a
+    /// link). Unlike the rest, this reads the disk (git status, a count of the
+    /// files): call it off the UI thread.
+    fn plan_delete(&self, project: &str) -> Result<crate::project_files::DeletePlan, String> {
+        let _ = project;
+        Err(PROJECT_FILES_UNAVAILABLE.to_owned())
+    }
+
+    /// Close the project `plan` was made for, stop its terminals and
+    /// background work, then move its folder to the system's trash and forget
+    /// it: out of the recents, its terminal list and history gone. Refused
+    /// when the folder is no longer the one `plan` describes, and for the
+    /// refusals of [`Self::plan_delete`]. Nothing is ever deleted for good.
+    /// Returns at once, without touching the disk: the folder's checks run
+    /// before anything stops, and a refusal they find ends the task as
+    /// failed. The plan's hold on the folder goes with the task.
+    fn delete_project(
+        &self,
+        plan: &crate::project_files::DeletePlan,
+    ) -> Result<Arc<dyn crate::project_files::ProjectTask>, String> {
+        let _ = plan;
+        Err(PROJECT_FILES_UNAVAILABLE.to_owned())
+    }
+
+    /// The confirmation for `plan` closed without a deletion: what the
+    /// workspace held open for it is let go. Returns at once.
+    fn release_delete_plan(&self, plan: &crate::project_files::DeletePlan) {
+        let _ = plan;
+    }
 }
+
+const PROJECT_FILES_UNAVAILABLE: &str = "This is not available here.";

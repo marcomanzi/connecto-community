@@ -8,12 +8,12 @@
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub(crate) use macos::{alive, descendants, kill, parent_of};
+pub(crate) use macos::{Known, alive, descendants, kill, parent_of};
 
 #[cfg(not(target_os = "macos"))]
 mod listed;
 #[cfg(not(target_os = "macos"))]
-pub(crate) use listed::{alive, descendants, kill, parent_of};
+pub(crate) use listed::{Known, alive, descendants, kill, parent_of};
 #[cfg(windows)]
 pub(crate) use listed::{exists, started_by};
 

@@ -9,7 +9,17 @@ and answers each prompt. Behaviour comes from words in the prompt:
   NEEDS         raise a notification
   RUN <cmd>     run a shell command (the agent using `connecto`) and put its output in the reply
   NOREPLY       end the turn with no reply text
+  FOOTER        print an input box's bottom rule and Connecto's Claude status line
+                at 23% context, as a footer is shown
   BG1           end the turn leaving background work b1 running (no follow-up turn)
+  TWINS         end the turn leaving two background shells, b1 and b2, that run the
+                same command, as real snapshot shells (children of this process)
+  CONTINUE      after the Stop, another Stop hook keeps the turn going: the log shows
+                work 1 s later, the turn ends 3 s after that, and Stop fires again
+                with stop_hook_active
+  APIFAIL       the turn ends in an API error: an error record, and StopFailure
+                instead of Stop
+  LATEEND       the turn's end record is written 3 s after its Stop
   MERGE         a background task's notification is queued into this turn, as Claude
                 does: its hook fires and the log gets an attachment record, and the
                 turn's one Stop ends both
@@ -19,6 +29,14 @@ Boot behaviour comes from files in the working folder, per terminal:
   boot-delay-<id>   seconds to spend starting (MCP servers) before it is ready
   boot-exit-<id>    a message to print, then exit with code 3, before it is ready
   boot-screen-<id>  text to show while it boots (a blocking prompt, say)
+  composer-<id>     typed characters, Backspace, Left/Right and Shift+Enter edit the
+                    composer as a TUI's do (otherwise only pastes reach it and keys
+                    are logged)
+  selfstart-<id>    once, when a pasted `[connecto notice]` lands, a background task's
+                    notification starts a turn by itself (its prompt hook fires) and
+                    the turn ends 2 s later. A prompt entered while it runs is
+                    logged to midturn-<id>.log: the tool would have queued it into
+                    that turn
 
 Everything it saw is written beside it: typed.log (one JSON per prompt), keys.log,
 context-<n>.txt (what the helper printed for each prompt).
@@ -58,7 +76,8 @@ def transcript(entry):
     """Claude's transcript: one JSON per line, under the profile."""
     base = os.environ.get("CLAUDE_CONFIG_DIR")
     if TOOL == "claude" and base:
-        with open(os.path.join(base, "t.jsonl"), "a") as log:
+        # One transcript per session, as Claude keeps.
+        with open(os.path.join(base, "t-%s.jsonl" % ME), "a") as log:
             log.write(json.dumps(entry) + "\n")
 
 
@@ -103,6 +122,9 @@ def run_turn(prompt):
         log.write(json.dumps({"prompt": prompt}) + "\n")
     print("PROMPT-SEEN: " + prompt.replace("\n", " | "), flush=True)
     sys.stdout.write("\r")
+    if "FOOTER" in prompt.split():
+        print("─" * 40 + "\r", flush=True)
+        print("  Opus 5.5 · high  |  [████░░░░░░░░░░░░░░░░] 23% (230k/1M)  |  $1.00\r", flush=True)
     ctx = hook("UserPromptSubmit", {"prompt": prompt, "turn_id": turn, "session_id": thread}, context=True)
     with open("context-%s-%d.txt" % (ME, n_prompts), "w") as out:
         out.write(ctx)
@@ -137,19 +159,58 @@ def run_turn(prompt):
         note = "<task-notification><task-id>b1</task-id>done</task-notification>"
         transcript({"type": "attachment", "attachment": {"type": "queued_command", "prompt": note}})
         hook("UserPromptSubmit", {"prompt": note, "session_id": thread}, context=True)
-        transcript({"type": "assistant", "message": {"role": "assistant", "stop_reason": "end_turn", "content": []}})
+    end_turn = {"type": "assistant", "message": {"role": "assistant", "stop_reason": "end_turn", "content": []}}
+    if TOOL == "claude" and "APIFAIL" in words:
+        failure = {"type": "assistant", "isApiErrorMessage": True, "message": {"role": "assistant", "stop_reason": "stop_sequence", "content": [{"type": "text", "text": "API Error: 529 overloaded"}]}}
+        if "LATEEND" not in words:
+            transcript(failure)
+        hook("StopFailure", {"session_id": thread, "error": "overloaded", "last_assistant_message": "API Error: 529 overloaded"})
+        if "LATEEND" in words:
+            time.sleep(3.0)
+            transcript(failure)
+        return
     if TOOL == "claude":
+        # Claude logs the turn's end before it runs the Stop hook.
+        if "LATEEND" not in words:
+            transcript(end_turn)
         payload = {"session_id": thread, "background_tasks": []}
         if reply is not None:
             payload["last_assistant_message"] = reply
-        if "BACKGROUND" in words or "BG1" in words:
+        if "BACKGROUND" in words:
+            payload["background_tasks"] = [{"id": "b1", "type": "shell", "status": "running",
+                                            "description": "Wait for the build", "command": "sleep 10"}]
+        elif "BG1" in words:
             payload["background_tasks"] = [{"id": "b1"}]
+        elif "TWINS" in words:
+            # Shaped as Claude runs a background command, so the stop finds them.
+            snaps = os.path.join(os.getcwd(), "shell-snapshots")
+            os.makedirs(snaps, exist_ok=True)
+            snap = os.path.join(snaps, "snapshot-sh-%s.sh" % ME)
+            with open(snap, "w") as out:
+                out.write("true\n")
+            twin = "sleep 30 ; true"
+            for _ in range(2):
+                subprocess.Popen(["/bin/sh", "-c", "source '%s' 2>/dev/null || true && eval '%s' < /dev/null" % (snap, twin)],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            payload["background_tasks"] = [{"id": b, "type": "shell", "status": "running",
+                                            "description": "Wait", "command": twin} for b in ("b1", "b2")]
         hook("Stop", payload)
+        if "LATEEND" in words:
+            time.sleep(3.0)
+            transcript(end_turn)
+        if "CONTINUE" in words:
+            time.sleep(1.0)
+            transcript({"type": "assistant", "message": {"role": "assistant", "stop_reason": "tool_use", "content": []}})
+            time.sleep(3.0)
+            transcript(end_turn)
+            hook("Stop", {"session_id": thread, "background_tasks": [], "stop_hook_active": True, "last_assistant_message": "continued"})
         if "BACKGROUND" in words:
             time.sleep(10.0)
             bg = "<task-notification><task-id>b1</task-id>done</task-notification>"
+            transcript({"type": "user", "message": {"role": "user", "content": bg}})
             hook("UserPromptSubmit", {"prompt": bg, "session_id": thread}, context=True)
             time.sleep(0.2)
+            transcript({"type": "assistant", "message": {"role": "assistant", "stop_reason": "end_turn", "content": []}})
             hook("Stop", {"session_id": thread, "background_tasks": [], "last_assistant_message": "background finished"})
     else:
         notify(turn, inputs_seen, reply)
@@ -175,14 +236,21 @@ if __name__ == "__main__":
         print(open("boot-exit-%s" % ME).read().strip() + "\r", flush=True)
         sys.exit(3)
     if HOOKED:
-        hook("SessionStart", {"session_id": thread, "transcript_path": os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", os.environ.get("CODEX_HOME", "/nonexistent")), "t.jsonl")})
+        hook("SessionStart", {"session_id": thread, "transcript_path": os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", os.environ.get("CODEX_HOME", "/nonexistent")), "t-%s.jsonl" % ME)})
     sys.stdout.write("\x1b[?2004h")
     print("FAKE-READY\r", flush=True)
     buf = b""
     pasted = None
     text = []
+    composer = os.path.exists("composer-%s" % ME)
+    cursor = 0
+    self_until = None
     while True:
-        r, _, _ = select.select([fd], [], [], 0.2)
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if self_until is not None and time.time() >= self_until:
+            self_until = None
+            transcript({"type": "assistant", "message": {"role": "assistant", "stop_reason": "end_turn", "content": []}})
+            hook("Stop", {"session_id": thread, "background_tasks": [], "last_assistant_message": "noted"})
         if not r:
             continue
         data = os.read(fd, 65536)
@@ -200,10 +268,23 @@ if __name__ == "__main__":
                     break
                 pasted += buf[:k]
                 buf = buf[k + 6:]
-                text.append(pasted.decode(errors="replace").replace("\r", "\n"))
+                chunk = pasted.decode(errors="replace").replace("\r", "\n")
+                if composer:
+                    text[cursor:cursor] = list(chunk)
+                    cursor += len(chunk)
+                else:
+                    text.append(chunk)
                 with open("pasted-%s.log" % ME, "a") as log:
-                    log.write("%d\n" % len(text[-1]))
-                print("PASTED %d\r" % len(text[-1]), flush=True)
+                    log.write("%d\n" % len(chunk))
+                print("PASTED %d\r" % len(chunk), flush=True)
+                if "[connecto notice]" in chunk and os.path.exists("selfstart-%s" % ME):
+                    os.remove("selfstart-%s" % ME)
+                    note = "<task-notification><task-id>b9</task-id>done</task-notification>"
+                    transcript({"type": "user", "message": {"role": "user", "content": note}})
+                    with open("typed-%s.log" % ME, "a") as log:
+                        log.write(json.dumps({"prompt": note}) + "\n")
+                    hook("UserPromptSubmit", {"prompt": note, "session_id": thread}, context=True)
+                    self_until = time.time() + 2.0
                 pasted = None
                 progress = True
                 continue
@@ -212,11 +293,43 @@ if __name__ == "__main__":
                 pasted = b""
                 progress = True
                 continue
+            if composer and buf[:1] == b"\x1b":
+                if b"\x1b[200~".startswith(buf) or (len(buf) < 3 and b"\x1b[".startswith(buf)):
+                    break  # the rest of the sequence is still on its way
+                if len(buf) < 2:
+                    break
+                if buf[:2] == b"\x1b\r":  # Shift+Enter: a newline in the draft
+                    text[cursor:cursor] = ["\n"]
+                    cursor += 1
+                    buf = buf[2:]
+                    progress = True
+                    continue
+                if buf[:3] in (b"\x1b[C", b"\x1b[D"):
+                    if buf[2:3] == b"C":
+                        cursor = min(cursor + 1, len(text))
+                    else:
+                        cursor = max(cursor - 1, 0)
+                    buf = buf[3:]
+                    progress = True
+                    continue
             ch, buf = buf[:1], buf[1:]
             progress = True
+            if composer and ch == b"\x7f":
+                if cursor > 0:
+                    del text[cursor - 1]
+                    cursor -= 1
+                continue
+            if composer and ch >= b" " and ch < b"\x7f":
+                text[cursor:cursor] = [ch.decode()]
+                cursor += 1
+                continue
             if ch == b"\r":
                 prompt = "".join(text)
                 text = []
+                cursor = 0
+                if self_until is not None and prompt.strip():
+                    with open("midturn-%s.log" % ME, "a") as log:
+                        log.write(json.dumps({"prompt": prompt}) + "\n")
                 if "SWALLOW" in prompt:
                     pass  # a menu took it: no hook, no turn
                 elif prompt.strip():

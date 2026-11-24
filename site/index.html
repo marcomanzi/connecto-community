@@ -5,9 +5,9 @@
 <script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Connecto — your coding agents, connected</title>
-<meta name="description" content="Connecto is a macOS app that runs Claude Code and Codex in real terminals, side by side, and lets them work together: agents ask each other, automations answer prompts, and skills packages follow every project.">
+<meta name="description" content="Connecto is a macOS app that runs Claude Code, Codex, Pi and Antigravity CLI in real terminals, side by side, and lets them work together: agents ask each other, automations answer prompts, and skills packages follow every project.">
 <meta property="og:title" content="Connecto — your coding agents, connected">
-<meta property="og:description" content="Run Claude Code and Codex in real terminals and let them work together. Automations, skills packages, isolated profiles and remote sessions.">
+<meta property="og:description" content="Run Claude Code, Codex, Pi and Antigravity CLI in real terminals and let them work together. Automations, skills packages, isolated profiles and remote sessions.">
 <meta property="og:image" content="assets/img/logo-640.png">
 <meta name="theme-color" content="#0b1520">
 <link rel="icon" href="assets/img/favicon.png">
@@ -37,16 +37,16 @@
 
 <section class="hero">
   <canvas id="net" aria-hidden="true"></canvas>
-  <div class="odo-ghost" id="odo-ghost" aria-hidden="true"></div>
+  <div class="odo-ghost" id="odo-ghost" aria-hidden="true" hidden></div>
   <div class="wrap">
-    <span class="eyebrow"><i></i>macOS<span class="if-win" hidden> · Windows</span> · Claude Code + Codex · more agents on the way</span>
+    <span class="eyebrow"><i></i>macOS<span class="if-win" hidden> · Windows</span> · Claude Code + Codex + Pi + Antigravity · <span id="count-trigger">more agents on the way</span></span>
     <h1>Your coding agents, <em>connected</em>.</h1>
-    <p class="lede">Connecto runs Claude Code and Codex in real terminals, side by side, and lets them work as a team. One agent asks another for a review, opens a helper, waits for the answer. You watch it all, and you hold the brake.</p>
+    <p class="lede">Connecto runs Claude Code, Codex, Pi and Antigravity CLI in real terminals, side by side, and lets them work as a team. One agent asks another for a review, opens a helper, waits for the answer. You watch it all, and you hold the brake.</p>
     <div class="cta">
       <a class="btn btn-primary" id="hero-dl" href="#download">Download for macOS</a>
       <a class="btn btn-ghost" href="docs/">Read the docs →</a>
     </div>
-    <div class="odo" id="odo" role="status" aria-live="polite">
+    <div class="odo" id="odo" role="status" aria-live="polite" hidden>
       <div class="odo-head"><span class="odo-live"><i></i>LIVE</span><span class="odo-label">Downloads of Connecto</span></div>
       <div class="odo-digits" id="odo-digits" aria-hidden="true"></div>
       <p class="odo-foot"><span id="odo-text">Counting downloads…</span><span class="odo-week" id="odo-week" hidden></span></p>
@@ -84,7 +84,8 @@
     <div class="label">One window for every agent CLI</div>
     <span class="chip"><i class="dot done"></i>Claude Code</span>
     <span class="chip"><i class="dot done"></i>Codex</span>
-    <span class="chip next">Gemini CLI <em>next</em></span>
+    <span class="chip"><i class="dot done"></i>Pi</span>
+    <span class="chip"><i class="dot done"></i>Antigravity CLI</span>
     <span class="chip next">Cursor CLI <em>next</em></span>
     <span class="chip next">opencode <em>next</em></span>
   </div>
@@ -213,7 +214,35 @@ EOF
       </div>
     </div>
 
-    <div class="split rv" id="isolation">
+    <div class="split rv" id="memory">
+      <div>
+        <span class="kicker">Project Memory</span>
+        <h2>Each project remembers what its agents learned.</h2>
+        <p>Decisions, conventions and pitfalls, grouped in rooms, kept for each project. Agents read them with the <code>connecto memory</code> command and add to them as they work. It is off until you turn it on for a project.</p>
+        <ul>
+          <li>An initial build reads the project's files, git history and past conversations to fill it in.</li>
+          <li>While you work, notes are added in batches. A dream cycle tidies them into memories, each with its sources.</li>
+          <li>It lives on your computer, outside the repository. Connecto never writes <code>AGENTS.md</code> or <code>CLAUDE.md</code>.</li>
+          <li>Secrets are redacted before anything is stored or sent to a model. Its runs use your own Claude or Codex login.</li>
+        </ul>
+        <a class="more" href="docs/memory.html">How project memory works →</a>
+      </div>
+      <div class="vis">
+<div class="tree"><span class="c">Project memory</span> <span class="m">(off by default)</span>
+├─ <span class="c">ingresso</span>      <span class="m">the brief, read first</span>
+├─ <span class="c">architettura</span>  <span class="m">architecture</span>
+├─ <span class="c">officina</span>      <span class="m">procedures</span>
+├─ <span class="c">decisioni</span>     <span class="m">decisions</span>
+├─ <span class="c">problemi</span>      <span class="m">known problems</span>
+├─ <span class="c">lavori-aperti</span> <span class="m">open work</span>
+├─ <span class="c">convenzioni</span>   <span class="m">conventions</span>
+└─ <span class="c">archivio</span>      <span class="m">the archive</span>
+
+<span class="r">→ outside the repository</span></div>
+      </div>
+    </div>
+
+    <div class="split flip rv" id="isolation">
       <div>
         <span class="kicker">Isolated and system terminals</span>
         <h2>Keep a project separate. Or don't.</h2>
@@ -241,7 +270,7 @@ EOF
       </div>
     </div>
 
-    <div class="split flip rv" id="remote">
+    <div class="split rv" id="remote">
       <div>
         <span class="kicker">Remote sessions</span>
         <h2>The agents on your other Mac, in this window.</h2>
@@ -267,17 +296,74 @@ EOF
   </div>
 </section>
 
+<section id="game-dev">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <span class="kicker">Game Dev package</span>
+      <h2>Make a game with a team of agents.</h2>
+      <p>Game Dev is a built-in package for making games in Godot with coding agents: a design kept to a size you can finish, a Godot workflow that runs headless, 3D art from Blender scripts, and playtests that judge the game on what it really shows.</p>
+    </div>
+
+    <div class="shots rv">
+      <figure class="wide">
+        <img src="assets/img/game-dev/roots-ruins-farm.webp" width="1600" height="900" loading="lazy" alt="An isometric 3D farm at noon: tilled plots with sprouting crops inside a wooden fence, a stone well, round green trees, a river along the left edge, a greenhouse and a mine entrance in the rocks.">
+        <figcaption><b>The farm.</b> Crops, tools and a day that runs from dawn to night.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/img/game-dev/roots-ruins-boss.webp" width="1600" height="900" loading="lazy" alt="A dark stone dungeon lit in purple: a stone guardian slams the ground inside a glowing rune circle, with violet crystals around the room.">
+        <figcaption><b>The mines.</b> Five floors of rooms, ending in a fight with the Rune Guardian.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/img/game-dev/roots-ruins-village.webp" width="1600" height="900" loading="lazy" alt="A village square at dusk: a round fountain on a cobbled plaza, market stalls with striped awnings, lanterns and half-timbered houses with red roofs.">
+        <figcaption><b>The village.</b> Shops to sell the harvest to, at dusk.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/img/game-dev/roots-ruins-night.webp" width="1600" height="900" loading="lazy" alt="The farmhouse at night: a campfire glows under a canvas shelter, lit windows and a stone path, with a pink blossom tree in the dark.">
+        <figcaption><b>Night on the farm.</b> Light and shadow from Godot's renderer.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/img/game-dev/roots-ruins-art.webp" width="1600" height="1000" loading="lazy" alt="Game models in a row on a green background: leafy trees, a pink blossom tree, a dead tree, a boulder, a workbench, a stone furnace, a chest, a well with a red roof, ore rocks and a lantern post.">
+        <figcaption><b>The art.</b> Every model is a Blender script, exported as .glb.</figcaption>
+      </figure>
+    </div>
+    <p class="shots-note rv"><b>Roots &amp; Ruins</b>, an isometric farming game with a soulslike roguelite in its mines, built in Godot 4.7 with Game Dev by one coordinator and about a dozen agent sessions working in parallel. Four screenshots from the game's own playtests, and a preview of its models in Godot.</p>
+
+    <div class="split rv gd-split">
+      <div>
+        <h3>Three skills, three tools.</h3>
+        <ul>
+          <li><b>game-design</b>: a one-page design kept to solo size, with milestones you can see are done, and a guide for running many sessions at once.</li>
+          <li><b>godot-game</b>: the headless workflow, a test runner that really fails, the Godot gotchas, and art from Blender scripts to <code>.glb</code>.</li>
+          <li><b>game-playtest</b>: a bot that plays the game, and a verdict from screenshots, video frames and logs.</li>
+        </ul>
+        <a class="more" href="docs/game-dev.html">The Game Dev package →</a>
+      </div>
+      <div class="vis">
+<div class="tree"><span class="c">Game Dev</span> <span class="m">needs</span>
+├─ Godot 4.7+ (4.x)  <span class="m">the engine</span>
+├─ Blender 4.2+      <span class="m">3D models from scripts</span>
+└─ FFmpeg 4.4+       <span class="m">frames from recordings</span>
+
+<span class="r">→ Connecto checks for them, and installs
+  what is missing once you say yes</span>
+<span class="m">  (Blender and FFmpeg from Connecto 0.3.11)</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
 <section id="clis">
   <div class="wrap">
     <div class="sec-head center rv">
       <span class="kicker">Agents</span>
-      <h2>Two today. Three more next.</h2>
+      <h2>Four today. Two more next.</h2>
       <p>Connecto talks to each CLI through an adapter, so a new agent joins the same window, the same <code>connecto</code> command and the same brake as the others.</p>
     </div>
     <div class="road rv">
       <div class="cli live"><b>Claude Code</b><span>available</span><p>Terminals, bridge, automations, packages, history.</p></div>
       <div class="cli live"><b>Codex</b><span>available</span><p>Terminals, bridge, automations, packages, history.</p></div>
-      <div class="cli soon"><b>Gemini CLI</b><span>next</span><p>Integration in progress.</p></div>
+      <div class="cli live"><b>Pi</b><span>available</span><p>Any model: OpenRouter, Together AI, or a local LM Studio. Terminals, bridge, history.</p></div>
+      <div class="cli live"><b>Antigravity CLI</b><span>available</span><p>Google's agent, the successor of Gemini CLI. Terminals, bridge, history.</p></div>
       <div class="cli soon"><b>Cursor CLI</b><span>next</span><p>Integration in progress.</p></div>
       <div class="cli soon"><b>opencode</b><span>next</span><p>Integration in progress.</p></div>
     </div>
@@ -287,11 +373,42 @@ EOF
 
 <section id="download" class="get">
   <div class="wrap">
+    <div class="sec-head center rv get-head">
+      <span class="kicker">Download</span>
+      <h2>Get Connecto.</h2>
+      <p>No Connecto account: your agents use the logins you already have.</p>
+    </div>
+    <div class="dl-products rv">
+      <article class="dl-product" id="dl" aria-labelledby="dl-title">
+        <img class="dl-icon" src="assets/img/icon-256.png" alt="" width="44" height="44">
+        <div class="dl-text">
+          <h3 id="dl-title">Connecto</h3>
+          <p>The <span class="if-no-win">macOS</span><span class="if-win" hidden>desktop</span> app: your agents in real terminals, working together.</p>
+          <p class="dl-sum"><span data-dl-summary="connecto"></span> <span class="linux-note"><span class="if-no-win">· Linux and Windows are not available yet.</span><span class="if-win" hidden><span class="if-no-linux">· Linux is not available yet.</span></span><span class="if-linux" hidden>(experimental)</span></span></p>
+        </div>
+        <button type="button" class="btn btn-primary dl-open" data-dl-product="connecto" aria-haspopup="dialog">Download</button>
+      </article>
+      <article class="dl-product" id="connecto-chat" aria-labelledby="connecto-chat-title">
+        <span class="dl-icon dl-icon-chat" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v8a2.5 2.5 0 0 1-2.5 2.5H10l-4.5 4v-4h0A2.5 2.5 0 0 1 4 13.5z"/><path d="M8.5 8.5h7M8.5 11.5h4.5"/></svg></span>
+        <div class="dl-text">
+          <h3 id="connecto-chat-title">Connecto Chat</h3>
+          <p>The companion for a second computer: chat with the agents on your paired Connecto host.</p>
+          <p class="dl-sum"><span data-dl-summary="chat"></span></p>
+        </div>
+        <button type="button" class="btn btn-ghost dl-open" data-dl-product="chat" aria-haspopup="dialog">Download</button>
+      </article>
+    </div>
+    <div class="pick-inline" id="dl-inline" role="region" aria-labelledby="dl-inline-title" tabindex="-1" hidden>
+      <h3 id="dl-inline-title">Download Connecto</h3>
+      <p class="pick-lede">Choose the file for your system and processor.</p>
+      <div class="pick-inline-body"></div>
+    </div>
+    <p class="req">Connecto needs macOS<span class="if-win" hidden>, or Windows 10 (1809) or later on x86_64</span>, and Claude Code, Codex, Pi or Antigravity CLI (it can install any of them). <a href="docs/install.html">Installation guide →</a></p>
     <span id="donate" class="anchor" aria-hidden="true"></span>
     <div class="donate-box compact rv">
       <span class="kicker">Open source</span>
       <h2>Sustain open-source development.</h2>
-      <p>Connecto is free software under the AGPL-3.0, built in the open and funded by the people who use it. If it earns a place in your day, you can help keep it independent. <b>The download below is free, always.</b></p>
+      <p>Connecto is free software under the AGPL-3.0, built in the open and funded by the people who use it. If it earns a place in your day, you can help keep it independent. <b>The download above is free, always.</b></p>
       <div class="amounts">
         <a class="amount" href="https://paypal.me/marcomanzi83/1EUR" target="_blank" rel="noopener">€1<small>Thank you</small></a>
         <a class="amount" href="https://paypal.me/marcomanzi83/5EUR" target="_blank" rel="noopener">€5<small>Supporter</small></a>
@@ -300,19 +417,22 @@ EOF
       </div>
       <p class="donate-note">Opens PayPal with the amount filled in; you can change it there. Prefer code to coins? <a href="https://github.com/marcomanzi/connecto-community" target="_blank" rel="noopener">The source is on GitHub.</a></p>
     </div>
-
-    <div class="sec-head center rv get-head">
-      <span class="kicker">Download</span>
-      <h2>Get Connecto.</h2>
-      <p>A native <span class="if-no-win">macOS app</span><span class="if-win" hidden>app for macOS and Windows</span>. No Connecto account: your agents use the logins you already have.</p>
-    </div>
-    <div class="dl rv" id="dl"></div>
-    <div class="unsigned"><b>The Mac builds are signed and notarized by Apple.</b> Open the disk image, drag Connecto to Applications, and open it. <a href="docs/install.html#unsigned">Step by step →</a> <span class="if-no-win">Linux and Windows are not available yet.</span><span class="if-win" hidden><br><b>Windows:</b> the build is not signed yet, so Windows SmartScreen warns the first time you start it: click <b>More info</b>, then <b>Run anyway</b>. <a href="docs/install.html#windows">Windows steps →</a> Linux is not available yet.</span></div>
-    <p class="req">Needs macOS<span class="if-win" hidden>, or Windows 10 (1809) or later on x86_64</span>, and Claude Code or Codex already installed. <a href="docs/install.html">Installation guide →</a></p>
   </div>
 </section>
 
 </main>
+
+<dialog class="pick" id="dl-pick" aria-labelledby="dl-pick-title" aria-describedby="dl-pick-lede">
+  <div class="pick-in">
+    <div class="pick-head">
+      <h2 id="dl-pick-title">Download Connecto</h2>
+      <button type="button" class="pick-close" aria-label="Close"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+    <p class="pick-lede" id="dl-pick-lede">Choose the file for your system and processor.</p>
+    <div class="pick-body" id="dl-pick-body"></div>
+    <p class="pick-foot"><a href="docs/install.html">Installation guide →</a></p>
+  </div>
+</dialog>
 
 <a class="dl-float" id="dl-float" href="#download" hidden aria-label="Downloads so far: go to the downloads"><i aria-hidden="true"></i><b id="dl-float-n">0</b> <span id="dl-float-word">downloads</span><span class="dl-float-week" id="dl-float-week" hidden></span></a>
 

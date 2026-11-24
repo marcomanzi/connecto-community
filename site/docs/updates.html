@@ -18,17 +18,17 @@
 <noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
 <main class="doc">
 <h1>Updates</h1>
-<p class="lead">Connecto keeps itself up to date. A new version is downloaded in the background and installed when you say so, with one restart. Your terminals come back afterwards, as at any start.</p>
+<p class="lead">Connecto keeps itself up to date. A new version is downloaded in the background and installed by itself, with one restart. Your terminals come back afterwards, and agents that were in the middle of a turn carry on.</p>
 
 <h2>How it works</h2>
 <ol>
-  <li><strong>A check at launch, then once a day.</strong> Connecto reads a small file, <code>connecto.studio/downloads/update.json</code>, that names the newest version. It sends nothing about you or your machine: the request carries only <code>Connecto-Updater/&lt;version&gt;</code> as its user agent.</li>
-  <li><strong>A download in the background.</strong> When there is a newer version, Connecto downloads it and checks it before offering it (see below).</li>
-  <li><strong>You choose when.</strong> A strip at the top of the window says <em>Connecto 0.1.9 is ready</em>, with <strong>Update and restart</strong> and <strong>Later</strong>. Later hides it until the next version.</li>
-  <li><strong>Running agents finish first.</strong> If an agent is in the middle of a turn, Connecto waits for it, and says how many turns it is waiting for. <strong>Restart now</strong> does not wait.</li>
-  <li><strong>The restart.</strong> Connecto quits as usual, the new version is put in place, and it starts. Open projects and terminals are restored, and agent sessions resume where they were.</li>
+  <li><strong>A check at launch, then every minute.</strong> Connecto reads a small file, <code>connecto.studio/downloads/update.json</code>, that names the newest version, and fetches it again only when it changed. It sends nothing about you or your machine: the request carries only <code>Connecto-Updater/&lt;version&gt;</code> as its user agent.</li>
+  <li><strong>A download in the background.</strong> When there is a newer version, Connecto downloads it and checks it before installing it (see below). A newer one found meanwhile takes its place.</li>
+  <li><strong>Installed as soon as nothing holds it back.</strong> Connecto waits while a pairing is under way, a file is being transferred, a package is being installed, or you typed in a terminal in the last 30 seconds. The strip at the top of the window says what it is waiting for.</li>
+  <li><strong>The restart.</strong> Connecto quits, the new version is put in place, and it starts. Open projects and terminals are restored, and agent sessions resume where they were. An agent that was in the middle of a turn is told <em>continua</em> and carries on.</li>
+  <li><strong>Never in a loop.</strong> A version is installed by itself once at most, and Connecto does not restart by itself twice within ten minutes. A version that does not start is replaced by the one you had.</li>
 </ol>
-<p>To check by hand, choose <strong>Connecto → Check for Updates…</strong> (on Windows, <strong>File → Check for Updates…</strong>), or <strong>Check now</strong> in <strong>Settings → Connecto Home → Updates</strong>. There you can also turn off <strong>Check for updates automatically</strong>. There is one release channel: no betas.</p>
+<p>To check by hand, choose <strong>Connecto → Check for Updates…</strong> (on Windows, <strong>File → Check for Updates…</strong>), or <strong>Check now</strong> in <strong>Settings → Connecto Home → Updates</strong>. There you can also turn off <strong>Check for updates automatically</strong>, or <strong>Install updates automatically</strong>: then a strip says <em>Connecto 0.3.11 is ready</em>, with <strong>Update and restart</strong> and <strong>Later</strong>, and Connecto waits for running agent turns before it restarts. There is one release channel: no betas.</p>
 
 <h2>What is checked</h2>
 <ul>

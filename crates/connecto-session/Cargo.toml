@@ -26,6 +26,13 @@ connecto-store.workspace = true
 connecto-term.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Protected folder names compared as a case- and normalization-insensitive
+# volume (APFS, NTFS) compares them (`project_folder::within_folded`).
+# Already in Cargo.lock.
+unicode-normalization = "0.1.26"
+# Full Unicode case folding for the same comparison (`ſ` is `s`). Already in
+# Cargo.lock.
+unicase = "2.10"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "socket", "user"] }
@@ -51,6 +58,8 @@ widestring = "1"
 
 [dev-dependencies]
 serde_json.workspace = true
+# Test folders that remove themselves. Already in Cargo.lock.
+tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true, features = ["signal", "process", "socket", "user"] }

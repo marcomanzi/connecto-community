@@ -1,0 +1,156 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    "Ask ${applicationName}": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chiedi a ${applicationName}"
+          }
+        }
+      }
+    },
+    "Ask ${applicationName} about ${project}": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chiedi a ${applicationName} su ${project}"
+          }
+        }
+      }
+    },
+    "Tell ${applicationName}": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Di' a ${applicationName}"
+          }
+        }
+      }
+    },
+    "Send a message to ${applicationName}": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fai una domanda a ${applicationName}"
+          }
+        }
+      }
+    },
+    "What is ${applicationName} doing": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cosa sta facendo ${applicationName}"
+          }
+        }
+      }
+    },
+    "${project} status in ${applicationName}": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stato di ${project} in ${applicationName}"
+          }
+        }
+      }
+    },
+    "Is ${applicationName} done": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "${applicationName} ha finito"
+          }
+        }
+      }
+    },
+    "Read the last ${applicationName} reply": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Leggi l'ultima risposta di ${applicationName}"
+          }
+        }
+      }
+    },
+    "What did ${applicationName} say": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cosa ha risposto ${applicationName}"
+          }
+        }
+      }
+    },
+    "Stop ${applicationName}": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ferma ${applicationName}"
+          }
+        }
+      }
+    },
+    "Stop the agent in ${applicationName}": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ferma l'agente in ${applicationName}"
+          }
+        }
+      }
+    },
+    "Stop ${project} in ${applicationName}": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ferma ${project} in ${applicationName}"
+          }
+        }
+      }
+    },
+    "Call ${applicationName}": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chiama ${applicationName}"
+          }
+        }
+      }
+    },
+    "Talk to ${project} in ${applicationName}": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Parla con ${project} in ${applicationName}"
+          }
+        }
+      }
+    },
+    "Open ${project} in ${applicationName}": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apri ${project} in ${applicationName}"
+          }
+        }
+      }
+    }
+  },
+  "version": "1.0"
+}

@@ -362,7 +362,8 @@ fn guide_updated_note(slug: &str, tool: ToolKind) -> String {
     let file = match tool {
         // Automations are authored by an agent; a shell is never one.
         ToolKind::Claude | ToolKind::Shell => "CLAUDE.md",
-        ToolKind::Codex => "AGENTS.md",
+        // Pi, Antigravity and OpenCode read `AGENTS.md`, as Codex does.
+        ToolKind::Codex | ToolKind::Pi | ToolKind::Antigravity | ToolKind::OpenCode => "AGENTS.md",
     };
     format!(
         "Connecto's automation guide was updated (a `trigger` field is now required for every \
@@ -375,7 +376,8 @@ fn authoring_prompt(root: &Path, slug: &str, tool: ToolKind) -> String {
     let guide = match tool {
         // Automations are authored by an agent; a shell is never one.
         ToolKind::Claude | ToolKind::Shell => "CLAUDE.md",
-        ToolKind::Codex => "AGENTS.md",
+        // Pi, Antigravity and OpenCode read `AGENTS.md`, as Codex does.
+        ToolKind::Codex | ToolKind::Pi | ToolKind::Antigravity | ToolKind::OpenCode => "AGENTS.md",
     };
     format!(
         "You are authoring the Connecto automation `{slug}` at `{root}/{slug}/automation.json`. \
@@ -424,7 +426,8 @@ fn described_prompt(root: &Path, slug: &str, tool: ToolKind, screen: &str, actio
     let guide = match tool {
         // Automations are authored by an agent; a shell is never one.
         ToolKind::Claude | ToolKind::Shell => "CLAUDE.md",
-        ToolKind::Codex => "AGENTS.md",
+        // Pi, Antigravity and OpenCode read `AGENTS.md`, as Codex does.
+        ToolKind::Codex | ToolKind::Pi | ToolKind::Antigravity | ToolKind::OpenCode => "AGENTS.md",
     };
     format!(
         "You are authoring the Connecto automation `{slug}` at `{root}/{slug}/automation.json`. \

@@ -80,7 +80,7 @@ fn row_state(label: &str, shortcut: Option<&str>, enabled: bool, checked: bool) 
 
 #[test]
 fn the_bar_sits_above_the_sidebar_and_the_terminal() {
-    let (_orbit, _connecto, ws) = two_projects();
+    let (_quill, _connecto, ws) = two_projects();
     let w = W::new(&ws);
     assert!((w.app.hits.sidebar.min.y - BAR_HEIGHT).abs() < 0.5);
     assert!((w.app.hits.main.min.y - BAR_HEIGHT).abs() < 0.5);
@@ -97,8 +97,8 @@ fn the_bar_sits_above_the_sidebar_and_the_terminal() {
     for name in titles {
         assert!(title(&w, name).max.y <= BAR_HEIGHT);
     }
-    // No band for traffic lights: the sidebar's buttons share the PROJECTS
-    // row.
+    // No band for traffic lights: the collapse button joins History and +,
+    // first in the row.
     let collapse = w.rect(&Hit::Collapse);
     let history = w.rect(&Hit::HeaderHistory);
     assert!((collapse.center().y - history.center().y).abs() < 0.5);
@@ -109,7 +109,7 @@ fn the_bar_sits_above_the_sidebar_and_the_terminal() {
 
 #[test]
 fn every_menu_lists_the_macos_items_in_order_with_their_windows_shortcuts() {
-    let (_orbit, _connecto, ws) = two_projects();
+    let (_quill, _connecto, ws) = two_projects();
     let mut w = W::new(&ws);
     for menu in in_window_menus() {
         open(&mut w, menu.title);
@@ -159,7 +159,7 @@ fn every_menu_lists_the_macos_items_in_order_with_their_windows_shortcuts() {
 
 #[test]
 fn clicking_an_item_runs_the_same_command_as_the_macos_menu() {
-    let (orbit, connecto, ws) = two_projects();
+    let (quill, connecto, ws) = two_projects();
     let mut w = W::new(&ws);
     choose(&mut w, "Agents", "Stop Everything");
     assert_eq!(ws.stopped.load(Ordering::Relaxed), 1);
@@ -214,12 +214,12 @@ fn clicking_an_item_runs_the_same_command_as_the_macos_menu() {
 
     choose(&mut w, "Terminal", "Close Terminal");
     assert_eq!(*connecto.terminals.closes.lock().unwrap(), ["claude"]);
-    assert!(!orbit.typed_anywhere() && !connecto.typed_anywhere());
+    assert!(!quill.typed_anywhere() && !connecto.typed_anywhere());
 }
 
 #[test]
 fn open_recent_is_disabled_when_empty_and_lists_the_recents() {
-    let (_orbit, _connecto, ws) = two_projects();
+    let (_quill, _connecto, ws) = two_projects();
     let mut w = W::new(&ws);
     open_recent(&mut w);
     assert!(
@@ -239,8 +239,8 @@ fn open_recent_is_disabled_when_empty_and_lists_the_recents() {
     ws.edit(|view| {
         view.recents = vec![
             RecentProject {
-                path: "/work/orbit".into(),
-                name: "orbit".into(),
+                path: "/work/quill".into(),
+                name: "quill".into(),
             },
             RecentProject {
                 path: "/work/older".into(),
@@ -252,13 +252,13 @@ fn open_recent_is_disabled_when_empty_and_lists_the_recents() {
     open_recent(&mut w);
     let recent: Vec<RowState> = rows(&w)
         .into_iter()
-        .skip_while(|(label, ..)| label != "orbit")
+        .skip_while(|(label, ..)| label != "quill")
         .take(3)
         .collect();
     assert_eq!(
         recent,
         [
-            row_state("orbit", None, true, false),
+            row_state("quill", None, true, false),
             row_state("older", None, true, false),
             row_state("Clear Recent", None, true, false),
         ]
@@ -283,10 +283,10 @@ fn open_recent_is_disabled_when_empty_and_lists_the_recents() {
 
 #[test]
 fn an_open_menu_keeps_keys_and_clicks_from_the_terminal() {
-    let (orbit, connecto, ws) = two_projects();
+    let (quill, connecto, ws) = two_projects();
     let mut w = W::new(&ws);
     w.type_text("a");
-    assert_eq!(orbit.slot("claude-1").typed(), b"a");
+    assert_eq!(quill.slot("claude-1").typed(), b"a");
     open(&mut w, "Terminal");
     assert!(!rows(&w).is_empty());
     w.type_text("b");
@@ -295,7 +295,7 @@ fn an_open_menu_keeps_keys_and_clicks_from_the_terminal() {
     w.frame(vec![]);
     assert!(rows(&w).is_empty(), "Escape closes the menu");
     assert_eq!(
-        orbit.slot("claude-1").typed(),
+        quill.slot("claude-1").typed(),
         b"a",
         "nothing typed while the menu was open reached the terminal"
     );
@@ -310,13 +310,13 @@ fn an_open_menu_keeps_keys_and_clicks_from_the_terminal() {
     // Afterwards the terminal has the keyboard again.
     w.frame(vec![]);
     w.type_text("c");
-    assert_eq!(orbit.slot("claude-1").typed(), b"ac");
+    assert_eq!(quill.slot("claude-1").typed(), b"ac");
     assert!(!connecto.typed_anywhere());
 }
 
 #[test]
 fn a_menu_click_goes_through_the_native_menus_queue() {
-    let (_orbit, _connecto, ws) = two_projects();
+    let (_quill, _connecto, ws) = two_projects();
     let mut w = W::new(&ws);
     w.app.queue_for_tests(Command::NewTerminal);
     w.frame(vec![]);

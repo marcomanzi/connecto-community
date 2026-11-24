@@ -21,7 +21,8 @@ use serde_json::json;
 
 use super::render::{self, DrainInput, Fact, Notice};
 use super::{AgentCommand, Caller, Report, Signal, WriteKind, WriteOutcome};
-use crate::relay::{Shared, Slot};
+use crate::background;
+use crate::relay::{Shared, Slot, WakeNote};
 use crate::turn::{Phase, RequestEnd};
 
 const TICK: Duration = Duration::from_millis(250);
@@ -40,6 +41,19 @@ pub(crate) const BOOT_CAP: Duration = Duration::from_secs(180);
 const WAKE_QUEUE_LIMIT: Duration = Duration::from_secs(30);
 /// How long a typed wake waits for the watcher's next prompt.
 const WAKE_PROMPT_LIMIT: Duration = Duration::from_secs(3);
+/// How long wanted notices wait in the inbox of a terminal that is not
+/// working, with no wake on its way, before a wake is tried again. Each try
+/// doubles the wait, up to [`WAKE_RETRY_MAX`].
+const WAKE_RETRY_FIRST: Duration = Duration::from_secs(10);
+const WAKE_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Where the seats of callers from other projects start: far above any slot
+/// a project can have, so a seat is never taken for a terminal (ADR 0035).
+const SEAT_BASE: usize = usize::MAX / 2;
+/// Most seats one state keeps; past it the oldest goes, with its watches.
+const SEATS_MAX: usize = 1024;
+/// Most ask ends remembered that came before their ask was recorded.
+const TOMBSTONES_MAX: usize = 256;
 
 /// A terminal attempt: the slot, which actor holds it, and its attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +101,45 @@ pub(crate) enum Owed {
     DrainDone { reservation: u64, written: bool },
     /// The handler gave up waiting on a send: its id is out.
     TimedOut { id: String },
+    /// The send waits for the user to send or clear their draft, and its
+    /// sender was told so: its id is out, and no clock runs until it is typed.
+    Waiting { id: String },
+    /// From another project's bridge (ADR 0035): a notice for a terminal
+    /// here. Cross-project messages go through these debts, never through
+    /// the bounded queue, so a full queue cannot lose the end of an ask.
+    Forwarded(Forward),
+    /// A caller here asked a terminal of another project with `--ask`: until
+    /// the answer is forwarded, its own turns hold the asks it was given.
+    /// Owed by the handler before it reports the send.
+    ForeignAsk(ForeignAsk),
+    /// The attempt that sat at `att` in that bridge instance has ended: its
+    /// seat here goes, with its watches.
+    SeatGone {
+        project: String,
+        instance: u64,
+        att: Att,
+    },
+    /// A caller here unwatched `source` in another project: what the watch
+    /// made wanted is withdrawn.
+    ForeignCancel {
+        to: Att,
+        to_instance: u64,
+        source: String,
+    },
 }
+
+/// An `--ask` that has been typed into its target and not answered yet, by
+/// terminal id: what an update saves so the asker gets its reply after the
+/// restart (ADR 0030).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenAsk {
+    pub request: String,
+    pub from: String,
+    pub target: String,
+}
+
+/// Whether an op admitted across projects may still act (ADR 0035).
+pub(crate) type StillGuard = Box<dyn Fn() -> bool + Send>;
 
 pub(crate) enum Msg {
     Event {
@@ -116,12 +168,67 @@ pub(crate) enum Msg {
         caller: Caller,
         target: String,
         on: bool,
+        /// For a caller from another project: whether Pause is still off in
+        /// the epochs both projects admitted it in, asked right before the
+        /// watch changes, so a Pause while it was queued changes nothing.
+        still: Option<StillGuard>,
         reply: Sender<Reply>,
     },
     Drain {
         caller: Caller,
+        /// A new project memory version to announce, taken by the handler.
+        memory_version: Option<u64>,
+        /// A line about a project operation the prompt matches (ADR 0031).
+        ops_note: Option<String>,
         reply: Sender<Option<Drained>>,
     },
+    /// A sentence for one terminal from Connecto itself (the answer to its
+    /// secret request): a notice, and a wake when it is idle.
+    Notice {
+        caller: Caller,
+        text: String,
+    },
+    /// The asks open in the project now, for an update to save.
+    OpenAsks {
+        reply: Sender<Vec<OpenAsk>>,
+    },
+}
+
+/// A notice from another project's bridge state for one terminal here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Forward {
+    /// The terminal attempt here it is for, and the bridge instance it was
+    /// made in: a project closed and opened again counts its attempts anew.
+    pub to: Att,
+    pub to_instance: u64,
+    /// The project and bridge instance it comes from.
+    pub from_project: String,
+    pub from_instance: u64,
+    pub notice: Notice,
+    pub wake: String,
+    /// The request it ends, for an ask's answer.
+    pub ended: Option<String>,
+}
+
+/// A caller from another project, as this state knows it: its project, the
+/// bridge instance it called from, and its attempt there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Seat {
+    project_id: String,
+    instance: u64,
+    att: Att,
+}
+
+/// An ask a caller here made in another project, not answered yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForeignAsk {
+    pub att: Att,
+    pub project_id: String,
+    /// The target's bridge instance: once that project is closed, even if it
+    /// is opened again, the ask will never be answered.
+    pub project_instance: u64,
+    pub project_name: String,
+    pub request: String,
 }
 
 // ---- inbox
@@ -170,6 +277,13 @@ struct Entry {
     notice: Notice,
 }
 
+/// When the safety net may try a wake again, and how many it has tried.
+#[derive(Debug, Clone, Copy)]
+struct Retry {
+    next: Instant,
+    tries: u32,
+}
+
 /// One terminal attempt's notices.
 #[derive(Debug, Default)]
 pub(crate) struct Inbox {
@@ -179,6 +293,11 @@ pub(crate) struct Inbox {
     lost: u32,
     first_done: bool,
     wake: Option<WakeFlight>,
+    /// A project memory version taken for this terminal and not yet printed:
+    /// several merge into the latest (spec §6.1).
+    memory_version: Option<u64>,
+    /// The safety net's schedule while wanted notices wait.
+    retry: Option<Retry>,
 }
 
 impl Inbox {
@@ -273,6 +392,7 @@ struct Reservation {
     merged: BTreeMap<String, Merged>,
     lost: u32,
     first: bool,
+    memory_version: Option<u64>,
 }
 
 // ---- requests
@@ -316,10 +436,26 @@ struct Request {
     /// The target was seen ready: the unmatched clock runs from then.
     ready_seen: bool,
     born: Instant,
+    /// Held for the user's draft: nothing was typed yet, and no clock runs.
+    /// The actor ends the wait itself, typed or refused.
+    waiting: bool,
     note: Option<&'static str>,
     state: ReqState,
     reason: String,
     reply: Option<EventText>,
+    /// The target ended the turn this ask started while it waited on asks of
+    /// its own: the ask stays open until a turn of the target ends with none
+    /// left, so the asker is woken once, with the final answer, and not after
+    /// every exchange the target has with other agents. The reply of the
+    /// latest turn, should no later one give one.
+    held: Option<EventText>,
+    /// Opened again after an update cut it (ADR 0030): it ends with its
+    /// target's next turn, and its asker is found again by id, since the
+    /// asker restarted too.
+    restored: bool,
+    /// For an asker from another project, where its answer goes. Kept here,
+    /// so a seat that is dropped later cannot lose it (ADR 0035).
+    seat: Option<Seat>,
 }
 
 /// Everything the thread owns.
@@ -334,6 +470,11 @@ struct State {
     requests: BTreeMap<String, Request>,
     order: VecDeque<String>,
     reply_bytes: usize,
+    /// Asks an update cut, waiting for their target to run again, and since
+    /// when (ADR 0030).
+    restoring: Vec<(OpenAsk, Instant)>,
+    /// Restored asks whose answer waits for their asker to run, and since when.
+    deferred: Vec<(String, Instant)>,
     next_request: u64,
     next_key: u64,
     next_wake: u64,
@@ -343,6 +484,25 @@ struct State {
     assume_live: bool,
     /// How long a wake may wait for an outcome. A field so a test can shorten it.
     wake_limit: Duration,
+    /// The safety net's first wait. A field so a test can shorten it.
+    retry_first: Duration,
+    /// Tests only: the bridges of other projects, by project and instance,
+    /// in place of a directory.
+    #[cfg(test)]
+    peers: BTreeMap<(String, u64), Arc<Shared>>,
+    /// Callers from other projects, by their seat's slot number.
+    seats: BTreeMap<usize, Seat>,
+    next_seat: usize,
+    /// Asks callers here made in other projects, not answered yet.
+    foreign_asks: Vec<ForeignAsk>,
+    /// Ask ends that arrived before their ask was recorded here: project,
+    /// its instance, request.
+    tombstones: VecDeque<(String, u64, String)>,
+}
+
+/// The word `list` gives for a terminal's state.
+pub(crate) fn state_word(slot: &Slot) -> &'static str {
+    State::state_word(slot)
 }
 
 pub(crate) struct StateHandle {
@@ -376,6 +536,8 @@ impl State {
             requests: BTreeMap::new(),
             order: VecDeque::new(),
             reply_bytes: 0,
+            restoring: Vec::new(),
+            deferred: Vec::new(),
             next_request: 1,
             next_key: 1,
             next_wake: 1,
@@ -383,6 +545,13 @@ impl State {
             next_nid: 1,
             assume_live: false,
             wake_limit: WAKE_QUEUE_LIMIT,
+            retry_first: WAKE_RETRY_FIRST,
+            #[cfg(test)]
+            peers: BTreeMap::new(),
+            seats: BTreeMap::new(),
+            next_seat: 0,
+            foreign_asks: Vec::new(),
+            tombstones: VecDeque::new(),
         }
     }
 }
@@ -415,6 +584,7 @@ impl State {
 
     fn handle(&mut self, msg: Msg) {
         self.reconcile();
+        self.refresh_restored();
         self.pay_debts();
         match msg {
             Msg::Event {
@@ -446,12 +616,30 @@ impl State {
                 caller,
                 target,
                 on,
+                still,
                 reply,
             } => {
-                let _ = reply.send(self.watch(&caller, &target, on));
+                let answer = if still.as_ref().is_some_and(|still| !still()) {
+                    refusal(
+                        "paused",
+                        "Connecto is paused by the user. Nothing was done.",
+                    )
+                } else {
+                    self.watch(&caller, &target, on)
+                };
+                let _ = reply.send(answer);
             }
-            Msg::Drain { caller, reply } => {
-                let _ = reply.send(self.drain(&caller));
+            Msg::Drain {
+                caller,
+                memory_version,
+                ops_note,
+                reply,
+            } => {
+                let _ = reply.send(self.drain_with(&caller, memory_version, ops_note));
+            }
+            Msg::Notice { caller, text } => self.note(&caller, text),
+            Msg::OpenAsks { reply } => {
+                let _ = reply.send(self.open_asks());
             }
         }
         self.take_reports();
@@ -471,17 +659,45 @@ impl State {
                         request.clock_from = Instant::now();
                     }
                 }
+                Owed::Waiting { id } => {
+                    if let Some(request) = self.requests.get_mut(&id) {
+                        request.id_given_out = true;
+                        request.waiting = true;
+                        request.clock_from = Instant::now();
+                    }
+                }
+                Owed::Forwarded(forward) => self.on_forwarded(forward),
+                Owed::ForeignAsk(ask) => self.on_foreign_ask(ask),
+                Owed::SeatGone {
+                    project,
+                    instance,
+                    att,
+                } => self.seat_gone(&project, instance, att),
+                Owed::ForeignCancel {
+                    to,
+                    to_instance,
+                    source,
+                } => {
+                    if to_instance == self.shared.bridge_instance {
+                        self.cancel_wanted(to, &source);
+                    }
+                }
             }
         }
     }
 
     fn tick(&mut self) {
         self.reconcile();
+        self.open_restored();
+        self.refresh_restored();
+        self.retry_deferred();
         self.pay_debts();
         self.take_reports();
         self.check_lost();
         self.check_requests();
         self.check_wakes();
+        self.retry_wakes();
+        self.check_foreign_asks();
     }
 
     fn live(&self, slot: &Slot) -> bool {
@@ -547,6 +763,7 @@ impl State {
     /// and no wake is sent. A dead conversation has no one to tell.
     fn attempt_ended(&mut self, old: Att) {
         self.inboxes.remove(&old.slot);
+        self.foreign_asks.retain(|ask| ask.att != old);
         self.watches
             .retain(|(watcher, target)| *watcher != old && *target != old);
         self.reservations
@@ -569,6 +786,146 @@ impl State {
                 &Self::ended_reason(why.as_deref()),
                 None,
             );
+        }
+    }
+
+    // ---- asks an update cut (ADR 0030)
+
+    /// The asks open in this project: typed into a target that has not
+    /// answered, by an asker that is still the conversation that asked.
+    fn open_asks(&self) -> Vec<OpenAsk> {
+        let project = self.shared.project_key.load(Ordering::SeqCst);
+        self.requests
+            .iter()
+            .filter(|(_, r)| {
+                r.state == ReqState::Pending
+                    && r.ask
+                    && r.ask_open
+                    && r.project == project
+                    && (r.restored || self.slot_of(r.from).is_some())
+            })
+            .map(|(id, r)| OpenAsk {
+                request: id.clone(),
+                from: r.from_id.clone(),
+                target: r.target_id.clone(),
+            })
+            .collect()
+    }
+
+    /// Open again the asks an update cut, each once its target runs: it then
+    /// ends with the target's next turn, as an ask held across the target's
+    /// own asks does. A target that does not run within [`BOOT_CAP`] ends it
+    /// as exited, so the asker is not left waiting.
+    fn open_restored(&mut self) {
+        let now = Instant::now();
+        let taken = self.shared.take_restored();
+        self.restoring
+            .extend(taken.into_iter().map(|ask| (ask, now)));
+        if self.restoring.is_empty() {
+            return;
+        }
+        let project = self.shared.project_key.load(Ordering::SeqCst);
+        for (ask, since) in std::mem::take(&mut self.restoring) {
+            if self.requests.contains_key(&ask.request) {
+                continue;
+            }
+            let (Some(target), Some(from)) = (
+                self.shared.slot_by_id(&ask.target),
+                self.shared.slot_by_id(&ask.from),
+            ) else {
+                continue;
+            };
+            let att = self.current(&target);
+            let runs = self.known.get(&target.index) == Some(&att) && self.live(&target);
+            if !runs && now.duration_since(since) < BOOT_CAP {
+                self.restoring.push((ask, since));
+                continue;
+            }
+            if let Some(number) = ask
+                .request
+                .strip_prefix('r')
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                self.next_request = self.next_request.max(number.saturating_add(1));
+            }
+            let id = ask.request.clone();
+            self.requests.insert(
+                id.clone(),
+                Request {
+                    project,
+                    from: self.current(&from),
+                    from_id: ask.from,
+                    target: att,
+                    target_id: ask.target,
+                    ask: true,
+                    ask_open: true,
+                    id_given_out: true,
+                    bound: true,
+                    clock_from: now,
+                    working_seen: false,
+                    ready_seen: true,
+                    born: now,
+                    waiting: false,
+                    note: None,
+                    state: ReqState::Pending,
+                    reason: String::new(),
+                    reply: None,
+                    held: Some(EventText::new(String::new())),
+                    restored: true,
+                    seat: None,
+                },
+            );
+            self.order.push_back(id.clone());
+            if runs {
+                target.ask.store(1, Ordering::SeqCst);
+            } else {
+                self.finish(
+                    &id,
+                    ReqState::Exited,
+                    "The terminal did not start again after the update. Use read.",
+                    None,
+                );
+            }
+        }
+    }
+
+    /// A restored ask's asker restarted with the app: follow it to the
+    /// conversation it runs now, so its own asks hold its turns and the
+    /// answer reaches it.
+    fn refresh_restored(&mut self) {
+        let found: Vec<(String, Att)> = self
+            .requests
+            .iter()
+            .filter(|(_, r)| r.restored)
+            .filter_map(|(id, r)| {
+                let slot = self.shared.slot_by_id(&r.from_id)?;
+                Some((id.clone(), self.current(&slot)))
+            })
+            .collect();
+        for (id, att) in found {
+            if let Some(request) = self.requests.get_mut(&id) {
+                request.from = att;
+            }
+        }
+    }
+
+    /// Give a restored ask's answer to its asker once it runs, up to
+    /// [`BOOT_CAP`]; after that it stays for `connecto result`.
+    fn retry_deferred(&mut self) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for (id, since) in std::mem::take(&mut self.deferred) {
+            let Some(request) = self.requests.get(&id) else {
+                continue;
+            };
+            let (from, state) = (request.from, request.state.word());
+            match self.slot_of(from) {
+                Some(sender) if self.live(&sender) => self.notify_sender(&id, from, state),
+                _ if now.duration_since(since) < BOOT_CAP => self.deferred.push((id, since)),
+                _ => {}
+            }
         }
     }
 
@@ -654,6 +1011,7 @@ impl State {
                 if request.state != ReqState::Pending {
                     return;
                 }
+                request.waiting = false;
                 let typed = matches!(outcome, WriteOutcome::Typed);
                 let pasted = matches!(
                     outcome,
@@ -692,9 +1050,12 @@ impl State {
                         );
                     }
                 } else if request.id_given_out {
-                    // A late outcome after a timeout: nothing was typed.
-                    let note = "The text was not typed.";
-                    self.finish(id, ReqState::Unmatched, note, None);
+                    // A late outcome after a timeout or a wait: nothing was typed.
+                    let note = match &outcome {
+                        WriteOutcome::NotReady { why } => format!("The text was not typed: {why}."),
+                        _ => "The text was not typed.".to_owned(),
+                    };
+                    self.finish(id, ReqState::Unmatched, &note, None);
                 } else {
                     // Refused before any paste, with no id given out.
                     self.requests.remove(id);
@@ -712,6 +1073,11 @@ impl State {
             return;
         }
         match end {
+            RequestEnd::Ok(text) if self.awaits(att) => {
+                if let Some(request) = self.requests.get_mut(id) {
+                    request.held = Some(text);
+                }
+            }
             RequestEnd::Ok(text) => self.finish(id, ReqState::Ok, "", Some(text)),
             RequestEnd::Interrupted => {
                 self.finish(
@@ -737,6 +1103,46 @@ impl State {
             }
             RequestEnd::Unmatched(why) => self.finish(id, ReqState::Unmatched, why, None),
             RequestEnd::Unavailable(why) => self.finish(id, ReqState::Unavailable, why, None),
+        }
+    }
+
+    /// Whether `att` waits on an `--ask` of its own.
+    fn awaits(&self, att: Att) -> bool {
+        self.requests
+            .values()
+            .any(|r| r.from == att && r.ask && r.state == ReqState::Pending)
+            || self.foreign_asks.iter().any(|ask| ask.att == att)
+    }
+
+    /// A turn of `att` ended: the asks it holds open end with it once it waits
+    /// on none of its own, with that turn's reply. An interrupt ends them too.
+    fn release_held(&mut self, att: Att, interrupted: bool) {
+        let ids: Vec<String> = self
+            .requests
+            .iter()
+            .filter(|(_, r)| r.target == att && r.state == ReqState::Pending && r.held.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        if ids.is_empty() || (!interrupted && self.awaits(att)) {
+            return;
+        }
+        let last = self
+            .shared
+            .slot(att.slot)
+            .and_then(|slot| slot.last_reply())
+            .map(EventText::new);
+        for id in ids {
+            if interrupted {
+                self.finish(
+                    &id,
+                    ReqState::Interrupted,
+                    "The turn was interrupted. Use read.",
+                    None,
+                );
+                continue;
+            }
+            let held = self.requests.get_mut(&id).and_then(|r| r.held.take());
+            self.finish(&id, ReqState::Ok, "", last.clone().or(held));
         }
     }
 
@@ -840,6 +1246,11 @@ impl State {
         if !self.is_current(att) {
             return;
         }
+        match signal {
+            Signal::Finished => self.release_held(att, false),
+            Signal::Interrupted => self.release_held(att, true),
+            _ => {}
+        }
         match signal.word() {
             Some(word) => self.deliver_event(att, word, None),
             None => self.left_working(att),
@@ -883,6 +1294,37 @@ impl State {
             };
             let text = render::wake_text(&source_slot.id, &fact, watched);
             self.route(att, &target, notice, text, watched);
+        }
+        // Callers from other projects hear only what they watch.
+        let seats: Vec<Att> = self
+            .watches
+            .iter()
+            .filter(|(watcher, target)| *target == source && Self::is_seat(*watcher))
+            .map(|(watcher, _)| *watcher)
+            .collect();
+        if seats.is_empty() {
+            return;
+        }
+        let label = format!(
+            "{} in project {}",
+            source_slot.id,
+            super::header_name(&self.own_name())
+        );
+        // Merged, folded and withdrawn by this key: the project's id, this
+        // bridge instance and the terminal, never a name a rename changes.
+        let key = self.watch_key(&source_slot.id);
+        let fact = Fact::Event { word };
+        for seat in seats {
+            let notice = Notice {
+                source: key.clone(),
+                text: render::sentence(&label, &fact, true),
+                wanted: true,
+                body: detail.map(|d| format!("How it ended: {d}")),
+            };
+            let wake = render::wake_text(&label, &fact, true);
+            if let Some(found) = self.seats.get(&seat.slot).cloned() {
+                self.forward(&found, notice, wake, None);
+            }
         }
     }
 
@@ -930,6 +1372,17 @@ impl State {
             }
         }
         let nid = self.nid();
+        if wakes {
+            let note = if self.shared.pause().is_paused() {
+                WakeNote::ParkedPaused
+            } else if target.phase() == Phase::Working {
+                WakeNote::ParkedWorking
+            } else {
+                WakeNote::ParkedInFlight
+            };
+            self.shared
+                .wake_note(target, att.attempt, &format!("n{nid}"), note);
+        }
         self.inboxes.entry(att.slot).or_default().push(nid, notice);
     }
 
@@ -1034,14 +1487,44 @@ impl State {
         }
     }
 
-    fn notify_sender(&mut self, request: &str, from: Att, state: &'static str) {
-        // A notice belongs to the conversation that asked.
-        let Some(sender) = self.slot_of(from) else {
+    /// Connecto's own sentence for `caller`, if its session is still the one
+    /// that asked.
+    fn note(&mut self, caller: &Caller, text: String) {
+        let att = Att::from(caller);
+        let Some(slot) = self.slot_of(att) else {
             return;
         };
-        if !self.live(&sender) {
+        if !self.live(&slot) {
             return;
         }
+        let fact = Fact::Note {
+            text: connecto_redact::sanitize(&text),
+        };
+        let notice = Notice {
+            source: String::new(),
+            text: render::sentence("", &fact, false),
+            wanted: true,
+            body: None,
+        };
+        let wake = render::wake_text("", &fact, false);
+        self.route(att, &slot, notice, wake, true);
+    }
+
+    fn notify_sender(&mut self, request: &str, from: Att, state: &'static str) {
+        if Self::is_seat(from) {
+            self.notify_foreign_sender(request, state);
+            return;
+        }
+        let restored = self.requests.get(request).is_some_and(|r| r.restored);
+        // A notice belongs to the conversation that asked.
+        let Some(sender) = self.slot_of(from).filter(|sender| self.live(sender)) else {
+            // A restored ask's asker restarts with the app and may not run
+            // yet: its answer waits for it.
+            if restored && !self.deferred.iter().any(|(id, _)| id == request) {
+                self.deferred.push((request.to_owned(), Instant::now()));
+            }
+            return;
+        };
         let fact = Fact::RequestEnded {
             request: request.to_owned(),
             state: state.to_owned(),
@@ -1090,6 +1573,75 @@ impl State {
         }
     }
 
+    /// The safety net. A wake can be lost without a trace of a stop to come:
+    /// the actor found the terminal busy, the screen not ready, or the user's
+    /// draft in the way, and `LeftWorking` may never come again (an idle
+    /// asker waiting for its reply). So wanted notices that wait in the inbox
+    /// of a terminal that is not working, with no wake on its way and
+    /// Connecto not paused, get a wake again after [`WAKE_RETRY_FIRST`],
+    /// then after twice as long each time, up to [`WAKE_RETRY_MAX`]. A user
+    /// draft holds it off: a draft is never typed over, and the user's own
+    /// next prompt drains the inbox anyway.
+    fn retry_wakes(&mut self) {
+        if self.shared.pause().is_paused() {
+            return;
+        }
+        let now = Instant::now();
+        let slots: Vec<usize> = self.inboxes.keys().copied().collect();
+        for index in slots {
+            let Some(att) = self.known.get(&index).copied() else {
+                continue;
+            };
+            let Some(slot) = self.slot_of(att) else {
+                continue;
+            };
+            let live = self.live(&slot);
+            let first = self.retry_first;
+            let Some(inbox) = self.inboxes.get_mut(&index) else {
+                continue;
+            };
+            if !inbox.any_wanted() {
+                inbox.retry = None;
+                continue;
+            }
+            // A shell has no prompt hook: nothing it could be woken into.
+            let shell = slot.tool == connecto_store::Tool::Shell;
+            if inbox.wake.is_some() || !live || shell || slot.phase() == Phase::Working {
+                continue;
+            }
+            let Some(retry) = inbox.retry else {
+                inbox.retry = Some(Retry {
+                    next: now + first,
+                    tries: 0,
+                });
+                continue;
+            };
+            if now < retry.next {
+                continue;
+            }
+            let tries = retry.tries.saturating_add(1);
+            let wait = first
+                .saturating_mul(1_u32.checked_shl(tries.min(16)).unwrap_or(u32::MAX))
+                .min(WAKE_RETRY_MAX);
+            inbox.retry = Some(Retry {
+                next: now + wait,
+                tries,
+            });
+            if !matches!(slot.pane.draft(), crate::draft::Known::Exact(draft) if draft.is_empty()) {
+                self.shared
+                    .wake_note(&slot, att.attempt, "", WakeNote::ParkedDraft);
+                continue;
+            }
+            let ids = inbox.take_wanted();
+            let id = format!("w{}", self.next_wake);
+            self.shared
+                .wake_note(&slot, att.attempt, &id, WakeNote::Retried);
+            if !self.send_wake(att, &slot, render::UNREAD_WAKE, Why::Unread(ids.clone())) {
+                self.restore(att, Why::Unread(ids));
+            }
+        }
+    }
+
     fn check_lost(&mut self) {
         let slots: Vec<Arc<Slot>> = self.shared.slots.load().iter().flatten().cloned().collect();
         for slot in slots {
@@ -1106,7 +1658,7 @@ impl State {
                 .filter(|(_, target)| *target == att)
                 .map(|(watcher, _)| *watcher)
                 .collect();
-            for watcher in watchers {
+            for watcher in watchers.into_iter().filter(|w| !Self::is_seat(*w)) {
                 self.inboxes.entry(watcher.slot).or_default().lost += 1;
             }
             if slot.phase() != Phase::Working {
@@ -1129,6 +1681,11 @@ impl State {
             let Some(request) = self.requests.get_mut(&id) else {
                 continue;
             };
+            if request.waiting {
+                // Held for the user's draft; the actor bounds the wait.
+                request.clock_from = now;
+                continue;
+            }
             let (working, ready) = self
                 .shared
                 .slot(request.target.slot)
@@ -1191,7 +1748,7 @@ impl State {
             pause_epoch: epoch,
             attempt: att.attempt,
         };
-        let from = Att::from(caller);
+        let from = self.seat_of(caller);
         let (id, ask) = match kind {
             AdmitKind::Send { ask } => {
                 let id = format!("r{}", self.next_request);
@@ -1210,7 +1767,7 @@ impl State {
                 Request {
                     project: self.shared.project_key.load(Ordering::SeqCst),
                     from,
-                    from_id: caller.id.clone(),
+                    from_id: caller.label(),
                     target: att,
                     target_id: slot.id.clone(),
                     ask,
@@ -1221,10 +1778,14 @@ impl State {
                     working_seen: false,
                     ready_seen: false,
                     born: Instant::now(),
+                    waiting: false,
                     note: None,
                     state: ReqState::Pending,
                     reason: String::new(),
                     reply: None,
+                    held: None,
+                    restored: false,
+                    seat: self.seats.get(&from.slot).cloned(),
                 },
             );
             self.order.push_back(id.clone());
@@ -1249,22 +1810,50 @@ impl State {
         if request.project != project {
             return refusal("unknown_request", "No request has that id in this project.");
         }
+        // Across projects a caller reads only the answers to its own requests.
+        // Decided on who the request itself says asked, not on today's
+        // seats: a seat dropped since does not take a caller's answer away.
+        let mine = match &caller.origin {
+            None => request.from == Att::from(caller),
+            Some(origin) => {
+                request.seat.as_ref()
+                    == Some(&Seat {
+                        project_id: origin.project_id.clone(),
+                        instance: origin.instance,
+                        att: Att::from(caller),
+                    })
+            }
+        };
+        if caller.origin.is_some() && !mine {
+            return refusal(
+                "unknown_request",
+                "No request of yours has that id in that project.",
+            );
+        }
         let mut reason = request.reason.clone();
         if request.state == ReqState::Pending {
-            let background = self
-                .shared
-                .slot(request.target.slot)
+            let slot = self.shared.slot(request.target.slot);
+            let background = slot
+                .as_ref()
                 .is_some_and(|slot| slot.phase() == Phase::Background);
+            // What runs, named, so the sender can tell a dev server from a
+            // command that is nearly done.
+            let running = slot
+                .as_ref()
+                .map(|slot| background::summary(&slot.background_shown(), Instant::now()))
+                .filter(|running| !running.is_empty())
+                .map_or_else(String::new, |running| format!(" Still running: {running}."));
             // The sender of an `--ask` is woken with the reply: it should end its
             // turn and wait, not poll.
-            let ours = request.ask && request.from == Att::from(caller);
+            let ours = request.ask && mine;
+            let target = &request.target_id;
             reason = match (background, ours) {
-                (true, true) => "The target has background work running, so its turn has not ended. The reply will be delivered to you automatically; end your turn and wait.",
-                (true, false) => "The target has background work running, so its turn has not ended. Use read.",
-                (false, true) => "The reply will be delivered to you automatically; end your turn and wait. Do not poll.",
-                (false, false) => "The target has not answered yet.",
-            }
-            .to_owned();
+                (true, true) => format!("The target has background work running, so its turn has not ended.{running} The reply will be delivered to you automatically; end your turn and wait. `connecto tasks {target}` lists that work."),
+                (true, false) => format!("The target has background work running, so its turn has not ended.{running} Use read, or `connecto tasks {target}`."),
+                (false, true) if request.held.is_some() => "The target is still working with other agents it asked. The reply will be delivered to you automatically when it is done; end your turn and wait.".to_owned(),
+                (false, true) => "The reply will be delivered to you automatically; end your turn and wait. Do not poll.".to_owned(),
+                (false, false) => "The target has not answered yet.".to_owned(),
+            };
         }
         let header = json!({
             "state": request.state.word(),
@@ -1294,7 +1883,15 @@ impl State {
     // ---- watches, list and drain
 
     fn watch(&mut self, caller: &Caller, target: &str, on: bool) -> Reply {
-        let from = Att::from(caller);
+        let from = if on {
+            self.seat_of(caller)
+        } else {
+            match self.find_seat(caller) {
+                Some(att) => att,
+                // Never seen here, so it watches nothing here.
+                None => return Reply::ok(json!({ "target": target, "watching": false })),
+            }
+        };
         let Some(slot) = self.shared.slot_by_id(target) else {
             return refusal("unknown_terminal", "No terminal has that id.");
         };
@@ -1321,7 +1918,22 @@ impl State {
             }
         } else {
             self.watches.retain(|watch| *watch != (from, att));
-            self.cancel_wanted(from, target);
+            match self.seats.get(&from.slot).cloned() {
+                Some(seat) => {
+                    // The notices are in the caller's own project.
+                    let source = self.watch_key(target);
+                    self.send_to(
+                        &seat.project_id,
+                        seat.instance,
+                        Owed::ForeignCancel {
+                            to: seat.att,
+                            to_instance: seat.instance,
+                            source,
+                        },
+                    );
+                }
+                None => self.cancel_wanted(from, target),
+            }
         }
         Reply::ok(json!({ "target": target, "watching": on }))
     }
@@ -1399,7 +2011,11 @@ impl State {
     }
 
     fn list(&self, caller: &Caller) -> Reply {
-        let from = Att::from(caller);
+        let from = self.find_seat(caller).unwrap_or(Att {
+            slot: usize::MAX,
+            uid: 0,
+            attempt: 0,
+        });
         let view = self.view.load();
         let terminals: Vec<serde_json::Value> = view
             .terminals
@@ -1410,6 +2026,7 @@ impl State {
                 let att = self.current(&slot);
                 let watched = self.watches.contains(&(from, att));
                 let off = slot.pane.bridge_off_reason();
+                let running = slot.background_shown();
                 Some(json!({
                     "id": entry.id,
                     "tool": entry.tool.name(),
@@ -1417,15 +2034,27 @@ impl State {
                     "seconds": seconds,
                     "last_event": last,
                     "watched": watched,
+                    "owner": entry.owner(),
                     "bridge": if off.is_some() { "off" } else { "on" },
                     "bridge_reason": off,
                     "warning": slot.pane.power_warning(),
                     "exit": Self::exit_text(&slot, att),
+                    "background": if running.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        background::json(&running, Instant::now())
+                    },
                 }))
             })
             .collect();
+        // A caller from another project is none of these terminals.
+        let this = if caller.origin.is_some() {
+            serde_json::Value::Null
+        } else {
+            json!(caller.id)
+        };
         Reply::ok(json!({
-            "self": caller.id,
+            "self": this,
             "paused": self.shared.pause().is_paused(),
             "terminals": terminals,
         }))
@@ -1448,7 +2077,19 @@ impl State {
             .collect()
     }
 
+    #[cfg(test)]
     fn drain(&mut self, caller: &Caller) -> Option<Drained> {
+        self.drain_with(caller, None, None)
+    }
+
+    /// A drain, with a project memory version to announce merged into any
+    /// still waiting: one notice names the latest.
+    fn drain_with(
+        &mut self,
+        caller: &Caller,
+        memory_version: Option<u64>,
+        ops_note: Option<String>,
+    ) -> Option<Drained> {
         let att = Att::from(caller);
         if !self.is_current(att) {
             return None;
@@ -1463,6 +2104,7 @@ impl State {
             merged: std::mem::take(&mut inbox.merged),
             lost: std::mem::take(&mut inbox.lost),
             first,
+            memory_version: inbox.memory_version.take().max(memory_version),
         };
         let input = DrainInput {
             terminal: caller.id.clone(),
@@ -1479,6 +2121,8 @@ impl State {
                 .collect(),
             lost: reservation.lost,
             first,
+            memory_version: reservation.memory_version,
+            ops_note,
         };
         let body = render::render(&input).map(|text| render::context_json(&text));
         let id = self.next_reservation;
@@ -1498,6 +2142,298 @@ impl State {
                     body: Vec::new(),
                 })
             }
+        }
+    }
+
+    // ---- other projects (ADR 0035)
+
+    const fn is_seat(att: Att) -> bool {
+        att.slot >= SEAT_BASE
+    }
+
+    /// This project's id and the name the directory gives it.
+    fn own_id(&self) -> String {
+        self.shared
+            .memory_project
+            .get()
+            .map(|(id, _)| id.clone())
+            .unwrap_or_default()
+    }
+
+    /// What notices about `terminal` carry as their source in another
+    /// project's inbox.
+    fn watch_key(&self, terminal: &str) -> String {
+        format!(
+            "{terminal} in project {}#{}",
+            self.own_id(),
+            self.shared.bridge_instance
+        )
+    }
+
+    fn own_name(&self) -> String {
+        let id = self.own_id();
+        self.shared
+            .directory
+            .get()
+            .and_then(|directory| directory.by_id(&id))
+            .map(|entry| entry.name)
+            .or_else(|| {
+                self.shared
+                    .memory_project
+                    .get()
+                    .and_then(|(_, path)| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default()
+    }
+
+    /// The attempt a caller acts as here: its own for a caller of this
+    /// project, a seat for one from another.
+    fn find_seat(&self, caller: &Caller) -> Option<Att> {
+        let Some(origin) = &caller.origin else {
+            return Some(Att::from(caller));
+        };
+        let wanted = Seat {
+            project_id: origin.project_id.clone(),
+            instance: origin.instance,
+            att: Att::from(caller),
+        };
+        self.seats
+            .iter()
+            .find(|(_, seat)| **seat == wanted)
+            .map(|(slot, _)| Att {
+                slot: *slot,
+                uid: 0,
+                attempt: 0,
+            })
+    }
+
+    fn seat_of(&mut self, caller: &Caller) -> Att {
+        if let Some(att) = self.find_seat(caller) {
+            return att;
+        }
+        let Some(origin) = &caller.origin else {
+            return Att::from(caller);
+        };
+        if self.seats.len() >= SEATS_MAX
+            && let Some((&oldest, _)) = self.seats.iter().next()
+        {
+            // An ask it made keeps its own copy of where the answer goes.
+            self.drop_seat(oldest);
+        }
+        let slot = SEAT_BASE + self.next_seat;
+        self.next_seat += 1;
+        self.seats.insert(
+            slot,
+            Seat {
+                project_id: origin.project_id.clone(),
+                instance: origin.instance,
+                att: Att::from(caller),
+            },
+        );
+        Att {
+            slot,
+            uid: 0,
+            attempt: 0,
+        }
+    }
+
+    fn drop_seat(&mut self, slot: usize) {
+        self.seats.remove(&slot);
+        self.watches.retain(|(watcher, _)| watcher.slot != slot);
+    }
+
+    fn seat_gone(&mut self, project: &str, instance: u64, att: Att) {
+        let gone = Seat {
+            project_id: project.to_owned(),
+            instance,
+            att,
+        };
+        let slots: Vec<usize> = self
+            .seats
+            .iter()
+            .filter(|(_, seat)| **seat == gone)
+            .map(|(slot, _)| *slot)
+            .collect();
+        for slot in slots {
+            self.drop_seat(slot);
+        }
+    }
+
+    /// The bridge state's shared side of `project` while it is the instance
+    /// `instance`.
+    fn peer(&self, project: &str, instance: u64) -> Option<Arc<Shared>> {
+        #[cfg(test)]
+        if let Some(shared) = self.peers.get(&(project.to_owned(), instance)) {
+            return Some(Arc::clone(shared));
+        }
+        self.shared
+            .directory
+            .get()
+            .and_then(|directory| directory.by_id(project))
+            .and_then(|entry| entry.ctx())
+            .map(|ctx| Arc::clone(&ctx.shared))
+            .filter(|shared| shared.bridge_instance == instance)
+    }
+
+    /// Hand a debt to another project's bridge state. Lossless while that
+    /// bridge instance runs; false when it does not.
+    fn send_to(&self, project: &str, instance: u64, owed: Owed) -> bool {
+        match self.peer(project, instance) {
+            Some(shared) => {
+                shared.owe(owed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A notice for the caller `seat`, in its own project.
+    fn forward(&mut self, seat: &Seat, notice: Notice, wake: String, ended: Option<String>) {
+        let forward = Forward {
+            to: seat.att,
+            to_instance: seat.instance,
+            from_project: self.own_id(),
+            from_instance: self.shared.bridge_instance,
+            notice,
+            wake,
+            ended,
+        };
+        if !self.send_to(&seat.project_id, seat.instance, Owed::Forwarded(forward)) {
+            // Its project closed: nobody there to tell.
+            self.seat_gone(&seat.project_id, seat.instance, seat.att);
+        }
+    }
+
+    /// The end of an ask a caller from another project made here.
+    fn notify_foreign_sender(&mut self, request: &str, state: &'static str) {
+        let Some(seat) = self.requests.get(request).and_then(|r| r.seat.clone()) else {
+            return;
+        };
+        let name = super::header_name(&self.own_name());
+        // The command names the project by its id, which never changes and
+        // needs no quoting; the notice shows its name.
+        let id = self.own_id();
+        let fact = Fact::RequestEndedIn {
+            request: request.to_owned(),
+            name: name.chars().take(16).collect(),
+            project: id.clone(),
+            state: state.to_owned(),
+        };
+        let body = self.requests.get(request).and_then(|r| {
+            r.reply.as_ref().map(|reply| {
+                render::framed_reply(
+                    &format!("{} in project {name}", r.target_id),
+                    &format!("{request} --project {id}"),
+                    reply.expose(),
+                )
+            })
+        });
+        let notice = Notice {
+            source: String::new(),
+            text: render::sentence("", &fact, false),
+            wanted: true,
+            body,
+        };
+        let wake = render::wake_text("", &fact, false);
+        self.forward(&seat, notice, wake, Some(request.to_owned()));
+    }
+
+    /// A notice from another project for a terminal here.
+    fn on_forwarded(&mut self, forward: Forward) {
+        if forward.to_instance != self.shared.bridge_instance {
+            // Meant for an earlier opening of this project: its terminals'
+            // numbers mean other conversations now.
+            return;
+        }
+        if let Some(request) = &forward.ended {
+            let before = self.foreign_asks.len();
+            self.foreign_asks.retain(|ask| {
+                !(ask.project_id == forward.from_project
+                    && ask.project_instance == forward.from_instance
+                    && ask.request == *request)
+            });
+            if self.foreign_asks.len() == before {
+                // The answer came before its ask was recorded here.
+                if self.tombstones.len() >= TOMBSTONES_MAX {
+                    self.tombstones.pop_front();
+                }
+                self.tombstones.push_back((
+                    forward.from_project.clone(),
+                    forward.from_instance,
+                    request.clone(),
+                ));
+            }
+        }
+        match self.slot_of(forward.to).filter(|slot| self.live(slot)) {
+            Some(slot) => {
+                let wanted = forward.notice.wanted;
+                self.route(forward.to, &slot, forward.notice, forward.wake, wanted);
+            }
+            None => {
+                // That conversation is over: its seat there can go.
+                let own = self.own_id();
+                self.send_to(
+                    &forward.from_project,
+                    forward.from_instance,
+                    Owed::SeatGone {
+                        project: own,
+                        instance: self.shared.bridge_instance,
+                        att: forward.to,
+                    },
+                );
+            }
+        }
+    }
+
+    fn on_foreign_ask(&mut self, ask: ForeignAsk) {
+        if let Some(index) = self
+            .tombstones
+            .iter()
+            .position(|(project, instance, request)| {
+                *project == ask.project_id
+                    && *instance == ask.project_instance
+                    && *request == ask.request
+            })
+        {
+            self.tombstones.remove(index);
+            return;
+        }
+        if self.is_current(ask.att) {
+            self.foreign_asks.push(ask);
+        }
+    }
+
+    /// An ask made in a project that has closed since will never be
+    /// answered: its asker is told so, and is no longer held.
+    fn check_foreign_asks(&mut self) {
+        if self.foreign_asks.is_empty() {
+            return;
+        }
+        let (open, closed): (Vec<ForeignAsk>, Vec<ForeignAsk>) =
+            std::mem::take(&mut self.foreign_asks)
+                .into_iter()
+                .partition(|ask| self.peer(&ask.project_id, ask.project_instance).is_some());
+        self.foreign_asks = open;
+        for ask in closed {
+            let Some(slot) = self.slot_of(ask.att).filter(|slot| self.live(slot)) else {
+                continue;
+            };
+            let fact = Fact::Note {
+                text: format!(
+                    "Request {} in project {} ended (exited): that project was closed before it answered.",
+                    ask.request,
+                    super::header_name(&ask.project_name)
+                ),
+            };
+            let notice = Notice {
+                source: String::new(),
+                text: render::sentence("", &fact, false),
+                wanted: true,
+                body: None,
+            };
+            let wake = render::wake_text("", &fact, false);
+            self.route(ask.att, &slot, notice, wake, true);
         }
     }
 
@@ -1532,6 +2468,7 @@ impl State {
             merged.wanted_ids.extend(more.wanted_ids);
         }
         inbox.lost += reservation.lost;
+        inbox.memory_version = inbox.memory_version.max(reservation.memory_version);
         if reservation.first {
             inbox.first_done = false;
         }
@@ -1631,6 +2568,21 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        rig_with(Null)
+    }
+
+    /// Audit lines, kept for a test to read.
+    #[derive(Clone, Default)]
+    struct Kept(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Sink for Kept {
+        fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(line.to_owned());
+            Ok(())
+        }
+    }
+
+    fn rig_with(sink: impl Sink) -> Rig {
         let root = std::env::temp_dir().join(format!("mg-state-{}", std::process::id()));
         let layout = Layout {
             data_root: root.join("data"),
@@ -1638,7 +2590,7 @@ mod tests {
         };
         let shared = Shared::new(
             layout.clone(),
-            Audit::with_sink(Null).unwrap(),
+            Audit::with_sink(sink).unwrap(),
             Arc::new(|| {}),
             None,
             "",
@@ -1693,6 +2645,20 @@ mod tests {
                 uid: att.uid,
                 id: slot.id.clone(),
                 attempt: att.attempt,
+                origin: None,
+            }
+        }
+
+        /// `slot`'s caller as if it came from another project, with the same
+        /// slot, uid, attempt and id as a terminal here.
+        fn stranger(&self, slot: &Slot) -> Caller {
+            Caller {
+                origin: Some(Arc::new(super::super::Origin {
+                    project_id: "other".into(),
+                    project_name: "other".into(),
+                    instance: 7,
+                })),
+                ..self.caller(slot)
             }
         }
 
@@ -1759,6 +2725,137 @@ mod tests {
         // The next stop tries again.
         rig.state.left_working(att);
         assert!(rig.inbox(&a).wake.is_some());
+    }
+
+    /// The safety net: wanted notices left in the inbox of an idle terminal
+    /// (its wake found it busy, not ready, or behind a draft) get a wake again,
+    /// never at once, never while one is on its way, never while paused or
+    /// while the terminal works, and less often each time.
+    #[test]
+    fn wanted_notices_left_behind_get_a_wake_again_with_backoff() {
+        let mut rig = rig();
+        rig.state.retry_first = Duration::from_millis(150);
+        let a = Arc::clone(&rig.a);
+        rig.wanted(&a, 2, "b");
+        rig.state.tick();
+        assert!(rig.inbox(&a).wake.is_none(), "nothing retries at once");
+        thread::sleep(Duration::from_millis(200));
+        // Not while paused.
+        rig.shared.pause().pause();
+        rig.state.tick();
+        assert!(rig.inbox(&a).wake.is_none(), "paused: nothing is tried");
+        rig.shared.pause().resume();
+        rig.state.tick();
+        assert!(
+            rig.inbox(&a).wake.is_some(),
+            "due and idle: one wake goes out"
+        );
+        assert!(!rig.inbox(&a).any_wanted());
+        // One in flight: no second.
+        rig.state.tick();
+        rig.settle();
+        assert!(
+            rig.inbox(&a).wake.is_none(),
+            "refused: no process to type into"
+        );
+        assert!(rig.inbox(&a).any_wanted(), "the notices are wanted again");
+        // The next try waits twice as long.
+        rig.state.tick();
+        assert!(rig.inbox(&a).wake.is_none(), "backing off");
+        thread::sleep(Duration::from_millis(320));
+        rig.state.tick();
+        assert!(
+            rig.inbox(&a).wake.is_some(),
+            "tried again after the longer wait"
+        );
+        rig.settle();
+        // Drained: the schedule is dropped.
+        let caller = rig.caller(&a);
+        let drained = rig.state.drain(&caller).unwrap();
+        rig.state.drain_done(drained.reservation, true);
+        rig.state.tick();
+        assert!(rig.inbox(&a).retry.is_none());
+    }
+
+    /// What the audit log says of a wake that typed nothing is one of a fixed
+    /// set: no notice text, no screen text, no error message.
+    #[test]
+    fn wake_audit_reasons_come_from_a_fixed_set() {
+        let kept = Kept::default();
+        let mut rig = rig_with(kept.clone());
+        rig.state.retry_first = Duration::ZERO;
+        let a = Arc::clone(&rig.a);
+        let att = rig.att(&a);
+        let secret = "token sk-live-0000 on screen";
+        // One wake goes out; a second notice parks behind it.
+        for _ in 0..2 {
+            rig.state
+                .route(att, &a, notice("b", secret, true), secret.to_owned(), true);
+        }
+        rig.settle();
+        // The safety net tries again.
+        rig.state.tick();
+        rig.state.tick();
+        rig.settle();
+        assert!(rig.shared.gate().flush(Duration::from_secs(2)));
+        let fixed: Vec<(&str, &str)> = WakeNote::ALL.iter().map(|n| n.audit()).collect();
+        let lines = kept.0.lock().unwrap().clone();
+        let mut seen = std::collections::BTreeSet::new();
+        for line in &lines {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            if record["action"] != "wake" || record["decision"] != "outcome" {
+                continue;
+            }
+            let pair = (
+                record["outcome"].as_str().unwrap().to_owned(),
+                record["reason"].as_str().unwrap().to_owned(),
+            );
+            assert!(!line.contains("sk-live"), "{line}");
+            assert!(
+                pair.1.is_empty()
+                    || fixed
+                        .iter()
+                        .any(|(o, r)| (*o, *r) == (pair.0.as_str(), pair.1.as_str())),
+                "{pair:?}"
+            );
+            seen.insert(pair.0);
+        }
+        assert!(
+            seen.contains("parked") && seen.contains("retried"),
+            "{seen:?}"
+        );
+    }
+
+    /// The safety net leaves a working terminal alone: its wake waits for
+    /// the turn to end.
+    #[test]
+    fn a_working_terminal_gets_no_retried_wake() {
+        let mut rig = rig();
+        rig.state.retry_first = Duration::ZERO;
+        let a = Arc::clone(&rig.a);
+        // With its actor gone, the published phase stays as set.
+        assert!(a.end_actor());
+        a.set_published(Phase::Working, false);
+        rig.wanted(&a, 1, "b");
+        rig.state.tick();
+        rig.state.tick();
+        assert!(rig.inbox(&a).wake.is_none());
+        assert!(rig.inbox(&a).retry.is_none(), "no try is even scheduled");
+        assert!(
+            rig.inbox(&a).any_wanted(),
+            "still waiting for the turn to end"
+        );
+        a.set_published(Phase::Idle, false);
+        rig.state.tick();
+        assert!(
+            rig.inbox(&a).retry.is_some_and(|r| r.tries == 0),
+            "the wait starts once it is idle"
+        );
+        rig.state.tick();
+        // The ended actor cannot take it, so it is given back at once; the
+        // schedule shows the try.
+        assert!(rig.inbox(&a).retry.is_some_and(|r| r.tries == 1));
+        assert!(rig.inbox(&a).any_wanted());
     }
 
     /// T40: a released drain reservation restores the notices with the wanted
@@ -1908,7 +3005,395 @@ mod tests {
         assert!(rig.state.reservations.is_empty());
     }
 
+    /// A new memory version is announced at the next prompt only: it wakes
+    /// nobody, a failed write keeps it, and versions waiting merge into one
+    /// notice naming the latest (spec §6.1).
+    #[test]
+    fn memory_versions_wait_for_the_prompt_and_merge_into_one_notice() {
+        let mut rig = rig();
+        let a = Arc::clone(&rig.a);
+        let caller = rig.caller(&a);
+        let first = rig.state.drain_with(&caller, Some(3), None).unwrap();
+        assert!(rig.inbox(&a).wake.is_none(), "nothing was woken");
+        rig.shared.owe(Owed::DrainDone {
+            reservation: first.reservation,
+            written: false,
+        });
+        rig.state.pay_debts();
+        assert_eq!(
+            rig.inbox(&a).memory_version,
+            Some(3),
+            "kept for the next prompt"
+        );
+        assert!(rig.inbox(&a).wake.is_none());
+        let next = rig.state.drain_with(&caller, Some(5), None).unwrap();
+        let body = String::from_utf8(next.body).unwrap();
+        assert_eq!(
+            body.matches("project memory updated to version").count(),
+            1,
+            "{body}"
+        );
+        assert!(
+            body.contains("project memory updated to version 5"),
+            "{body}"
+        );
+        rig.shared.owe(Owed::DrainDone {
+            reservation: next.reservation,
+            written: true,
+        });
+        rig.state.pay_debts();
+        assert_eq!(rig.inbox(&a).memory_version, None);
+        let quiet = rig.state.drain_with(&caller, None, None).unwrap();
+        assert!(quiet.body.is_empty(), "nothing new: nothing printed");
+    }
+
     /// Finding 4: a report stamped with an earlier attempt changes nothing.
+    #[test]
+    fn a_caller_from_another_project_is_never_taken_for_a_terminal_here() {
+        let mut rig = rig();
+        let (a, b) = (Arc::clone(&rig.a), Arc::clone(&rig.b));
+        // Same slot, uid, attempt and id as `a`, but from another project.
+        let stranger = rig.stranger(&a);
+        let seat = rig.state.seat_of(&stranger);
+        assert_ne!(seat, rig.att(&a));
+        assert!(State::is_seat(seat));
+        assert_eq!(rig.state.seat_of(&stranger), seat, "one seat per caller");
+        // Its list names no terminal as itself.
+        let list = rig.state.list(&stranger);
+        assert!(list.header["self"].is_null(), "{:?}", list.header);
+        // A watch is the seat's, not `a`'s: `a` is not woken by `b`'s events.
+        assert!(rig.state.watch(&stranger, &b.id, true).is_ok());
+        assert!(rig.state.watches.contains(&(seat, rig.att(&b))));
+        assert!(!rig.state.watches.contains(&(rig.att(&a), rig.att(&b))));
+        // And `a`'s own request is not the stranger's to read.
+        let id = typed_send(&mut rig, false);
+        assert!(rig.state.result(&id, &rig.caller(&a)).is_ok());
+        let theirs = rig.state.result(&id, &stranger);
+        assert_eq!(
+            theirs.header["code"], "unknown_request",
+            "{:?}",
+            theirs.header
+        );
+    }
+
+    #[test]
+    fn an_ask_in_another_project_holds_the_askers_turns_until_its_answer() {
+        let mut rig = rig();
+        let mine = rig.shared.bridge_instance;
+        let a = Arc::clone(&rig.a);
+        let att = rig.att(&a);
+        let ask = |request: &str| {
+            Owed::ForeignAsk(ForeignAsk {
+                att,
+                project_id: "other".into(),
+                project_instance: 9,
+                project_name: "other".into(),
+                request: request.into(),
+            })
+        };
+        let answer = |request: &str, to_instance: u64| {
+            Owed::Forwarded(Forward {
+                to: att,
+                to_instance,
+                from_project: "other".into(),
+                from_instance: 9,
+                notice: notice("", "Request r1 in project other ended (ok).", true),
+                wake: "[connecto notice] x".into(),
+                ended: Some(request.into()),
+            })
+        };
+        // Debts, not queue messages: a full queue cannot lose them.
+        rig.shared.owe(ask("r1"));
+        rig.state.handle(Msg::Poke);
+        assert!(rig.state.awaits(att));
+        rig.shared.owe(answer("r1", mine));
+        rig.state.handle(Msg::Poke);
+        assert!(!rig.state.awaits(att));
+        // An answer that overtakes its ask leaves nothing held.
+        rig.shared.owe(answer("r2", mine));
+        rig.shared.owe(ask("r2"));
+        rig.state.handle(Msg::Poke);
+        assert!(!rig.state.awaits(att));
+        // And the answer reached the asker: in its inbox, or in a wake.
+        let inbox = rig.inbox(&a);
+        let woken = matches!(
+            inbox.wake.as_ref().map(|flight| &flight.why),
+            Some(Why::Event(notice)) if notice.text.contains("in project other")
+        );
+        assert!(
+            woken
+                || inbox
+                    .entries
+                    .iter()
+                    .any(|entry| entry.notice.text.contains("in project other"))
+        );
+    }
+
+    /// Three projects; the two askers have the same slot, uid and attempt,
+    /// and their own state queues are full. Each answer still reaches only
+    /// the project that asked, and releases its asker's own ask there.
+    #[test]
+    fn an_answer_reaches_only_the_project_that_asked_even_with_full_queues() {
+        let mut beta = rig();
+        let mut alpha = rig();
+        let mut gamma = rig();
+        let _ = beta
+            .shared
+            .memory_project
+            .set(("beta".into(), std::path::PathBuf::from("/w/beta")));
+        // The askers' queues are full: nothing may ride on them.
+        let mut held = Vec::new();
+        for caller in [&alpha, &gamma] {
+            let (tx, rx) = bounded(1);
+            tx.try_send(Msg::Poke).unwrap();
+            let _ = caller.shared.state.set(tx);
+            held.push(rx);
+        }
+        let beta_instance = beta.shared.bridge_instance;
+        for (name, caller) in [("alpha", &alpha), ("gamma", &gamma)] {
+            beta.state.peers.insert(
+                (name.into(), caller.shared.bridge_instance),
+                Arc::clone(&caller.shared),
+            );
+        }
+        for caller in [&mut alpha, &mut gamma] {
+            caller
+                .state
+                .peers
+                .insert(("beta".into(), beta_instance), Arc::clone(&beta.shared));
+        }
+        let from = |rig: &Rig, project: &str| Caller {
+            origin: Some(Arc::new(super::super::Origin {
+                project_id: project.into(),
+                project_name: project.into(),
+                instance: rig.shared.bridge_instance,
+            })),
+            ..rig.caller(&rig.a)
+        };
+        let (from_alpha, from_gamma) = (from(&alpha, "alpha"), from(&gamma, "gamma"));
+        assert_eq!(Att::from(&from_alpha), Att::from(&from_gamma));
+        let b = Arc::clone(&beta.b);
+        let att_b = beta.att(&b);
+        let mut ask = |caller: &Caller| {
+            let id = beta
+                .state
+                .admit(caller, "b", AdmitKind::Send { ask: true })
+                .ok()
+                .unwrap()
+                .id;
+            beta.state
+                .on_typing(att_b, &id, WriteKind::Send, WriteOutcome::Typed);
+            id
+        };
+        let (for_alpha, for_gamma) = (ask(&from_alpha), ask(&from_gamma));
+        // Each asker's own project records its ask, as the handler does.
+        for (rig, request) in [(&mut alpha, &for_alpha), (&mut gamma, &for_gamma)] {
+            let att = rig.att(&rig.a);
+            rig.shared.owe(Owed::ForeignAsk(ForeignAsk {
+                att,
+                project_id: "beta".into(),
+                project_instance: beta_instance,
+                project_name: "beta".into(),
+                request: request.clone(),
+            }));
+            rig.state.pay_debts();
+            assert!(rig.state.awaits(att));
+        }
+        let heard = |rig: &mut Rig, text: &str| {
+            let a = Arc::clone(&rig.a);
+            rig.inbox(&a).entries.iter().any(|entry| {
+                entry
+                    .notice
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| body.contains(text))
+            })
+        };
+        beta.state.finish(
+            &for_alpha,
+            ReqState::Ok,
+            "",
+            Some(EventText::new("answer for alpha".into())),
+        );
+        alpha.state.pay_debts();
+        gamma.state.pay_debts();
+        assert!(heard(&mut alpha, "answer for alpha"));
+        assert!(!heard(&mut gamma, "answer for alpha"));
+        let (att_alpha, att_gamma) = (alpha.att(&alpha.a), gamma.att(&gamma.a));
+        assert!(!alpha.state.awaits(att_alpha), "alpha's ask is released");
+        assert!(gamma.state.awaits(att_gamma), "gamma's is not");
+        beta.state.finish(
+            &for_gamma,
+            ReqState::Ok,
+            "",
+            Some(EventText::new("answer for gamma".into())),
+        );
+        gamma.state.pay_debts();
+        alpha.state.pay_debts();
+        assert!(heard(&mut gamma, "answer for gamma"));
+        assert!(!heard(&mut alpha, "answer for gamma"));
+        assert!(!gamma.state.awaits(att_gamma));
+        drop(held);
+    }
+
+    /// A watched event forwarded to another project carries a key made of
+    /// the project's id, its bridge instance and the terminal, never its
+    /// name; an unwatch withdraws by that same key. Two projects with one
+    /// name, or a rename, cannot mix them up.
+    #[test]
+    fn notices_across_projects_are_keyed_by_project_id_instance_and_terminal() {
+        let mut beta = rig();
+        let alpha = rig();
+        let _ = beta
+            .shared
+            .memory_project
+            .set(("beta-id".into(), std::path::PathBuf::from("/w/shared-name")));
+        beta.state.peers.insert(
+            ("alpha".into(), alpha.shared.bridge_instance),
+            Arc::clone(&alpha.shared),
+        );
+        let watcher = Caller {
+            origin: Some(Arc::new(super::super::Origin {
+                project_id: "alpha".into(),
+                project_name: "alpha".into(),
+                instance: alpha.shared.bridge_instance,
+            })),
+            ..alpha.caller(&alpha.a)
+        };
+        let b = Arc::clone(&beta.b);
+        assert!(beta.state.watch(&watcher, "b", true).is_ok());
+        let att_b = beta.att(&b);
+        beta.state.deliver_event(att_b, "finished", None);
+        let key = format!("b in project beta-id#{}", beta.shared.bridge_instance);
+        let owed = alpha.shared.take_owed();
+        assert!(
+            owed.iter().any(|owed| matches!(
+                owed,
+                Owed::Forwarded(forward) if forward.notice.source == key
+                    && forward.notice.text.contains("in project shared-name")
+            )),
+            "{owed:?}"
+        );
+        assert!(beta.state.watch(&watcher, "b", false).is_ok());
+        let owed = alpha.shared.take_owed();
+        assert!(
+            owed.iter().any(|owed| matches!(
+                owed,
+                Owed::ForeignCancel { source, .. } if *source == key
+            )),
+            "{owed:?}"
+        );
+    }
+
+    /// A watch or unwatch from another project that a Pause overtook while
+    /// it was queued changes nothing: a watch set before stays, and no new
+    /// one is set.
+    #[test]
+    fn a_watch_change_refused_by_pause_keeps_the_watches_as_they_were() {
+        let mut rig = rig();
+        let (a, b) = (Arc::clone(&rig.a), Arc::clone(&rig.b));
+        let stranger = rig.stranger(&a);
+        assert!(rig.state.watch(&stranger, "b", true).is_ok());
+        let watching = |rig: &Rig| rig.state.watches.len();
+        assert_eq!(watching(&rig), 1);
+        let ask = |rig: &mut Rig, target: &str, on: bool| {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            rig.state.handle(Msg::Watch {
+                caller: stranger.clone(),
+                target: target.into(),
+                on,
+                still: Some(Box::new(|| false)),
+                reply: tx,
+            });
+            rx.recv().unwrap()
+        };
+        let repeated = ask(&mut rig, "b", true);
+        assert_eq!(repeated.header["code"], "paused");
+        assert_eq!(watching(&rig), 1);
+        let unwatch = ask(&mut rig, "b", false);
+        assert_eq!(unwatch.header["code"], "paused");
+        assert_eq!(watching(&rig), 1);
+        let att_b = rig.att(&b);
+        assert!(rig.state.watches.iter().any(|(_, target)| *target == att_b));
+        let other = ask(&mut rig, "a", true);
+        assert_eq!(other.header["code"], "paused");
+        assert_eq!(watching(&rig), 1);
+    }
+
+    /// `result` across projects is decided on who the request says asked:
+    /// a seat dropped since (past the cap) does not take the answer away,
+    /// and another caller still cannot read it.
+    #[test]
+    fn an_askers_result_survives_its_seat() {
+        let mut rig = rig();
+        let (a, b) = (Arc::clone(&rig.a), Arc::clone(&rig.b));
+        let asker = rig.stranger(&a);
+        let id = rig
+            .state
+            .admit(&asker, "b", AdmitKind::Send { ask: true })
+            .ok()
+            .unwrap()
+            .id;
+        let att_b = rig.att(&b);
+        rig.state
+            .on_typing(att_b, &id, WriteKind::Send, WriteOutcome::Typed);
+        rig.state
+            .finish(&id, ReqState::Ok, "", Some(EventText::new("whole".into())));
+        // Its project could not be reached, so its seat is gone already;
+        // drop it in any case, as the cap would.
+        if let Some(seat) = rig.state.find_seat(&asker) {
+            rig.state.drop_seat(seat.slot);
+        }
+        assert!(rig.state.find_seat(&asker).is_none());
+        let reply = rig.state.result(&id, &asker);
+        assert!(reply.is_ok(), "{:?}", reply.header);
+        assert_eq!(reply.body, b"whole");
+        let other = rig.stranger(&b);
+        assert_eq!(
+            rig.state.result(&id, &other).header["code"],
+            "unknown_request"
+        );
+    }
+
+    /// A project closed and opened again counts its terminals anew, so the
+    /// same slot, uid and attempt are another conversation: it gets a seat
+    /// of its own, and nothing meant for the earlier one reaches it.
+    #[test]
+    fn a_reopened_project_is_a_new_bridge_instance_and_inherits_nothing() {
+        let mut rig = rig();
+        let (a, b) = (Arc::clone(&rig.a), Arc::clone(&rig.b));
+        let before = rig.stranger(&a);
+        let mut after = before.clone();
+        after.origin = Some(Arc::new(super::super::Origin {
+            instance: 8,
+            ..(**before.origin.as_ref().unwrap()).clone()
+        }));
+        let old_seat = rig.state.seat_of(&before);
+        assert!(rig.state.watch(&before, &b.id, true).is_ok());
+        let new_seat = rig.state.seat_of(&after);
+        assert_ne!(new_seat, old_seat);
+        let att_b = rig.att(&b);
+        assert!(rig.state.watches.contains(&(old_seat, att_b)));
+        assert!(
+            !rig.state.watches.contains(&(new_seat, att_b)),
+            "the old watch is not the new one's"
+        );
+        // A forward for this project's earlier instance is dropped.
+        let att = rig.att(&a);
+        let stale = Forward {
+            to: att,
+            to_instance: rig.shared.bridge_instance + 1000,
+            from_project: "other".into(),
+            from_instance: 9,
+            notice: notice("", "old news", true),
+            wake: "[connecto notice] old news".into(),
+            ended: None,
+        };
+        rig.state.on_forwarded(stale);
+        let inbox = rig.inbox(&a);
+        assert!(inbox.wake.is_none() && inbox.entries.is_empty());
+    }
+
     #[test]
     fn a_report_from_an_earlier_attempt_does_not_touch_the_new_one() {
         assert!(is_stale(3, 4));
@@ -2302,5 +3787,100 @@ mod tests {
         );
         rig.state.left_working(att);
         assert!(rig.inbox(&a).wake.is_some(), "the next stop wakes it again");
+    }
+
+    /// ADR 0030: an update saves the asks open now, by terminal id; only
+    /// typed ones, and not after they ended.
+    #[test]
+    fn the_open_asks_are_the_typed_ones_not_yet_answered() {
+        let mut rig = rig();
+        assert!(rig.state.open_asks().is_empty());
+        let id = typed_send(&mut rig, true);
+        let _plain = typed_send(&mut rig, false);
+        assert_eq!(
+            rig.state.open_asks(),
+            vec![OpenAsk {
+                request: id.clone(),
+                from: "a".to_owned(),
+                target: "b".to_owned(),
+            }]
+        );
+        rig.state.finish(&id, ReqState::Ok, "", None);
+        assert!(rig.state.open_asks().is_empty());
+    }
+
+    /// ADR 0030: an ask an update cut is opened again once its target runs,
+    /// keeps its id, ends with the target's next turn, and its answer waits
+    /// for the asker to run before it is given.
+    #[test]
+    fn a_restored_ask_ends_with_the_targets_next_turn_and_reaches_the_asker() {
+        let mut rig = rig();
+        let (a, b) = (Arc::clone(&rig.a), Arc::clone(&rig.b));
+        rig.state.assume_live = false;
+        rig.shared.restore_asks(vec![OpenAsk {
+            request: "r13".to_owned(),
+            from: "a".to_owned(),
+            target: "b".to_owned(),
+        }]);
+        rig.state.open_restored();
+        assert!(
+            !rig.state.requests.contains_key("r13"),
+            "not before its target runs"
+        );
+        assert_eq!(rig.state.restoring.len(), 1);
+        rig.state.assume_live = true;
+        rig.state.open_restored();
+        let request = &rig.state.requests["r13"];
+        assert!(request.restored && request.bound && request.state == ReqState::Pending);
+        assert_eq!(rig.state.next_request, 14, "new ids come after it");
+        assert_eq!(
+            rig.state.open_asks().len(),
+            1,
+            "a second update saves it again"
+        );
+        // The asker sees it as its own open ask.
+        let att_a = rig.att(&a);
+        assert!(rig.state.awaits(att_a));
+        // The target's turn ends while the asker is not running yet.
+        rig.state.assume_live = false;
+        let att_b = rig.att(&b);
+        rig.state.on_signal(att_b, Signal::Finished);
+        assert_eq!(rig.state.requests["r13"].state, ReqState::Ok);
+        assert_eq!(
+            rig.state.deferred.len(),
+            1,
+            "the answer waits for the asker"
+        );
+        assert!(rig.inbox(&a).entries.is_empty() && rig.inbox(&a).wake.is_none());
+        rig.state.assume_live = true;
+        rig.state.retry_deferred();
+        assert!(rig.state.deferred.is_empty());
+        let inbox = rig.inbox(&a);
+        assert!(
+            inbox.wake.is_some() || inbox.any_wanted(),
+            "the asker is told its ask ended"
+        );
+    }
+
+    /// ADR 0030: a restored ask whose target does not run again in time ends
+    /// as exited, so its asker is not left waiting.
+    #[test]
+    fn a_restored_ask_whose_target_never_runs_ends_as_exited() {
+        let mut rig = rig();
+        rig.state.assume_live = false;
+        let long_ago = Instant::now()
+            .checked_sub(BOOT_CAP + Duration::from_secs(1))
+            .unwrap();
+        rig.state.restoring.push((
+            OpenAsk {
+                request: "r4".to_owned(),
+                from: "a".to_owned(),
+                target: "b".to_owned(),
+            },
+            long_ago,
+        ));
+        rig.state.open_restored();
+        assert!(rig.state.restoring.is_empty());
+        assert_eq!(rig.state.requests["r4"].state, ReqState::Exited);
     }
 }

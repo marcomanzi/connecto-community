@@ -10,17 +10,21 @@ use std::time::{Duration, Instant, SystemTime};
 use arc_swap::ArcSwap;
 use connecto_core::{
     HomeMigration, InstallState, InstalledPackage, PackageItem, PackagesView, ProjectPackages,
-    ProjectPackagesView, ProjectSettings, ToolKind,
+    ProjectPackagesView, ProjectSettings, RequirementState, RequirementView, ToolKind,
 };
 use connecto_hook::package::{self, FILE_NAME, Manifest};
+use connecto_hook::requires::{Os, Requirement};
 use connecto_session::Wake;
 use connecto_session::project_settings;
-use crossbeam_channel::{Receiver, RecvTimeoutError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 
 use crate::host::Host;
-use crate::package::{BUILTIN_ID, Package, Seen, Variant, builtin, load_dir, signature};
+use crate::package::{
+    BUILTIN_ID, GAME_DEV_ID, Package, Seen, Variant, builtin, game_dev, is_builtin, load_dir,
+    signature,
+};
 use crate::state::State;
-use crate::{guide, home, install, session};
+use crate::{bundle, guide, home, install, session};
 
 pub const TICK: Duration = Duration::from_millis(400);
 const OPEN_LIMIT: Duration = Duration::from_secs(30);
@@ -39,9 +43,48 @@ pub enum Cmd {
     },
     Edit(String),
     Delete(String),
+    /// Write the package as one file at the path.
+    Export {
+        id: String,
+        dest: PathBuf,
+    },
+    /// Add the package in the exported file as a new package.
+    Import(PathBuf),
     SetProject(String, ProjectSettings),
+    /// As `SetProject`, from a peer from before OpenCode: the project keeps
+    /// the OpenCode config it has when this is applied.
+    SetProjectKeepingOpenCode(String, ProjectSettings),
+    /// As `SetProject`, from a peer from before sets of tools: its one tool
+    /// or all is resolved against the project's set when this is applied
+    /// (`ProjectTools::from_older_peer`). `SetProjectKeepingOpenCode` does
+    /// the same.
+    SetProjectKeepingTools(String, ProjectSettings),
     Refresh(String),
+    /// Look again for the tools a package needs.
+    CheckRequirements(String),
+    /// Run a tool's install command in a new shell terminal of the project.
+    InstallRequirement {
+        project: String,
+        package: String,
+        requirement: String,
+        /// The command the user approved; run only if it is still the one.
+        command: String,
+    },
     Stop,
+}
+
+/// Looks for one tool: [`crate::requires::detect`] outside tests.
+/// The second argument is the folders a found program may not be in
+/// ([`crate::requires::locate_all`]).
+pub type Detector = Arc<dyn Fn(&Requirement, &[PathBuf]) -> RequirementState + Send + Sync>;
+
+/// What is known of the tools one package needs.
+struct Checks {
+    /// The requirements these states are for; a change starts a new look.
+    requires: Vec<Requirement>,
+    states: Vec<RequirementState>,
+    /// The look whose answer counts (older answers are dropped).
+    generation: u64,
 }
 
 pub struct Config {
@@ -50,6 +93,8 @@ pub struct Config {
     pub user_home: PathBuf,
     pub host: Arc<dyn Host>,
     pub wake: Wake,
+    /// How the tools packages need are looked for; `None`: on this machine.
+    pub detector: Option<Detector>,
 }
 
 /// One folder in `<home>/packages/`.
@@ -95,6 +140,14 @@ pub struct Core {
     state: State,
     registry: Vec<Entry>,
     builtins: HashMap<Variant, Arc<Package>>,
+    game_dev: Option<Arc<Package>>,
+    /// By package id.
+    checks: HashMap<String, Checks>,
+    checked_tx: Sender<(String, u64, Vec<RequirementState>)>,
+    checked_rx: Receiver<(String, u64, Vec<RequirementState>)>,
+    detector: Detector,
+    /// Numbers each look, so only the latest one's answer counts.
+    generation: u64,
     projects: Vec<ProjectState>,
     openings: Vec<Opening>,
     bindings: Vec<Binding>,
@@ -103,6 +156,8 @@ pub struct Core {
     /// How long an install waits for a launch in progress.
     lease_wait: Duration,
     last_error: Option<String>,
+    /// What the last export or import did, cleared by the next command.
+    notice: Option<String>,
     /// The packages folder could not be listed on the last try. A package
     /// missing from the registry is then unknown, not removed.
     unreadable: bool,
@@ -117,6 +172,60 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// The longest missing-tool warning. A remote Project Settings keeps at most
+/// 512 bytes of a line (`MAX_LINE` in `connecto-net/src/project_panels.rs`,
+/// older peers included), and a command, steps or link cut short must never
+/// be shown.
+const WARNING_MAX: usize = 400;
+/// The most of a package id or tool name a warning repeats.
+const WARNING_NAME_MAX: usize = 80;
+
+/// `text`, cut to at most `max` bytes on a character boundary.
+fn capped(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max - '…'.len_utf8();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// What the project's status says of a tool an installed package needs and
+/// the last look did not find. It says how to get it by hand, which works
+/// however the package came in (chosen, the default, or extended by
+/// another). The first of these that fits in [`WARNING_MAX`]: with this
+/// system's install command, with the manual steps, with the link, or plain.
+/// The plain one always fits: the names in it are capped.
+fn missing_tool_warning(package: &str, req: &Requirement, os: Os) -> String {
+    let lead = format!(
+        "{} needs {}, which is not installed here in a version it can use.",
+        capped(package, WARNING_NAME_MAX),
+        capped(&req.name, WARNING_NAME_MAX)
+    );
+    let after = "Restart Connecto once it is installed, so it looks again.";
+    let mut candidates = Vec::new();
+    if let Some(command) = req.install_on(os) {
+        // The command last, so nothing of the sentence is copied with it.
+        candidates.push(format!(
+            "{lead} {after} To install it, run in a terminal: {command}"
+        ));
+    }
+    if !req.manual.is_empty() {
+        candidates.push(format!("{lead} {after} To install it: {}", req.manual));
+    }
+    if let Some(url) = &req.url {
+        candidates.push(format!("{lead} Install it by hand (see {url}). {after}"));
+    }
+    candidates
+        .into_iter()
+        .find(|line| line.len() <= WARNING_MAX)
+        .unwrap_or_else(|| {
+            format!("{lead} Install it by hand, then restart Connecto so it looks again.")
+        })
+}
+
 impl Core {
     pub fn new(cfg: Config) -> Self {
         let crate::state::Loaded { state, warning } = State::load(&cfg.data_root);
@@ -124,6 +233,16 @@ impl Core {
             .host
             .saved_home()
             .map(|p| fs::canonicalize(&p).unwrap_or(p));
+        let (checked_tx, checked_rx) = unbounded();
+        let detector: Detector = cfg.detector.clone().unwrap_or_else(|| {
+            let home = cfg.user_home.clone();
+            Arc::new(move |req: &Requirement, untrusted: &[PathBuf]| {
+                // Made again for each look, so one after an install sees the
+                // PATH as it is now (on Windows, as saved in the registry).
+                let search = crate::requires::Search::here(&home);
+                crate::requires::detect(req, &search, untrusted, &crate::requires::version_output)
+            })
+        });
         let mut core = Self {
             view: Arc::new(ArcSwap::from_pointee(PackagesView::default())),
             home,
@@ -131,6 +250,12 @@ impl Core {
             state,
             registry: Vec::new(),
             builtins: HashMap::new(),
+            game_dev: None,
+            checks: HashMap::new(),
+            checked_tx,
+            checked_rx,
+            detector,
+            generation: 0,
             projects: Vec::new(),
             openings: Vec::new(),
             bindings: Vec::new(),
@@ -138,6 +263,7 @@ impl Core {
             unsettled: false,
             lease_wait: Duration::from_secs(5),
             last_error: warning,
+            notice: None,
             unreadable: false,
             revision: 0,
             dirty: true,
@@ -145,6 +271,7 @@ impl Core {
             cfg,
         };
         core.reload_registry();
+        core.check_changed_requirements();
         core
     }
 
@@ -153,6 +280,7 @@ impl Core {
     }
 
     fn fail(&mut self, why: String) {
+        self.notice = None;
         self.last_error = Some(why);
         self.dirty = true;
     }
@@ -166,6 +294,272 @@ impl Core {
         Ok(package)
     }
 
+    fn game_dev_package(&mut self) -> Result<Arc<Package>, String> {
+        if let Some(found) = &self.game_dev {
+            return Ok(Arc::clone(found));
+        }
+        let package = Arc::new(game_dev()?);
+        self.game_dev = Some(Arc::clone(&package));
+        Ok(package)
+    }
+
+    /// Every package that loads, with what it needs: the built-in ones, then
+    /// the user's.
+    fn all_requirements(&mut self) -> Vec<(String, Vec<Requirement>)> {
+        let mut out = Vec::new();
+        if let Ok(game) = self.game_dev_package() {
+            out.push((GAME_DEV_ID.to_owned(), game.manifest.requires.clone()));
+        }
+        for entry in &self.registry {
+            if let Ok(package) = &entry.package {
+                out.push((entry.id.clone(), package.manifest.requires.clone()));
+            }
+        }
+        out
+    }
+
+    /// Where packages and what they install live: Connecto Home, Connecto's
+    /// data, and every open project. A program found there came with a
+    /// package (or a project), so it is neither found nor run.
+    fn untrusted(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self.home.iter().cloned().collect();
+        out.push(self.cfg.data_root.clone());
+        out.extend(self.projects.iter().map(|p| p.path.clone()));
+        out.extend(self.cfg.host.projects().into_iter().map(|p| p.path));
+        out
+    }
+
+    /// The package and the packages it extends, in that order.
+    fn chain_of(&self, id: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut next = Some(connecto_core::current_package_id(id).to_owned());
+        while let Some(id) = next
+            .take()
+            .filter(|i| !out.contains(i) && out.len() < MAX_DEPTH)
+        {
+            next = self
+                .registry
+                .iter()
+                .find(|e| e.id == id)
+                .and_then(|e| e.package.as_ref().ok())
+                .and_then(|p| p.manifest.extends.clone());
+            out.push(id);
+        }
+        out
+    }
+
+    /// Look now, on this thread, for the tools of the packages `settings`
+    /// adds to the project (or the default package it turns on), with what
+    /// they extend: the view's answer may be old. Why one cannot be added,
+    /// if it cannot.
+    fn verify_added(&mut self, project: &str, settings: &ProjectSettings) -> Option<String> {
+        let before = self
+            .projects
+            .iter()
+            .find(|p| p.id == project)
+            .map(|p| p.settings.clone());
+        let mut added: Vec<String> = settings
+            .packages
+            .iter()
+            .filter(|id| before.as_ref().is_none_or(|b| !b.packages.contains(id)))
+            .cloned()
+            .collect();
+        if settings.use_default_package
+            && before.as_ref().is_none_or(|b| !b.use_default_package)
+            && let Some(default) = self.state.default_id()
+        {
+            added.push(default.to_owned());
+        }
+        self.verify_packages(&added)
+    }
+
+    /// Look now, on this thread, for the tools of `packages` and of what
+    /// they extend. Why one of them cannot be turned on, if one cannot.
+    fn verify_packages(&mut self, packages: &[String]) -> Option<String> {
+        let wanted: Vec<String> = packages.iter().flat_map(|id| self.chain_of(id)).collect();
+        let all = self.all_requirements();
+        let untrusted = self.untrusted();
+        for id in wanted {
+            let Some((_, requires)) = all.iter().find(|(p, _)| *p == id) else {
+                continue;
+            };
+            let states: Vec<RequirementState> = requires
+                .iter()
+                .map(|r| (self.detector)(r, &untrusted))
+                .collect();
+            if let Some(checks) = self.checks.get_mut(&id)
+                && checks.requires == *requires
+            {
+                checks.states.clone_from(&states);
+                self.dirty = true;
+            }
+            if let Some((req, _)) = requires.iter().zip(&states).find(|(_, s)| !s.met()) {
+                return Some(format!(
+                    "{id} needs {}, which is not installed here in a version it can use, so it was not turned on",
+                    req.name
+                ));
+            }
+        }
+        None
+    }
+
+    /// Start a look for each package whose requirements are new or changed,
+    /// and forget the packages that are gone.
+    fn check_changed_requirements(&mut self) {
+        let all = self.all_requirements();
+        self.checks
+            .retain(|id, _| all.iter().any(|(known, _)| known == id));
+        for (id, requires) in all {
+            let same = self.checks.get(&id).is_some_and(|c| c.requires == requires);
+            if !same {
+                self.start_check(&id, requires);
+            }
+        }
+    }
+
+    /// Look for a package's tools on a thread of its own (a version flag may
+    /// take a while); the answer is taken on a later tick.
+    fn start_check(&mut self, id: &str, requires: Vec<Requirement>) {
+        self.generation += 1;
+        let generation = self.generation;
+        self.checks.insert(
+            id.to_owned(),
+            Checks {
+                states: vec![RequirementState::Checking; requires.len()],
+                requires: requires.clone(),
+                generation,
+            },
+        );
+        self.dirty = true;
+        if requires.is_empty() {
+            return;
+        }
+        let (tx, detector, id, untrusted) = (
+            self.checked_tx.clone(),
+            Arc::clone(&self.detector),
+            id.to_owned(),
+            self.untrusted(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("package-requires".into())
+            .spawn(move || {
+                let states = requires.iter().map(|r| detector(r, &untrusted)).collect();
+                let _ = tx.send((id, generation, states));
+            });
+        if let Err(why) = spawned {
+            self.fail(format!(
+                "the tools packages need could not be looked for: {why}"
+            ));
+        }
+    }
+
+    /// A warning for each tool an installed package needs and the last look
+    /// did not find. Adding a package is refused without its tools, but one
+    /// already in a project is updated anyway: a new version may need a tool
+    /// the old one did not (Game Dev 3 added Blender and FFmpeg).
+    fn missing_tools(&self, status: &ProjectPackages) -> Vec<String> {
+        let mut out = Vec::new();
+        for package in &status.packages {
+            if package.installed_version.is_none() {
+                continue;
+            }
+            let Some(checks) = self.checks.get(&package.id) else {
+                continue;
+            };
+            for (req, state) in checks.requires.iter().zip(&checks.states) {
+                if !state.met() && *state != RequirementState::Checking {
+                    out.push(missing_tool_warning(&package.id, req, Os::CURRENT));
+                }
+            }
+        }
+        out
+    }
+
+    /// Take the answers of finished looks.
+    fn take_checks(&mut self) {
+        while let Ok((id, generation, states)) = self.checked_rx.try_recv() {
+            if let Some(checks) = self.checks.get_mut(&id)
+                && checks.generation == generation
+                && checks.states.len() == states.len()
+            {
+                checks.states = states;
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn check_requirements(&mut self, id: &str) {
+        let Some((_, requires)) = self.all_requirements().into_iter().find(|(p, _)| p == id) else {
+            return self.fail(format!("no such package: {id}"));
+        };
+        self.start_check(id, requires);
+    }
+
+    /// Open a shell terminal in the project that runs the tool's install
+    /// command. The command is the package's own, for this system, never one
+    /// passed in; a tool that needs a licence has none.
+    fn install_requirement(
+        &mut self,
+        project: &str,
+        package: &str,
+        requirement: &str,
+        approved: &str,
+    ) {
+        let Some((_, requires)) = self
+            .all_requirements()
+            .into_iter()
+            .find(|(p, _)| p == package)
+        else {
+            return self.fail(format!("no such package: {package}"));
+        };
+        let Some(req) = requires.iter().find(|r| r.id == requirement) else {
+            return self.fail(format!("{package} needs no tool {requirement}"));
+        };
+        let Some(command) = req.install_on(Os::CURRENT) else {
+            return self.fail(format!(
+                "{} has no install command here: follow its manual steps",
+                req.name
+            ));
+        };
+        // The package may have changed since the user saw the command: run
+        // only the very text they approved.
+        if command != approved {
+            return self.fail(crate::CHANGED.to_owned());
+        }
+        if !self.projects.iter().any(|p| p.id == project) {
+            return self.fail("no such project".to_owned());
+        }
+        match self.cfg.host.add_terminal(
+            project,
+            ToolKind::Shell,
+            Some(format!("Install {}", req.name)),
+            Some(command.to_owned()),
+            None,
+            None,
+        ) {
+            Ok(terminal) => self.cfg.host.show(project, Some(&terminal)),
+            Err(why) => self.fail(format!("{} could not be installed: {why}", req.name)),
+        }
+    }
+
+    /// What the view says of a package's tools.
+    fn requirement_views(&self, id: &str, requires: &[Requirement]) -> Vec<RequirementView> {
+        let states = self
+            .checks
+            .get(id)
+            .filter(|c| c.requires == requires)
+            .map(|c| c.states.clone())
+            .unwrap_or_default();
+        requires
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let state = states.get(i).cloned().unwrap_or_default();
+                crate::requires::view(r, state, Os::CURRENT)
+            })
+            .collect()
+    }
+
     fn packages_dir(&self) -> Option<PathBuf> {
         self.home.as_deref().map(home::packages_dir)
     }
@@ -173,18 +567,45 @@ impl Core {
     // ---- commands -------------------------------------------------------
 
     pub fn command(&mut self, cmd: Cmd) {
+        if !matches!(cmd, Cmd::Stop) {
+            self.notice = None;
+        }
         match cmd {
             Cmd::SetHome(path) => self.set_home(&path),
             Cmd::SetDefault(id) => self.set_default(id),
             Cmd::Create { name, extends } => self.create(&name, extends),
             Cmd::Edit(id) => self.open_session(&id, false),
             Cmd::Delete(id) => self.delete(&id),
+            Cmd::Export { id, dest } => self.export(&id, &dest),
+            Cmd::Import(path) => self.import(&path),
             Cmd::SetProject(id, settings) => self.set_project(&id, settings),
+            Cmd::SetProjectKeepingOpenCode(id, mut settings) => {
+                // Read here, where writes are applied one after another: what
+                // is saved now includes every write queued before this one.
+                // The project as this worker holds it (set by the last write
+                // it applied), else as saved.
+                let own = self.settings_now(&id);
+                settings.opencode_config = own.opencode_config;
+                settings.tools = own.tools.from_older_peer(settings.tools);
+                self.set_project(&id, settings);
+            }
+            Cmd::SetProjectKeepingTools(id, mut settings) => {
+                // Read here, as above: after every write queued before it.
+                settings.tools = self.settings_now(&id).tools.from_older_peer(settings.tools);
+                self.set_project(&id, settings);
+            }
             Cmd::Refresh(id) => {
                 if let Some(project) = self.projects.iter_mut().find(|p| p.id == id) {
                     project.dirty = true;
                 }
             }
+            Cmd::CheckRequirements(id) => self.check_requirements(&id),
+            Cmd::InstallRequirement {
+                project,
+                package,
+                requirement,
+                command,
+            } => self.install_requirement(&project, &package, &requirement, &command),
             Cmd::Stop => {}
         }
         self.dirty = true;
@@ -198,13 +619,21 @@ impl Core {
                 "{id} cannot be the default: it has problems or is gone"
             ));
         }
+        // The default goes into every project that uses it: look for its
+        // tools now, not by the view's answer, which may be old. Refused, the
+        // default stays what it was.
+        if let Some(id) = &id
+            && let Some(why) = self.verify_packages(std::slice::from_ref(id))
+        {
+            return self.fail(why);
+        }
         self.state.default = Some(id);
         self.save_state();
         self.mark_all_dirty();
     }
 
     fn installable(&self, id: &str) -> bool {
-        id == BUILTIN_ID
+        is_builtin(id)
             || self
                 .registry
                 .iter()
@@ -223,7 +652,26 @@ impl Core {
         }
     }
 
+    /// A project's settings as writes stand now: as this worker holds them
+    /// (set by the last write it applied), else as saved.
+    fn settings_now(&self, id: &str) -> ProjectSettings {
+        self.projects.iter().find(|p| p.id == id).map_or_else(
+            || project_settings::load(&self.cfg.data_root, id),
+            |p| p.settings.clone(),
+        )
+    }
+
     fn set_project(&mut self, id: &str, settings: ProjectSettings) {
+        self.sync_projects();
+        // The facade refused what the view knew to be missing; this is the
+        // last look, whoever asked (this window or a remote one). Refused
+        // settings are not saved, and the project's status says why.
+        if let Some(why) = self.verify_added(id, &settings) {
+            if let Some(project) = self.projects.iter_mut().find(|p| p.id == id) {
+                project.status.state = InstallState::Error(why.clone());
+            }
+            return self.fail(why);
+        }
         if let Err(why) = project_settings::save(&self.cfg.data_root, id, &settings) {
             return self.fail(format!("the project's settings could not be saved: {why}"));
         }
@@ -360,7 +808,7 @@ impl Core {
             .into_iter()
             .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
             .filter_map(|e| e.file_name().to_str().map(str::to_owned))
-            .filter(|id| package::valid_id(id) && id != BUILTIN_ID)
+            .filter(|id| package::valid_id(id) && !is_builtin(id))
             .collect();
         ids.sort();
         let mut registry = Vec::new();
@@ -458,28 +906,16 @@ impl Core {
         if let Err(why) = fs::create_dir_all(&dir) {
             return self.fail(format!("could not create the package: {why}"));
         }
-        let base = package::slugify(&name);
-        let (mut id, mut n) = (base.clone(), 2);
-        let folder = loop {
-            let folder = dir.join(&id);
-            // Never `builtin`'s id, and `create_dir` fails if it exists, so two
-            // creators cannot share a folder. On Windows never a device name
-            // either (`nul` is no folder there, `con` is one only on Windows 11).
-            if id != BUILTIN_ID && crate::platform::portable_name(&id) {
-                match fs::create_dir(&folder) {
-                    Ok(()) => break folder,
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(e) => return self.fail(format!("could not create the package: {e}")),
-                }
-            }
-            id = format!("{base}-{n}");
-            n += 1;
+        let (id, folder) = match Self::new_folder(&dir, &package::slugify(&name)) {
+            Ok(found) => found,
+            Err(e) => return self.fail(format!("could not create the package: {e}")),
         };
         let manifest = Manifest {
             name: name.clone(),
             description: String::new(),
             version: 1,
             extends,
+            requires: Vec::new(),
         };
         let written =
             crate::fsx::write_atomic(&folder, FILE_NAME, manifest.to_text().as_bytes(), None)
@@ -490,6 +926,88 @@ impl Core {
         }
         self.reload_registry();
         self.open_session(&id, true);
+    }
+
+    /// Make a new, empty package folder named after `base` (`base-2`, `base-3`
+    /// ... when it is taken).
+    fn new_folder(dir: &Path, base: &str) -> std::io::Result<(String, PathBuf)> {
+        let (mut id, mut n) = (base.to_owned(), 2);
+        loop {
+            let folder = dir.join(&id);
+            // Never `builtin`'s id, and `create_dir` fails if it exists, so two
+            // creators cannot share a folder. On Windows never a device name
+            // either (`nul` is no folder there, `con` is one only on Windows 11).
+            if !is_builtin(&id) && crate::platform::portable_name(&id) {
+                match fs::create_dir(&folder) {
+                    Ok(()) => return Ok((id, folder)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            id = format!("{base}-{n}");
+            n += 1;
+        }
+    }
+
+    fn export(&mut self, id: &str, dest: &Path) {
+        let Some(dir) = self.packages_dir() else {
+            return self.fail(NO_HOME.to_owned());
+        };
+        if is_builtin(id) || !package::valid_id(id) {
+            return self.fail("a built-in package cannot be exported".to_owned());
+        }
+        let bundle = match bundle::read_package(&dir.join(id)) {
+            Ok(bundle) => bundle,
+            Err(why) => return self.fail(format!("{id} could not be exported: {why}")),
+        };
+        if let Err(why) = fs::write(dest, bundle::encode(&bundle)) {
+            return self.fail(format!("could not write {}: {why}", dest.display()));
+        }
+        self.last_error = None;
+        self.notice = Some(format!(
+            "Exported {} to {}",
+            bundle.manifest.name,
+            dest.display()
+        ));
+        self.dirty = true;
+    }
+
+    fn import(&mut self, path: &Path) {
+        let Some(dir) = self.packages_dir() else {
+            return self.fail(NO_HOME.to_owned());
+        };
+        let bundle = match bundle::read_file(path) {
+            Ok(bundle) => bundle,
+            Err(why) => return self.fail(format!("could not import: {why}")),
+        };
+        if let Err(why) = fs::create_dir_all(&dir) {
+            return self.fail(format!("could not import: {why}"));
+        }
+        let name = bundle.manifest.name.clone();
+        let (id, folder) = match Self::new_folder(&dir, &package::slugify(&name)) {
+            Ok(found) => found,
+            Err(e) => return self.fail(format!("could not import: {e}")),
+        };
+        let written = bundle::write_into(&folder, &bundle)
+            .and_then(|()| Self::write_guides(&folder, &name, &id));
+        if let Err(why) = written {
+            let _ = fs::remove_dir_all(&folder);
+            return self.fail(format!("could not import: {why}"));
+        }
+        self.reload_registry();
+        self.last_error = None;
+        let missing = bundle
+            .manifest
+            .extends
+            .as_deref()
+            .filter(|base| !self.installable(base));
+        self.notice = Some(match missing {
+            Some(base) => format!(
+                "Imported {name} as {id}. It extends {base}, which is not here: import that one too."
+            ),
+            None => format!("Imported {name} as {id}"),
+        });
+        self.dirty = true;
     }
 
     fn write_guides(folder: &Path, name: &str, id: &str) -> std::io::Result<()> {
@@ -507,8 +1025,8 @@ impl Core {
         let Some(dir) = self.packages_dir() else {
             return self.fail(NO_HOME.to_owned());
         };
-        if id == BUILTIN_ID || !package::valid_id(id) {
-            return self.fail("the built-in package cannot be deleted".to_owned());
+        if is_builtin(id) || !package::valid_id(id) {
+            return self.fail("a built-in package cannot be deleted".to_owned());
         }
         let folder = dir.join(id);
         match fs::symlink_metadata(&folder) {
@@ -561,8 +1079,8 @@ impl Core {
         let Some(root) = self.packages_dir() else {
             return self.fail(NO_HOME.to_owned());
         };
-        if id == BUILTIN_ID || !package::valid_id(id) {
-            return self.fail("the built-in package cannot be edited".to_owned());
+        if is_builtin(id) || !package::valid_id(id) {
+            return self.fail("a built-in package cannot be edited".to_owned());
         }
         let folder = root.join(id);
         if !folder.join(FILE_NAME).is_file() {
@@ -590,22 +1108,7 @@ impl Core {
                 )
             });
         let reference = self.builtin_reference();
-        let projects: Vec<PathBuf> = self
-            .cfg
-            .host
-            .projects()
-            .into_iter()
-            .map(|p| p.path)
-            .filter(|p| self.home.as_ref().is_none_or(|h| !p.starts_with(h)))
-            .collect();
-        let prompt = authoring_prompt(
-            &root,
-            id,
-            new,
-            &projects,
-            reference.as_deref(),
-            &self.cfg.user_home,
-        );
+        let prompt = authoring_prompt(&root, id, new, reference.as_deref());
         self.openings.push(Opening {
             id: id.to_owned(),
             name: format!("Package: {name}"),
@@ -739,6 +1242,18 @@ impl Core {
         // Closed (or never recorded): resume that conversation, or begin a new
         // one. The prompt is used only if there is nothing to resume.
         if !project.terminals.is_empty() || now.duration_since(since) >= DEFAULTS_WAIT {
+            // The session is a Claude one (its guide is CLAUDE.md, its
+            // conversation is resumed): where Connecto Home leaves Claude out,
+            // say so rather than start another CLI.
+            if !project_settings::load(&self.cfg.data_root, &project.id)
+                .tools
+                .allows(ToolKind::Claude)
+            {
+                self.last_error = Some(
+                    "Packages are edited in a Claude session, and the Tools setting of the Connecto Home project leaves Claude out. Turn Claude on there to edit a package.".to_owned(),
+                );
+                return true;
+            }
             let resume = opening.recorded.as_ref().map(|r| r.session.clone());
             match self.cfg.host.add_terminal(
                 &project.id,
@@ -851,6 +1366,7 @@ impl Core {
         variant: Variant,
         stack: &mut Vec<String>,
     ) -> Result<Option<Vec<Arc<Package>>>, String> {
+        let id = connecto_core::current_package_id(id);
         if stack.iter().any(|s| s == id) {
             return Err(format!("{id} extends itself through {}", stack.join(" > ")));
         }
@@ -859,6 +1375,8 @@ impl Core {
         }
         let package = if id == BUILTIN_ID {
             self.builtin_for(variant)?
+        } else if id == GAME_DEV_ID {
+            self.game_dev_package()?
         } else {
             let Some(entry) = self.registry.iter().find(|e| e.id == id) else {
                 if self.unreadable {
@@ -1012,6 +1530,7 @@ impl Core {
 
     pub fn tick(&mut self, now: Instant) {
         self.now = now;
+        self.take_checks();
         self.sync_projects();
         // A package being edited settles for a tick before it counts, so a
         // half-written skill does not take files out of projects.
@@ -1023,6 +1542,8 @@ impl Core {
             self.unsettled = false;
             self.reload_registry();
         }
+        // A package added, changed or removed by any step since the last tick.
+        self.check_changed_requirements();
         for index in 0..self.projects.len() {
             if self.projects[index].dirty {
                 self.apply_project(index);
@@ -1065,6 +1586,22 @@ impl Core {
                 has_claude: true,
                 has_codex: true,
                 errors: Vec::new(),
+                requires: Vec::new(),
+            });
+        }
+        if let Ok(game) = self.game_dev_package() {
+            packages.push(PackageItem {
+                id: GAME_DEV_ID.to_owned(),
+                name: game.manifest.name.clone(),
+                description: game.manifest.description.clone(),
+                version: game.manifest.version,
+                builtin: true,
+                extends: None,
+                is_default: default.as_deref() == Some(GAME_DEV_ID),
+                has_claude: game.has_claude(),
+                has_codex: game.has_codex(),
+                errors: Vec::new(),
+                requires: self.requirement_views(GAME_DEV_ID, &game.manifest.requires),
             });
         }
         let mut users: Vec<PackageItem> = self
@@ -1082,6 +1619,7 @@ impl Core {
                     has_claude: p.has_claude(),
                     has_codex: p.has_codex(),
                     errors: e.problems.clone(),
+                    requires: self.requirement_views(&e.id, &p.manifest.requires),
                 },
                 Err(why) => PackageItem {
                     id: e.id.clone(),
@@ -1104,28 +1642,30 @@ impl Core {
             projects: self
                 .projects
                 .iter()
-                .map(|p| ProjectPackagesView {
-                    project_id: p.id.clone(),
-                    settings: p.settings.clone(),
-                    status: p.status.clone(),
+                .map(|p| {
+                    let mut status = p.status.clone();
+                    status.warnings.extend(self.missing_tools(&status));
+                    ProjectPackagesView {
+                        project_id: p.id.clone(),
+                        settings: p.settings.clone(),
+                        status,
+                    }
                 })
                 .collect(),
             last_error: self.last_error.clone(),
+            notice: self.notice.clone(),
+            tools_one_or_all: false,
         };
         self.view.store(Arc::new(view));
         (self.cfg.wake)();
     }
 }
 
-/// What a new authoring terminal is told first.
-fn authoring_prompt(
-    root: &Path,
-    id: &str,
-    new: bool,
-    projects: &[PathBuf],
-    reference: Option<&Path>,
-    user_home: &Path,
-) -> String {
+/// What a new authoring terminal is told first. It names the session's one
+/// objective, this package, and nothing else: no list of the user's projects
+/// or folders to survey. Sources are the ones the user names ("make it from
+/// project X").
+fn authoring_prompt(root: &Path, id: &str, new: bool, reference: Option<&Path>) -> String {
     let verb = if new {
         "authoring the new"
     } else {
@@ -1135,18 +1675,6 @@ fn authoring_prompt(
         "You are {verb} Connecto package `{id}` at `{}/{id}/`.",
         root.display()
     );
-    let mut listed = String::new();
-    for path in projects.iter().take(20) {
-        let text = path.display().to_string();
-        if !text.chars().any(|c| c.is_control() || c == '`') {
-            listed.push_str(&format!("\n- `{text}`"));
-        }
-    }
-    let projects = if listed.is_empty() {
-        "none are open".to_owned()
-    } else {
-        listed
-    };
     let reference = reference.map_or_else(String::new, |dir| {
         format!(
             " The built-in `connecto` package (read-only, to copy from or extend) is at `{}`.",
@@ -1180,12 +1708,11 @@ fn authoring_prompt(
     };
     format!(
         "{task} Read `{id}/CLAUDE.md` first (it says how a package is laid out){read}, then ask me \
-         {ask}. Sources to offer: my `{home}/.claude` and `{home}/.codex`, and the skills and \
-         agents of my open Connecto projects (paths below).{reference} Write only inside `{id}/`, \
-         never edit `version` in package.json, and run `connecto package check {id}` after every \
-         edit. {record}\n\n\
-         Open Connecto projects: {projects}",
-        home = user_home.display(),
+         {ask}. Do not look through my projects or folders on your own: use the sources I name \
+         (for example \"make it from project X\": then read that project's `.claude`, `.codex` and \
+         `.agents` and offer what is there; ask me for its path if you cannot tell).{reference} \
+         Write only inside `{id}/`, never edit `version` in package.json, and run \
+         `connecto package check {id}` after every edit. {record}"
     )
 }
 
@@ -1242,6 +1769,24 @@ mod tests {
         automations_root: Option<PathBuf>,
         used_root: Option<PathBuf>,
         shown: Vec<String>,
+        /// The tools (requirement ids) the fake search finds.
+        found: Vec<String>,
+        /// The tools of added terminals: `added` keeps their names.
+        added_tools: Vec<ToolKind>,
+    }
+
+    /// Finds what the host's `found` lists, and nothing else.
+    fn fake_detector(host: &Arc<FakeHost>) -> Detector {
+        let host = Arc::clone(host);
+        Arc::new(move |req: &Requirement, _: &[PathBuf]| {
+            if host.with(|s| s.found.contains(&req.id)) {
+                RequirementState::Found {
+                    version: Some("4.7.2".into()),
+                }
+            } else {
+                RequirementState::Missing
+            }
+        })
     }
 
     #[derive(Default)]
@@ -1277,7 +1822,7 @@ mod tests {
         fn add_terminal(
             &self,
             project: &str,
-            _: ToolKind,
+            tool: ToolKind,
             name: Option<String>,
             prompt: Option<String>,
             _: Option<String>,
@@ -1285,6 +1830,7 @@ mod tests {
         ) -> Result<String, String> {
             self.with(|s| {
                 s.added.push((project.to_owned(), name, prompt));
+                s.added_tools.push(tool);
                 if let Some(info) = &mut s.info {
                     info.terminals
                         .push(("claude-2".to_owned(), ToolKind::Claude));
@@ -1348,6 +1894,7 @@ mod tests {
                 user_home: base.join("user"),
                 host: Arc::clone(&host) as Arc<dyn Host>,
                 wake: Arc::new(|| {}),
+                detector: Some(fake_detector(&host)),
             });
             Self {
                 core,
@@ -1463,9 +2010,36 @@ mod tests {
         let status = r.status(&id);
         assert_eq!(status.state, InstallState::Updated);
         assert_eq!(status.packages[0].id, "connecto");
-        assert_eq!(status.packages[0].installed_version, Some(1));
+        assert_eq!(status.packages[0].installed_version, Some(10));
+        // Version 10: the second opinion, and teams that take their agents
+        // from `connecto agents --roles` (ADR 0045).
+        assert!(
+            path.join(".claude/skills/second-opinion/SKILL.md")
+                .is_file()
+        );
+        assert!(
+            path.join(".agents/skills/second-opinion/SKILL.md")
+                .is_file()
+        );
         assert!(path.join(".claude/skills/dev-team/SKILL.md").is_file());
         assert!(path.join(".agents/skills/dev-team/SKILL.md").is_file());
+        // Version 9: Claude ends a task with the status recap from
+        // `.claude/rules` (the others get it at launch). The project's own
+        // instruction files are not touched.
+        let rule = fs::read_to_string(path.join(".claude/rules/connecto-status.md")).unwrap();
+        assert!(rule.contains("**Waiting on user**"), "{rule}");
+        assert!(!path.join("AGENTS.md").exists() && !path.join("CLAUDE.md").exists());
+        // Version 8: the Agentic Works guide knows several jobs at once, for
+        // Claude and for the agents that read `.agents`.
+        for tool in [".claude", ".agents"] {
+            let guide =
+                fs::read_to_string(path.join(tool).join("skills/agentic-works/SKILL.md")).unwrap();
+            assert!(
+                guide.contains("connecto works parallel")
+                    && guide.contains("### Several jobs at once"),
+                "{tool}"
+            );
+        }
         assert!(path.join(".connecto/packages.lock").is_file());
         // Claude only: the Claude form of the package, and the Codex files go.
         r.core.command(set(
@@ -1477,6 +2051,7 @@ mod tests {
         ));
         r.core.tick(Instant::now());
         assert!(!path.join(".agents").exists() && !path.join(".codex").exists());
+        assert!(path.join(".claude/rules/connecto-status.md").is_file());
         let skill = fs::read_to_string(path.join(".claude/skills/dev-team/SKILL.md")).unwrap();
         assert!(skill.contains("connecto add claude"));
         let settings = fs::read_to_string(path.join(".claude/settings.json")).unwrap();
@@ -1494,6 +2069,89 @@ mod tests {
         assert_eq!(r.status(&id).state, InstallState::None);
     }
 
+    /// Two writes queued one after the other: this machine makes OpenCode
+    /// isolated, then a peer from before OpenCode changes only the packages.
+    /// The second keeps the isolation the first saved, though it was made
+    /// from settings read before the first was applied.
+    #[test]
+    fn an_older_peers_queued_write_keeps_the_opencode_config_written_before_it() {
+        let mut r = Rig::new("keep-opencode");
+        let (id, _) = r.project("proj");
+        r.core.tick(Instant::now());
+        let before = r.core.view().load().settings_of(&id);
+        assert_eq!(before.opencode_config, connecto_core::ConfigMode::System);
+        let isolated = ProjectSettings {
+            opencode_config: connecto_core::ConfigMode::Isolated,
+            ..before.clone()
+        };
+        // The older peer's settings: as it read them, before the first write.
+        let older = ProjectSettings {
+            use_default_package: false,
+            ..before
+        };
+        r.core.command(set(&id, isolated));
+        r.core
+            .command(Cmd::SetProjectKeepingOpenCode(id.clone(), older));
+        let saved = connecto_session::project_settings::load(&r.data, &id);
+        assert_eq!(saved.opencode_config, connecto_core::ConfigMode::Isolated);
+        assert!(!saved.use_default_package, "the peer's change is kept");
+        r.core.publish();
+        assert_eq!(
+            r.core.view().load().settings_of(&id).opencode_config,
+            connecto_core::ConfigMode::Isolated
+        );
+    }
+
+    /// Two writes queued one after the other: this machine chooses Codex and
+    /// Pi, then a peer from before sets of tools, which was shown All, changes
+    /// only the packages. The second keeps Codex and Pi, though it was made
+    /// before the first was applied; one that chose a tool sets that tool.
+    #[test]
+    fn an_older_peers_queued_write_keeps_the_set_of_tools_written_before_it() {
+        use connecto_core::ToolKind;
+        let mut r = Rig::new("keep-tools");
+        let (id, _) = r.project("proj");
+        r.core.tick(Instant::now());
+        let before = r.core.view().load().settings_of(&id);
+        assert_eq!(before.tools, ProjectTools::All);
+        let codex_pi = ProjectTools::from_tools([ToolKind::Codex, ToolKind::Pi]).unwrap();
+        let older = ProjectSettings {
+            use_default_package: false,
+            ..before.clone()
+        };
+        r.core.command(set(
+            &id,
+            ProjectSettings {
+                tools: codex_pi,
+                ..before
+            },
+        ));
+        r.core
+            .command(Cmd::SetProjectKeepingTools(id.clone(), older.clone()));
+        let saved = connecto_session::project_settings::load(&r.data, &id);
+        assert_eq!(saved.tools, codex_pi);
+        assert!(!saved.use_default_package, "the peer's change is kept");
+        // From before OpenCode too.
+        r.core
+            .command(Cmd::SetProjectKeepingOpenCode(id.clone(), older.clone()));
+        assert_eq!(
+            connecto_session::project_settings::load(&r.data, &id).tools,
+            codex_pi
+        );
+        // A peer that chose Claude alone.
+        r.core.command(Cmd::SetProjectKeepingTools(
+            id.clone(),
+            ProjectSettings {
+                tools: ProjectTools::Claude,
+                ..older
+            },
+        ));
+        assert_eq!(
+            connecto_session::project_settings::load(&r.data, &id).tools,
+            ProjectTools::Claude
+        );
+    }
+
     #[test]
     fn settings_persist_and_a_new_manager_reads_them() {
         let mut r = Rig::new("persist");
@@ -1503,6 +2161,8 @@ mod tests {
             tools: ProjectTools::Codex,
             claude_config: connecto_core::ConfigMode::System,
             codex_config: connecto_core::ConfigMode::System,
+            pi_config: connecto_core::ConfigMode::System,
+            opencode_config: connecto_core::ConfigMode::Isolated,
             use_default_package: false,
             packages: vec![],
         };
@@ -1516,6 +2176,7 @@ mod tests {
             user_home: r.base.join("user"),
             host: Arc::clone(&r.host) as Arc<dyn Host>,
             wake: Arc::new(|| {}),
+            detector: None,
         });
         let mut fresh = fresh;
         fresh.tick(Instant::now());
@@ -1738,6 +2399,26 @@ mod tests {
     }
 
     #[test]
+    fn a_package_is_not_edited_where_connecto_home_leaves_claude_out() {
+        use connecto_core::ToolKind;
+        let mut r = Rig::new("create-no-claude");
+        let mut settings = project_settings::load(&r.data, "home-project");
+        settings.tools = ProjectTools::from_tools([ToolKind::Codex, ToolKind::Pi]).unwrap();
+        project_settings::save(&r.data, "home-project", &settings).unwrap();
+        r.core.command(Cmd::Create {
+            name: "My Team".to_owned(),
+            extends: None,
+        });
+        r.core.tick(Instant::now());
+        r.core.tick(Instant::now());
+        let added = r.host.with(|s| s.added.clone());
+        assert!(added.is_empty(), "no session started: {added:?}");
+        r.core.publish();
+        let error = r.core.view().load().last_error.clone().unwrap_or_default();
+        assert!(error.contains("leaves Claude out"), "{error}");
+    }
+
+    #[test]
     fn creating_a_package_writes_it_and_opens_a_briefed_claude_session_in_home() {
         let mut r = Rig::new("create");
         let (_, other) = r.project("some-project");
@@ -1765,9 +2446,10 @@ mod tests {
         let prompt = prompt.as_deref().unwrap();
         assert!(prompt.contains("connecto package check my-team"));
         assert!(
-            prompt.contains(&other.display().to_string()),
-            "lists the open projects"
+            !prompt.contains(&other.display().to_string()),
+            "the open projects are not listed: the session only knows its objective"
         );
+        assert!(prompt.contains("Do not look through my projects"));
         assert!(
             prompt.contains("builtin-connecto"),
             "points at the built-in package"
@@ -1802,15 +2484,78 @@ mod tests {
     }
 
     #[test]
+    fn a_package_exported_to_a_file_imports_as_a_new_package() {
+        let mut r = Rig::new("export");
+        r.write_package(
+            "team",
+            r#"{"name":"Team","description":"Tools","version":3}"#,
+            &[(
+                ".claude/skills/a/SKILL.md",
+                "---\nname: a\ndescription: a\n---\n",
+            )],
+        );
+        fs::write(r.home.join("packages/team/ORIGIN.md"), "# Origin\n").unwrap();
+        r.settle();
+        let file = r.home.join("team.connecto-package");
+        r.core.command(Cmd::Export {
+            id: "team".to_owned(),
+            dest: file.clone(),
+        });
+        assert!(
+            r.view()
+                .notice
+                .clone()
+                .unwrap()
+                .starts_with("Exported Team")
+        );
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(
+            !text.contains("connecto-packages:begin"),
+            "no guide: {text}"
+        );
+        r.core.command(Cmd::Import(file));
+        let view = r.view();
+        assert!(view.last_error.is_none(), "{:?}", view.last_error);
+        assert_eq!(view.notice.as_deref(), Some("Imported Team as team-2"));
+        let copy = r.home.join("packages/team-2");
+        assert_eq!(
+            fs::read_to_string(copy.join(".claude/skills/a/SKILL.md")).unwrap(),
+            "---\nname: a\ndescription: a\n---\n"
+        );
+        assert_eq!(
+            fs::read_to_string(copy.join("ORIGIN.md")).unwrap(),
+            "# Origin\n"
+        );
+        assert!(
+            copy.join("CLAUDE.md").is_file(),
+            "the guide is written again"
+        );
+        let item = view.packages.iter().find(|p| p.id == "team-2").unwrap();
+        assert_eq!((item.version, item.description.as_str()), (1, "Tools"));
+        // Not a package file: refused, nothing added.
+        let junk = r.home.join("junk.connecto-package");
+        fs::write(&junk, "{}").unwrap();
+        r.core.command(Cmd::Import(junk));
+        assert!(
+            r.view()
+                .last_error
+                .clone()
+                .unwrap()
+                .contains("not a Connecto package")
+        );
+        assert!(!r.home.join("packages/team-3").exists());
+    }
+
+    #[test]
     fn a_new_package_is_told_to_write_its_origin_and_an_edit_to_read_and_keep_it() {
         let root = Path::new("/home/packages");
-        let made = authoring_prompt(root, "team", true, &[], None, Path::new("/u"));
+        let made = authoring_prompt(root, "team", true, None);
         assert!(
             made.contains("Before you finish, write `team/ORIGIN.md`"),
             "{made}"
         );
         assert!(!made.contains("never invent"), "{made}");
-        let edit = authoring_prompt(root, "team", false, &[], None, Path::new("/u"));
+        let edit = authoring_prompt(root, "team", false, None);
         assert!(
             edit.contains("Read `team/CLAUDE.md` first (it says how a package is laid out) and then `team/ORIGIN.md`"),
             "{edit}"
@@ -2160,6 +2905,7 @@ mod tests {
             user_home: r.base.join("user"),
             host: Arc::clone(&r.host) as Arc<dyn Host>,
             wake: Arc::new(|| {}),
+            detector: None,
         });
         core.tick(Instant::now());
         core.publish();
@@ -2242,5 +2988,506 @@ mod tests {
             self.command(Cmd::Edit("connecto".to_owned()));
             self.last_error.is_some()
         }
+    }
+
+    // ---- tools packages need (ADR 0037) ----------------------------------
+
+    const SKILL: &str = "---\nname: s\ndescription: does s\n---\nBody\n";
+
+    const NEEDS_TOOL: &str = r#"{"name":"Needs Tool","requires":[
+        {"id":"tool","name":"The Tool","detect":{"programs":["the-tool"]},
+         "install":{"macos":"brew install the-tool","windows":"winget install the-tool","linux":"apt install the-tool"},
+         "manual":"Get it from its site."},
+        {"id":"paid","name":"Paid Editor","licence":true,"detect":{"programs":["paid"]},
+         "manual":"Buy it and accept its licence yourself."}]}"#;
+
+    /// Ticks until the package's tools are no longer being looked for.
+    fn checked(r: &mut Rig, id: &str) -> Vec<RequirementView> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            r.core.tick(Instant::now());
+            let item = r
+                .view()
+                .packages
+                .iter()
+                .find(|p| p.id == id)
+                .cloned()
+                .unwrap();
+            if item
+                .requires
+                .iter()
+                .all(|q| q.state != RequirementState::Checking)
+                || Instant::now() > deadline
+            {
+                return item.requires;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn the_tools_a_package_needs_are_looked_for_and_looked_for_again() {
+        let mut r = Rig::new("req-look");
+        r.write_package("needs", NEEDS_TOOL, &[(".claude/skills/s/SKILL.md", SKILL)]);
+        r.settle();
+        let requires = checked(&mut r, "needs");
+        assert_eq!(requires.len(), 2);
+        assert_eq!(requires[0].state, RequirementState::Missing);
+        assert!(
+            requires[0]
+                .install
+                .as_deref()
+                .is_some_and(|c| c.contains("the-tool"))
+        );
+        // A tool that needs a licence is never offered as a command.
+        assert!(requires[1].licence && requires[1].install.is_none());
+        // Installed meanwhile: found once the user asks to check again.
+        r.host.with(|s| s.found.push("tool".into()));
+        assert_eq!(checked(&mut r, "needs")[0].state, RequirementState::Missing);
+        r.core.command(Cmd::CheckRequirements("needs".into()));
+        assert!(checked(&mut r, "needs")[0].state.met());
+    }
+
+    #[test]
+    fn a_tool_is_installed_in_a_shell_terminal_with_the_packages_own_command() {
+        let mut r = Rig::new("req-install");
+        r.write_package("needs", NEEDS_TOOL, &[(".claude/skills/s/SKILL.md", SKILL)]);
+        r.settle();
+        let (project, _) = r.project("p");
+        r.settle();
+        let expected = match Os::CURRENT {
+            Os::Macos => "brew install the-tool",
+            Os::Windows => "winget install the-tool",
+            Os::Linux => "apt install the-tool",
+        };
+        // The package changed after the user saw its command: what they
+        // approved is not what would run, so nothing runs.
+        r.core.command(Cmd::InstallRequirement {
+            project: project.clone(),
+            package: "needs".into(),
+            requirement: "tool".into(),
+            command: "brew install something-else".into(),
+        });
+        assert_eq!(r.core.last_error.as_deref(), Some(crate::CHANGED));
+        assert!(r.host.with(|s| s.added.is_empty()));
+        r.core.command(Cmd::InstallRequirement {
+            project: project.clone(),
+            package: "needs".into(),
+            requirement: "tool".into(),
+            command: expected.into(),
+        });
+        let (added, tools) = r.host.with(|s| (s.added.clone(), s.added_tools.clone()));
+        assert_eq!(
+            added,
+            vec![(
+                project.clone(),
+                Some("Install The Tool".to_owned()),
+                Some(expected.to_owned())
+            )]
+        );
+        assert_eq!(tools, vec![ToolKind::Shell]);
+        // Never for a licence tool, nor for a tool the package does not name.
+        for requirement in ["paid", "other"] {
+            r.core.last_error = None;
+            r.core.command(Cmd::InstallRequirement {
+                project: project.clone(),
+                package: "needs".into(),
+                requirement: requirement.into(),
+                command: expected.into(),
+            });
+            assert!(r.core.last_error.is_some(), "{requirement}");
+        }
+        assert_eq!(r.host.with(|s| s.added.len()), 1);
+    }
+
+    #[test]
+    fn game_dev_is_built_in_needs_its_tools_and_installs_its_skills() {
+        let mut r = Rig::new("req-gamedev");
+        let (project, path) = r.project("game");
+        r.settle();
+        let item = r
+            .view()
+            .packages
+            .iter()
+            .find(|p| p.id == GAME_DEV_ID)
+            .cloned()
+            .unwrap();
+        assert!(item.builtin && !item.is_default && item.errors.is_empty());
+        assert_eq!(
+            item.requires
+                .iter()
+                .map(|q| q.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["godot", "blender", "ffmpeg"]
+        );
+        // Like the other built-in package, it is not the user's to change.
+        r.core.last_error = None;
+        r.core.command(Cmd::Delete(GAME_DEV_ID.into()));
+        assert!(r.core.last_error.is_some());
+        // A folder of that name in Connecto Home is not read.
+        r.write_package(
+            GAME_DEV_ID,
+            r#"{"name":"Mine"}"#,
+            &[(".claude/skills/s/SKILL.md", SKILL)],
+        );
+        r.settle();
+        assert_eq!(
+            r.view()
+                .packages
+                .iter()
+                .filter(|p| p.id == GAME_DEV_ID)
+                .count(),
+            1
+        );
+        let game = ProjectSettings {
+            use_default_package: false,
+            packages: vec![GAME_DEV_ID.into()],
+            ..ProjectSettings::default()
+        };
+        // Without Godot the engine itself refuses, whoever asked.
+        r.core
+            .command(Cmd::SetProject(project.clone(), game.clone()));
+        r.settle();
+        assert!(matches!(r.status(&project).state, InstallState::Error(_)));
+        assert!(!path.join(".claude/skills/godot-game").exists());
+        assert!(
+            project_settings::load(&r.data, &project)
+                .packages
+                .is_empty(),
+            "not saved"
+        );
+        // Godot alone is not enough: the art needs Blender and the reviews
+        // FFmpeg.
+        r.host.with(|s| s.found.push("godot".into()));
+        r.core
+            .command(Cmd::SetProject(project.clone(), game.clone()));
+        r.settle();
+        assert!(matches!(r.status(&project).state, InstallState::Error(_)));
+        assert!(!path.join(".claude/skills/godot-game").exists());
+        r.host
+            .with(|s| s.found.extend(["blender".into(), "ffmpeg".into()]));
+        r.core.command(Cmd::SetProject(project.clone(), game));
+        r.settle();
+        assert_eq!(r.status(&project).state, InstallState::Updated);
+        for skill in ["game-design", "godot-game", "game-playtest"] {
+            assert!(
+                path.join(format!(".claude/skills/{skill}/SKILL.md"))
+                    .is_file(),
+                "{skill}"
+            );
+            assert!(
+                path.join(format!(".agents/skills/{skill}/SKILL.md"))
+                    .is_file(),
+                "{skill}"
+            );
+        }
+    }
+
+    /// A project that turned Game Dev on when it needed Godot only (version 2)
+    /// is updated to version 3 anyway, and told which new tools are missing
+    /// until they are installed.
+    #[test]
+    fn an_updated_package_warns_of_the_tools_it_now_needs() {
+        let mut r = Rig::new("req-upgrade");
+        r.host.with(|s| s.found.push("godot".into()));
+        let (project, path) = r.project("game");
+        let game = ProjectSettings {
+            use_default_package: false,
+            packages: vec![GAME_DEV_ID.into()],
+            ..ProjectSettings::default()
+        };
+        project_settings::save(&r.data, &project, &game).unwrap();
+        r.settle();
+        checked(&mut r, GAME_DEV_ID);
+        let status = r.status(&project);
+        assert_eq!(status.state, InstallState::Updated);
+        assert!(path.join(".claude/skills/godot-game/SKILL.md").is_file());
+        let missing: Vec<&String> = status
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("game-dev needs"))
+            .collect();
+        assert_eq!(missing.len(), 2, "{:?}", status.warnings);
+        assert!(missing[0].contains("Blender") && missing[1].contains("FFmpeg"));
+        // It says how to install each one by hand, which works however the
+        // package came in (chosen, the default, or extended by another).
+        let game_dev = crate::package::game_dev().unwrap();
+        for (warning, req) in missing.iter().zip(&game_dev.manifest.requires[1..]) {
+            assert_eq!(
+                **warning,
+                missing_tool_warning(GAME_DEV_ID, req, Os::CURRENT)
+            );
+            assert!(warning.contains("Restart Connecto"), "{warning}");
+            assert!(!warning.contains("remove"), "{warning}");
+        }
+        // Installed meanwhile and looked for again: the warnings go.
+        r.host
+            .with(|s| s.found.extend(["blender".into(), "ffmpeg".into()]));
+        r.core.command(Cmd::CheckRequirements(GAME_DEV_ID.into()));
+        checked(&mut r, GAME_DEV_ID);
+        let status = r.status(&project);
+        assert!(
+            status
+                .warnings
+                .iter()
+                .all(|w| !w.starts_with("game-dev needs")),
+            "{:?}",
+            status.warnings
+        );
+    }
+
+    /// A remote Project Settings keeps 512 bytes of a line (older peers
+    /// too), so every missing-tool warning of a built-in package fits, on
+    /// every system, and one too long for its command says where to read
+    /// how instead of showing a command cut short.
+    #[test]
+    fn missing_tool_warnings_fit_a_remote_line() {
+        let mut packages = vec![crate::package::game_dev().unwrap()];
+        for variant in [Variant::Claude, Variant::Codex, Variant::Both] {
+            packages.push(crate::package::builtin(variant).unwrap());
+        }
+        let mut seen = 0;
+        for package in &packages {
+            for req in &package.manifest.requires {
+                for os in Os::ALL {
+                    let warning = missing_tool_warning(&package.id, req, os);
+                    assert!(warning.len() <= 512, "{} bytes: {warning}", warning.len());
+                    if let Some(command) = req.install_on(os)
+                        && warning.contains("run in a terminal:")
+                    {
+                        assert!(warning.ends_with(command), "{warning}");
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 9, "Game Dev's three tools on three systems");
+        // Packages from elsewhere: manual steps only, a 500-character link,
+        // a 600-character name. Each warning fits and shows nothing cut.
+        let manual_only = Requirement {
+            id: "tool".into(),
+            name: "Tool".into(),
+            manual: "Download Tool from its website and put it on your PATH.".into(),
+            ..Requirement::default()
+        };
+        let warning = missing_tool_warning("pkg", &manual_only, Os::Linux);
+        assert!(
+            warning.ends_with(
+                "To install it: Download Tool from its website and put it on your PATH."
+            ),
+            "{warning}"
+        );
+        let long_url = format!("https://example.com/{}", "a".repeat(480));
+        let link_only = Requirement {
+            manual: "x".repeat(500),
+            url: Some(long_url.clone()),
+            ..manual_only.clone()
+        };
+        let warning = missing_tool_warning("pkg", &link_only, Os::Linux);
+        assert!(
+            !warning.contains("https://") && !warning.contains("xxx"),
+            "{warning}"
+        );
+        assert!(warning.ends_with("Install it by hand, then restart Connecto so it looks again."));
+        let long_name = Requirement {
+            name: "é".repeat(300),
+            ..link_only.clone()
+        };
+        for req in [&manual_only, &link_only, &long_name] {
+            for os in Os::ALL {
+                let warning = missing_tool_warning(&"p".repeat(64), req, os);
+                assert!(warning.len() <= WARNING_MAX, "{} bytes", warning.len());
+            }
+        }
+        // Linux's FFmpeg command is too long to show whole: a pointer instead.
+        let ffmpeg = &packages[0].manifest.requires[2];
+        let linux = missing_tool_warning(GAME_DEV_ID, ffmpeg, Os::Linux);
+        assert!(
+            !linux.contains("sudo") && linux.contains("https://ffmpeg.org/download.html"),
+            "{linux}"
+        );
+        assert!(
+            missing_tool_warning(GAME_DEV_ID, ffmpeg, Os::Macos).ends_with("brew install ffmpeg")
+        );
+    }
+
+    /// The facade, as the window and a remote viewer use it.
+    fn facade(r: &Rig) -> crate::Packages {
+        crate::Packages::with(Config {
+            data_root: r.data.clone(),
+            user_home: r.base.join("user"),
+            host: Arc::clone(&r.host) as Arc<dyn Host>,
+            wake: Arc::new(|| {}),
+            detector: Some(fake_detector(&r.host)),
+        })
+        .unwrap()
+    }
+
+    fn wait_view(packages: &crate::Packages, done: impl Fn(&PackagesView) -> bool) {
+        use connecto_core::PackagesControl as _;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(&packages.view()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_package_whose_tool_was_refused_cannot_be_enabled() {
+        use connecto_core::PackagesControl as _;
+        let mut r = Rig::new("req-refused");
+        r.write_package("needs", NEEDS_TOOL, &[(".claude/skills/s/SKILL.md", SKILL)]);
+        let (project, path) = r.project("game");
+        let packages = facade(&r);
+        let tool_is = |met: bool| {
+            let project = project.clone();
+            move |v: &PackagesView| {
+                v.project(&project).is_some()
+                    && v.packages.iter().any(|p| {
+                        p.id == "needs"
+                            && p.requires[0].state.met() == met
+                            && p.requires[0].state != RequirementState::Checking
+                    })
+            }
+        };
+        wait_view(&packages, tool_is(false));
+        let add = ProjectSettings {
+            use_default_package: false,
+            packages: vec!["needs".into()],
+            ..ProjectSettings::default()
+        };
+        // The user did not install the tool (or refused to): not enabled.
+        let why = packages
+            .set_project_settings(&project, add.clone())
+            .unwrap_err();
+        assert!(why.contains("The Tool"), "{why}");
+        let why = packages.set_default_package(Some("needs")).unwrap_err();
+        assert!(why.contains("The Tool"), "{why}");
+        std::thread::sleep(Duration::from_millis(300));
+        let view = packages.view();
+        assert!(view.project(&project).unwrap().settings.packages.is_empty());
+        assert!(!path.join(".claude/skills/s").exists());
+        // Installed, then checked again: now it can be added.
+        r.host
+            .with(|s| s.found.extend(["tool".to_owned(), "paid".to_owned()]));
+        packages.check_requirements("needs").unwrap();
+        wait_view(&packages, tool_is(true));
+        // Found earlier, gone by the time it is added: the view still says
+        // found, but the engine looks again and refuses.
+        r.host.with(|s| s.found.clear());
+        packages
+            .set_project_settings(&project, add.clone())
+            .unwrap();
+        wait_view(&packages, |v| {
+            v.project(&project)
+                .is_some_and(|p| matches!(p.status.state, InstallState::Error(_)))
+        });
+        assert!(
+            packages
+                .view()
+                .project(&project)
+                .unwrap()
+                .settings
+                .packages
+                .is_empty()
+        );
+        r.host
+            .with(|s| s.found.extend(["tool".to_owned(), "paid".to_owned()]));
+        // The engine's look also updated the view: check again first.
+        packages.check_requirements("needs").unwrap();
+        wait_view(&packages, tool_is(true));
+        packages.set_project_settings(&project, add).unwrap();
+        wait_view(&packages, |v| {
+            v.project(&project)
+                .is_some_and(|p| p.settings.packages == ["needs"])
+        });
+        assert_eq!(
+            packages.view().project(&project).unwrap().settings.packages,
+            ["needs"]
+        );
+        // A tool with no command here is refused before it reaches the engine.
+        assert!(
+            packages
+                .install_requirement(&project, "needs", "paid", "x")
+                .is_err()
+        );
+        packages.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_cannot_make_detection_run_a_program_it_brought_along() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let r = Rig::new("req-own-probe");
+        let folder = r.home.join("packages/evil");
+        let probe = folder.join(".claude/probe");
+        let marker = r.base.join("ran");
+        let manifest = format!(
+            r#"{{"name":"Evil","requires":[{{"id":"t","name":"T","manual":"m",
+                "detect":{{"paths":{{"macos":["{p}"],"linux":["{p}"]}},
+                           "version":{{"flag":"--version","min":"1.0"}}}}}}]}}"#,
+            p = probe.display()
+        );
+        r.write_package(
+            "evil",
+            &manifest,
+            &[
+                (".claude/skills/s/SKILL.md", SKILL),
+                (
+                    ".claude/probe",
+                    &format!("#!/bin/sh\ntouch '{}'\necho 9.9\n", marker.display()),
+                ),
+            ],
+        );
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+        // The real search, as the app uses it.
+        let mut core = Core::new(Config {
+            data_root: r.data.clone(),
+            user_home: r.base.join("user"),
+            host: Arc::clone(&r.host) as Arc<dyn Host>,
+            wake: Arc::new(|| {}),
+            detector: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let state = loop {
+            core.tick(Instant::now());
+            core.publish();
+            let view = core.view().load_full();
+            let state = view
+                .packages
+                .iter()
+                .find(|p| p.id == "evil")
+                .map(|p| p.requires[0].state.clone());
+            if state
+                .as_ref()
+                .is_some_and(|s| *s != RequirementState::Checking)
+                || Instant::now() > deadline
+            {
+                break state;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(state, Some(RequirementState::Missing));
+        assert!(!marker.exists(), "the package's own program was run");
+    }
+
+    #[test]
+    fn a_default_whose_tool_went_away_is_refused_and_the_old_default_stays() {
+        let mut r = Rig::new("req-default");
+        r.write_package("needs", NEEDS_TOOL, &[(".claude/skills/s/SKILL.md", SKILL)]);
+        r.host
+            .with(|s| s.found.extend(["tool".to_owned(), "paid".to_owned()]));
+        r.settle();
+        let item = checked(&mut r, "needs");
+        assert!(item.iter().all(|q| q.state.met()), "found at first");
+        // Gone before it is made the default; the view still says found.
+        r.host.with(|s| s.found.clear());
+        r.core.command(Cmd::SetDefault(Some("needs".into())));
+        assert!(
+            r.core
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("The Tool"))
+        );
+        assert_eq!(r.view().default_package.as_deref(), Some(BUILTIN_ID));
     }
 }

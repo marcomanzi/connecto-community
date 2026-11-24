@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="text/javascript" src="https://embeds.iubenda.com/widgets/84cb6fa7-26a3-4eae-97ad-1858681a8e46.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project memory · Connecto docs</title>
+<meta name="description" content="Project memory: a per-project memory of decisions, conventions and pitfalls that agents read with the connecto memory command. Off by default, stored on your Mac.">
+<meta name="theme-color" content="#0b1520">
+<link rel="icon" href="../assets/img/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body class="docs" data-page="memory">
+<noscript><p style="padding:16px"><a href="./">Connecto docs</a> · <a href="../">Home</a></p></noscript>
+<main class="doc">
+<h1>Project memory</h1>
+<p class="lead">Project memory keeps a memory of each project: the decisions, conventions and pitfalls its agents have learned. Claude and Codex sessions in that project read it with the <code>connecto memory</code> command, and add to it as they work.</p>
+
+
+<p>Memory is <strong>off by default</strong>, for each project. Turn it on for the projects where it helps.</p>
+
+<h2>What it is</h2>
+<ul>
+  <li><strong>A memory for one project.</strong> It holds notes and memories, grouped in rooms. Each one keeps the sources it came from.</li>
+  <li><strong>It changes what an agent is told and can look up.</strong> It does not change the model.</li>
+  <li><strong>It stays on your computer.</strong> It is kept in a database in Connecto's data folder, never in the repository. Connecto never writes <code>AGENTS.md</code> or <code>CLAUDE.md</code>.</li>
+  <li><strong>Nothing runs while Connecto is closed.</strong> There is no background service. A dream that was due while the app was closed runs once, the next time the app is open, if it is no more than 31 days late.</li>
+</ul>
+
+<h2 id="turn-on">Turn it on</h2>
+<ol>
+  <li>Open the project's settings: the gear on its row in the sidebar, or right-click the project and choose <strong>Project settings…</strong>.</li>
+  <li>Open the <strong>Project Memory</strong> tab and tick <strong>Keep a memory for this project</strong>.</li>
+  <li>Choose how it starts:
+    <ul>
+      <li><strong>Build the palace from the current project (recommended)</strong> opens <strong>Activity</strong> and starts the initial build. "Palace" is the name Connecto gives to a project's whole memory.</li>
+      <li><strong>Start empty</strong> lets the memory fill as you work. You can build it from the project later, in <strong>Activity</strong>.</li>
+      <li><strong>Cancel</strong> leaves memory off.</li>
+    </ul>
+  </li>
+</ol>
+<p>Untick the box to stop capture and both cycles. The data is kept. Terminals launched while memory is on are told about it in their launch text.</p>
+
+<h2>The initial build</h2>
+<p>For a project that already has code and history, the initial build reads what is there and writes the first version of the memory. It uses the same model as the dream cycle.</p>
+<p>Before it starts, you choose what it reads. <strong>Exclude</strong> takes paths or globs, comma separated, that are never read. Documentation and instructions, manifests, component structure, relevant code, test configuration, git state and local changes, recent history and Connecto conversations are all on by default. You can also set:</p>
+<table>
+  <tr><th>Setting</th><th>Default</th><th>Meaning</th></tr>
+  <tr><td>History</td><td>90 days</td><td>Days of git history and conversations.</td></tr>
+  <tr><td>Input limit</td><td>2,000,000 characters</td><td>Characters read in total. At least 12,000.</td></tr>
+  <tr><td>Time limit</td><td>60 minutes</td><td>When the limit is reached, the build publishes what it has analysed and marks the rest as not analysed.</td></tr>
+</table>
+<p><strong>Preview the plan</strong> shows, for each kind of source, what would be read and what is excluded, with about how many characters and model runs. It gives no cost estimate.</p>
+
+<h3>What is never read</h3>
+<p>These are skipped whatever you choose:</p>
+<ul>
+  <li>Credential files: <code>.env</code> files, keys and certificates, <code>.npmrc</code>, <code>.netrc</code>, <code>.git-credentials</code> and similar. Their names are not sent to a model either.</li>
+  <li>Dependency and build folders such as <code>node_modules</code>, <code>target</code>, <code>dist</code> and <code>.venv</code>, lock files and binaries.</li>
+  <li>Files over 1 MiB, anything reached through a symbolic link, and nested repositories and submodules.</li>
+</ul>
+<p>The exclusions apply to file contents. Other text, such as documentation or a commit message, can still mention an excluded path.</p>
+
+<h3>How git is used</h3>
+<p>Connecto checks the repository by reading its files itself. It uses git only when nothing in the repository's setup could make git run a program or read somewhere else, such as Git LFS filters, hooks, an include or an initialised submodule. When git is not used, the build lists files by walking the folders, has no history or local changes, and says why under <strong>GIT</strong>.</p>
+<p>Your system git configuration is never read. Git runs against a private folder under Connecto's data folder, on a copy of the index, with hooks and filters switched off.</p>
+
+<h3>What the build means</h3>
+<p>A file's text, code included, shows what is written down. It does not prove a fact. A decision read from a document becomes <em>accepted</em> only when the document is a decision record, such as an ADR or a file named <code>adr-</code>, <code>decision-</code> or <code>rfc-</code>. <strong>Source coverage</strong>, in <strong>Activity</strong>, lists what was analysed, excluded and still remaining. A finished build is not complete knowledge of the project.</p>
+<p>While it runs, your terminals keep feeding the queue. <strong>Cancel the build</strong> stops it, and <strong>Resume</strong> continues from the last checkpoint. If you close the app, the build resumes at the next start.</p>
+<p>A second build on a memory that already has content reconciles with the project. It adds and completes. It does not reset, merge or archive what is there, and it keeps the text and standing of memories you accepted.</p>
+
+<h2>How memories are added and tidied</h2>
+<p>There are two cycles. You set each one under <strong>Settings</strong>, with its own provider, model and effort.</p>
+
+<h3>The development cycle</h3>
+<p>While you work, a model reads new events in small batches and writes short notes, each with its sources. A note can be read at once.</p>
+<table>
+  <tr><th>Setting</th><th>Default</th><th>Meaning</th></tr>
+  <tr><td>Grouping window</td><td>3600 seconds</td><td>Time after the first event before a batch runs. Zero runs at once. A proposal or flag starts the batch at once.</td></tr>
+  <tr><td>Runs per hour, at most</td><td>20</td><td>Beyond it, the queue waits.</td></tr>
+  <tr><td>Input limit</td><td>60,000 characters</td><td>Per run. A larger batch is split, never cut.</td></tr>
+  <tr><td>Attempts</td><td>3</td><td>Before a batch counts as failed. Retries wait 30 seconds, then twice as long each time, up to 30 minutes.</td></tr>
+</table>
+<p>The default model is Claude <code>haiku</code> at <code>low</code> effort.</p>
+
+<h3>The dream cycle</h3>
+<p>At the time you choose, a model consolidates notes and evidence into memories. Connecto checks every change the model proposes, and publishes the result as one version. You can undo a version.</p>
+<table>
+  <tr><th>Setting</th><th>Default</th><th>Meaning</th></tr>
+  <tr><td>Days</td><td>Monday to Friday</td><td>With no day chosen, it never runs on schedule. <strong>Dream now</strong> still works.</td></tr>
+  <tr><td>Time</td><td>02:30</td><td>Local time.</td></tr>
+  <tr><td>Time limit</td><td>30 minutes</td><td>From the start of the dream to its publication.</td></tr>
+  <tr><td>Input limit</td><td>200,000 characters</td><td>Per run. More is split by room. At least 5,000.</td></tr>
+  <tr><td>Minimum new items</td><td>1</td><td>Events or notes since the last dream. With fewer, that date counts as done, with no run.</td></tr>
+</table>
+<p>The default model is Claude <code>sonnet</code> at <code>medium</code> effort. A scheduled dream runs at most once per date. A dream that fails still counts as that date's run.</p>
+<p><strong>Undo</strong>, on a version in <strong>Activity</strong>, restores what that version changed, as a new version. Notes that arrived later are not touched. Agents cannot undo a version.</p>
+
+<h2>What a memory says</h2>
+<p>Each memory shows three separate things. None is derived from another.</p>
+<p><strong>Status</strong> says how reliable it is:</p>
+<table>
+  <tr><th>Status</th><th>Meaning</th></tr>
+  <tr><td><code>candidato</code></td><td>Recorded with its sources, not yet independently confirmed.</td></tr>
+  <tr><td><code>verificato</code></td><td>At least one independent confirmation.</td></tr>
+  <tr><td><code>da_verificare</code></td><td>Something it rests on changed, or the evidence was not enough. It needs checking. It is not false.</td></tr>
+  <tr><td><code>superato</code></td><td>Replaced by another memory.</td></tr>
+  <tr><td><code>conflitto</code></td><td>Sources disagree, and both stay visible.</td></tr>
+</table>
+<p><strong>Freshness</strong> says how recent it is: when it was last confirmed, whether a file it is anchored to changed, and how many open notes it has. A changed file does not make a memory false.</p>
+<p><strong>Standing</strong> says what the memory claims. Each kind has its own steps, weakest first:</p>
+<table>
+  <tr><th>Kind</th><th>Standings, weakest first</th></tr>
+  <tr><td>Decision, convention</td><td>proposed, accepted, discarded</td></tr>
+  <tr><td>Work</td><td>planned, in progress, implemented</td></tr>
+  <tr><td>Fact, known problem</td><td>hypothesis, established</td></tr>
+  <tr><td>Procedure</td><td>documented, exercised</td></tr>
+</table>
+<p>An open <em>contradiction</em> note is marked <code>!</code> and printed under the memory it contradicts. Contradicted memories come first in the brief. No option hides them.</p>
+
+<h3>Evidence</h3>
+<ul>
+  <li><strong>A proposal is not a decision.</strong> A note from an agent gets the weakest standing of its kind, and only you can turn it into a decision.</li>
+  <li><strong>A plan is not an implementation.</strong> Work becomes implemented only from a code change Connecto observed in git, or from your statement.</li>
+  <li><strong>A hypothesis is not an established cause.</strong> A documented procedure is not one seen working.</li>
+  <li><strong>An agent repeating what it read does not verify it.</strong> Evidence from one session, or from one version of a file, counts once however often it repeats.</li>
+  <li><strong>What you type in a terminal is not your statement.</strong> Connecto cannot tell a typed prompt from one a CLI started on its own, so terminal text counts as something said in a session.</li>
+</ul>
+
+<h2>Your statements</h2>
+<p>To accept, reject or correct something, use the <strong>Memories</strong> tab. Open a memory or an open note. Under it are buttons worded for what it is, each with a line saying what it does. For example, a proposed decision has <strong>Accept this decision</strong> and <strong>Reject this decision</strong>. A reject asks you to confirm it first.</p>
+<ul>
+  <li><strong>Accept</strong> and <strong>reject</strong> take effect at once, as a new version you can undo.</li>
+  <li><strong>Correct</strong> says what is right instead. <strong>Add a note…</strong> is for anything else.</li>
+  <li>Accepting a plan or a procedure confirms it as it stands. It does not say the work is done or the procedure was run.</li>
+  <li>A statement is bound to what you saw. If the memory changed since, it is refused, reloaded, and you confirm again.</li>
+</ul>
+
+<h2>Reading the memory</h2>
+<p>The <strong>Project Memory</strong> tab has three inner tabs once memory is on:</p>
+<table>
+  <tr><th>Tab</th><th>What it holds</th></tr>
+  <tr><td><strong>Memories</strong></td><td>The default. Ask a question, read the brief, browse the rooms and search. Choose a memory to read it whole, with its sources, notes and actions.</td></tr>
+  <tr><td><strong>Activity</strong></td><td>The state in one line, the initial build, each run with its refusals, the published versions you can undo, and the last dream report.</td></tr>
+  <tr><td><strong>Settings</strong></td><td>Every setting of the two cycles in one form, export and delete.</td></tr>
+</table>
+<p>All memories are listed by room:</p>
+<table>
+  <tr><th>Room</th><th>What it holds</th></tr>
+  <tr><td><code>ingresso</code></td><td>The brief that agents read first. It is generated and holds no memories.</td></tr>
+  <tr><td><code>architettura</code></td><td>Architecture.</td></tr>
+  <tr><td><code>officina</code></td><td>Procedures.</td></tr>
+  <tr><td><code>decisioni</code></td><td>Decisions.</td></tr>
+  <tr><td><code>problemi</code></td><td>Known problems.</td></tr>
+  <tr><td><code>lavori-aperti</code></td><td>Open work.</td></tr>
+  <tr><td><code>convenzioni</code></td><td>Conventions.</td></tr>
+  <tr><td><code>archivio</code></td><td>The archive. Search leaves it out unless asked.</td></tr>
+</table>
+<p>A memory can apply to the whole project, or to a component folder, a branch or a worktree (<code>project</code>, <code>component:&lt;path&gt;</code>, <code>branch:&lt;name&gt;</code>, <code>worktree:&lt;path&gt;</code>).</p>
+<p>When a run keeps nothing, the state says <strong>Nothing kept: N proposed, 0 kept</strong>, with the reason, in amber. That is a problem, not a success: the memory is as it was. The <strong>dream report</strong> lists each refused proposal and why. It is kept only while the app is open.</p>
+
+<h2>Ask the memory</h2>
+<p>From the <strong>Memories</strong> tab you can ask a question, for example "Why does the store use SQLite?". A cheap model answers from the stored memories only: Claude Haiku at low effort, or Codex on its own configured model at low effort, whichever you choose. If the memory does not hold the answer, it says so. The answer names the memories it used, as <code>room/slug</code>, so you can open them.</p>
+<ul>
+  <li>Connecto picks what the model sees: the brief, a search for the question, and the best few memories, at most about 33,000 characters. Secrets are removed first.</li>
+  <li>The model is asked not to read project files. Nothing physically stops it, so this is an instruction.</li>
+  <li>An answer is not a memory. It writes nothing to the memory, and it is not listed under <strong>Activity</strong> or counted in the development cycle's runs.</li>
+  <li>A question waits at most 90 seconds. Questions are refused when memory is off, when Connecto is paused, when the question is empty or over 2,000 bytes, and when two are already waiting.</li>
+  <li>The last 8 questions and answers are kept while the app is open.</li>
+</ul>
+
+<h2>What agents see</h2>
+<p>While memory is on, the agents of the project are told about it:</p>
+<ul>
+  <li>At launch, each Claude and Codex terminal of the project is told to run <code>connecto memory brief</code> before any work, and to propose what adds value at the end.</li>
+  <li>A conversation that started before memory was turned on gets a one-time notice when it is resumed.</li>
+  <li>When a new version is published, each open terminal gets a short notice with its next prompt. No terminal is woken for it.</li>
+</ul>
+<p>Memory content reaches an agent only in the output of a <code>connecto memory</code> command. The launch text and the notices hold fixed instructions and version numbers, never memory content.</p>
+
+<h3>The commands</h3>
+<table>
+  <tr><th>Command</th><th>What it does</th></tr>
+  <tr><td><code>connecto memory brief [--budget N]</code></td><td>The short brief for the whole project and the caller's current branch. Contradicted memories come first.</td></tr>
+  <tr><td><code>connecto memory search &lt;text&gt; [--room R] [--scope S] [--all] [--budget N]</code></td><td>Finds memories by their text and notes. The archive is left out unless <code>--all</code> is given.</td></tr>
+  <tr><td><code>connecto memory read &lt;id|room/slug&gt; [--budget N]</code></td><td>One memory or note in full.</td></tr>
+  <tr><td><code>connecto memory room &lt;room&gt; [--budget N]</code></td><td>The memories of one room.</td></tr>
+  <tr><td><code>connecto memory status [--budget N]</code></td><td>The version, how far the development cycle has got, the queue, the last run of each cycle and the next dream. It shows no memory content.</td></tr>
+  <tr><td><code>connecto memory propose [--type …] [--about &lt;id&gt;] [--room R] [--scope S]</code></td><td>Leaves a note for the next dream. The text is read from standard input. The types are <code>integrazione</code>, <code>correzione</code>, <code>contraddizione</code> and <code>task</code>.</td></tr>
+  <tr><td><code>connecto memory flag &lt;id&gt; [--type contraddizione|correzione]</code></td><td>Leaves a note that a memory is wrong or out of date. The text is read from standard input.</td></tr>
+</table>
+<p>A note from <code>propose</code> or <code>flag</code> is at most 8 KiB. A longer one is refused, never cut. Without <code>--room</code>, a note goes to <code>decisioni</code>, or to <code>lavori-aperti</code> for <code>--type task</code>. Without <code>--scope</code>, it applies to the whole project. The same note sent twice by the same session is stored once.</p>
+<pre>$ connecto memory propose --room decisioni &lt;&lt;'EOF'
+We decided to keep the store per project.
+EOF</pre>
+<p>Every page the commands print opens with a fixed line saying that it holds notes from past sessions, not requests from the user. Output is kept within a token budget, estimated as characters divided by four. The defaults are 600 for <code>brief</code>, 800 for <code>search</code> and <code>room</code>, 1,500 for <code>read</code> and 200 for <code>status</code>. <code>--budget</code> takes 50 to 20,000. An entry is printed whole or listed by id with the command that reads it.</p>
+<table>
+  <tr><th>Exit code</th><th>Meaning</th></tr>
+  <tr><td>0</td><td>Connecto answered. The answer may itself say that nothing was stored.</td></tr>
+  <tr><td>1</td><td>Connecto refused the command, or the app is older than the command.</td></tr>
+  <tr><td>2</td><td>Usage mistake, including a missing text on standard input, or one over 8 KiB.</td></tr>
+  <tr><td>3</td><td>The <code>connecto</code> command cannot reach the app.</td></tr>
+</table>
+
+<h2>Cost</h2>
+<p>Memory adds model work, and it runs on your own Claude or Codex login, so it uses your usage. The development cycle runs a model session for each batch of your work. The dream and the initial build run more. Each session also carries the CLI's own fixed setup, so small runs are not cheap.</p>
+<ul>
+  <li><strong>No cost figures.</strong> The CLIs report no reliable cost, so Connecto shows none and promises no spending cap.</li>
+  <li><strong>Activity</strong> lists every run with its characters in and out, its duration and its outcome.</li>
+  <li><strong>Limits</strong> are set in runs per hour, characters per run and minutes, under <strong>Settings</strong>.</li>
+</ul>
+<p>One small measurement exists: five tasks, one run each, on a test repository. It is not statistically meaningful. With memory, the agent solved all five tasks, as it did without it. Counting both cycles, it used <strong>more</strong> tokens. Nothing here shows a saving.</p>
+
+<h2>Where it is stored, and privacy</h2>
+<ul>
+  <li><strong>Stored locally.</strong> The project's memory database and its queue live in Connecto's data folder. On macOS, exports go to <code>~/Library/Application Support/connecto/projects/&lt;id&gt;/memory/exports/</code>. Nothing is written into the repository.</li>
+  <li><strong>Never instruction files.</strong> Connecto does not write <code>AGENTS.md</code> or <code>CLAUDE.md</code>.</li>
+  <li><strong>Redaction.</strong> Connecto removes secrets before it stores, sends to a model, prints or exports text. It removes the values of environment variables whose names end in <code>_API_KEY</code>, <code>_TOKEN</code> or <code>_SECRET</code>, or contain <code>PASSWORD</code> (only values at least 8 bytes long), common key and token formats, and the values kept in the <a href="secrets.html">secret vault</a>, with their common encodings.</li>
+  <li><strong>Not covered.</strong> What a memory run reads on its own, with its CLI's tools, is not filtered. It goes to the model unredacted, and into the CLI's own session log, as in any terminal of that CLI. The initial build's exclusions do not bind it.</li>
+  <li><strong>Redaction is best effort.</strong> It lowers the chance that a secret travels. It is not proof that none did.</li>
+</ul>
+
+<h3>Export</h3>
+<p><strong>Settings → EXPORT</strong> writes JSON, Markdown or both. The JSON file holds everything: memories, notes, evidence, relations and versions. The Markdown is one file per room. Each export has its own name, so nothing earlier is overwritten.</p>
+
+<h3>Delete</h3>
+<p><strong>Settings → DELETE → Delete memory…</strong> turns memory off and deletes the project's memory database, its queue and the exports Connecto wrote. This cannot be undone, so export first if you want a copy. The transcripts of memory runs stay in the CLI's own session folders. Delete does not remove them.</p>
+
+<h2>Pause, stop and runs on hold</h2>
+<ul>
+  <li><strong>Pause</strong> (Pause All Agents) starts no memory run. A run already going publishes nothing, and runs again after Resume.</li>
+  <li><strong>Stop Everything</strong> cancels every memory run in progress. The queue is kept.</li>
+  <li><strong>Closing the app</strong> cancels runs. The memory stays consistent, because each write is one transaction.</li>
+  <li>The first time a CLI runs in a folder, it asks whether you trust that folder. A memory run cannot answer that question, so it waits <strong>on hold</strong>, and <strong>Activity</strong> says why. Open a terminal for the project with that CLI once and accept. The run then resumes by itself after a short wait.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>Nothing runs while Connecto is closed.</li>
+  <li>What you type in a terminal is never recorded as your statement. Use the <strong>Memories</strong> tab.</li>
+  <li>A memory is a set of notes, not a complete record of the project.</li>
+  <li>Some repositories are read without git, so the build has no history or local changes. Your system git configuration is never read.</li>
+  <li>A prompt over 64 KiB is stored as "content not available", never cut.</li>
+  <li>On Windows, deleting memory is refused (you remove the folder yourself), and the initial build reads file names but not their contents. The memory code has not been built or tried on Windows yet.</li>
+  <li>Daylight-saving changes, and catching up several days with the real CLIs, have not been tried.</li>
+</ul>
+</main>
+<script src="../assets/docs.js"></script>
+</body>
+</html>
